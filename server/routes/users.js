@@ -40,10 +40,21 @@ function attachSite(row, sites) {
         radius: site.radius,
         source: site.source,
         hasFence: site.hasFence,
+        centreSource: site.centreSource,
+        radiusSource: site.radiusSource,
+        radiusIsAuthoritative: site.radiusIsAuthoritative,
+        centreIsEstimate: site.centreIsEstimate,
+        centreConfidence: site.centreConfidence,
       }
     : null;
 
-  const fence = site && site.lat != null && site.lng != null ? { lat: site.lat, lng: site.lng, radius: site.radius } : null;
+  // A verdict needs a fence that was actually on record. An estimated centre, or
+  // a radius borrowed from a nearby fence record, would produce a confident
+  // inside/outside for a boundary nobody ever configured.
+  const fence =
+    site && site.radiusIsAuthoritative && site.lat != null && site.lng != null
+      ? { lat: site.lat, lng: site.lng, radius: site.radius }
+      : null;
   if (fence && row.location) {
     const judged = geo.verdictWithAccuracy(
       { lat: row.location.lat, lng: row.location.lng },

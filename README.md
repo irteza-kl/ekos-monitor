@@ -127,7 +127,7 @@ cookie.
 | **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** map, **history** charts, **heartbeats** (every stored document, paged, click a row for its full breakdown), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
-| **Geofence Sites** | The fence registry — centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Sites with no stored radius get a derived centre, marked as such. |
+| **Geofence Sites** | The fence registry — centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
 | **Query Explorer** | Read-only `find`/`aggregate` console with the field inventory, canned recipes, explain plans, table/JSON views and JSON export. |
 
 ### Map furniture
@@ -198,6 +198,61 @@ session (logged in + clocked in), the device geofence flag beside the recomputed
 distance to the boundary, site, lat/lng, accuracy band, battery, network and device-local
 time. Wide rows scroll sideways inside the table rather than wrapping, and `↓ CSV`
 (`/api/snapshots.csv`) exports the same columns.
+
+### Where fence geometry comes from
+
+Three sources feed the site registry, and they are not interchangeable. Mixing them
+was the original bug: a circle drawn on the map read as a boundary regardless of
+whether anyone had ever configured one.
+
+| Source | Gives | Trust |
+| --- | --- | --- |
+| `validateClockInLogs` | centre, radius, address, embedded on every validation call | **authoritative** — the only real fence geometry |
+| `ekosClientState` heartbeats | activity, and a centre *estimated* from on-site fixes | estimate only, never a radius |
+| `exit_window` documents | fence centre + radius, but **no site id** | a candidate, listed not adopted |
+
+So `hasFence` means one thing: the geofence log had a fence. Each row also carries
+`centreSource`, `radiusSource` and `centreConfidence`, and the map only draws a solid
+circle when the radius is authoritative — an estimated centre gets a dashed ring sized
+to the spread of the fixes behind it, which is what is actually known.
+
+A radius is never borrowed. Several fences of different sizes sit on the same spot in
+this data (a 20 m and a 100 m fence share site 12's centre), so adopting whichever one
+happened to be nearest would be picking the rule a site is judged by at random. Nearby
+fence records are listed in the drawer with their distance and whether the radius
+agrees, and left there.
+
+The same rule governs verdicts: a distance-from-boundary is only computed against a
+fence on record. No authoritative geometry means the row shows the device's own flag
+and nothing more, rather than an invented inside/outside.
+
+### When a site moves
+
+Geometry is embedded on each validation call, so an edit shows up as a new revision
+rather than overwriting anything. The registry groups by site **and** geometry, takes
+the revision on the newest call as current, keeps the rest as history, and reports the
+jump: `fenceMovedMetres`, `fenceMovedAt`, `fenceRevisions`. Per-site counts sum across
+revisions, so a relocation does not silently reset them.
+
+Estimated centres are harder, and are deliberately not an average of everything ever
+stored — that yields a point between the old and new locations where nobody has stood.
+Fixes are bucketed by time (hourly for ranges up to a week, daily beyond), grouped by
+proximity, and the **largest** group wins. Not the newest: a phone clocked into site 60
+while standing at site 12 puts six fixes 5 km away, and newest-wins made those six the
+site. A second location holding a real share of the fixes is reported as a **disputed**
+centre with both listed, because an estimate with two credible answers should say so.
+Fixes taken outside the fence are ignored whenever inside-fence fixes exist — they say
+where a person was, not where the fence is.
+
+Two things follow. Estimated centres are scoped to the dashboard's date range, so
+`/api/sites` takes `from`/`to`. And the registry is cached for 5 minutes per range, so
+the ⟳ Refresh button sends `refresh=1` to rebuild it — without that, a refresh after an
+edit re-runs every query against the same cached geometry and the site looks unmoved.
+
+Finally, `centreDivergenceMetres` states the gap between the recorded centre and where
+devices actually cluster, flagged when it exceeds the radius. Nobody eyeballs two
+coordinate pairs and spots a 200 m error; that number is the cheapest signal that a
+fence is wrong or stale.
 
 ### Accuracy is treated as part of the verdict
 

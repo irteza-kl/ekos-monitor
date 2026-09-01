@@ -19,7 +19,9 @@ const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
  */
 router.get('/sites', async (req, res, next) => {
   try {
-    const sites = await getSites({ force: req.query.refresh === '1' });
+    // The estimated centres are scoped to the requested window, so the range
+    // travels into the registry instead of being silently all-time.
+    const sites = await getSites({ force: req.query.refresh === '1', from: req.query.from, to: req.query.to });
 
     let occupancy = new Map();
     try {
@@ -60,7 +62,9 @@ router.get('/sites', async (req, res, next) => {
       const occ = occupancy.get(s.siteId) || { present: [], inside: 0, outside: 0, unknown: 0 };
       // Distance of each present device from this fence, for the guide panel.
       const present = occ.present.map((p) => {
-        if (!p.location || !s.plottable || s.radius == null) return { ...p, relation: null, verdict: null };
+        // Only a fence that is actually on record can produce a distance-from-boundary.
+        // Measuring against an estimated centre would invent a verdict.
+        if (!p.location || !s.plottable || !s.radiusIsAuthoritative) return { ...p, relation: null, verdict: null };
         const judged = geo.verdictWithAccuracy(
           { lat: p.location.lat, lng: p.location.lng },
           { lat: s.lat, lng: s.lng, radius: s.radius },
@@ -85,7 +89,9 @@ router.get('/sites', async (req, res, next) => {
       rows: filtered,
       total: filtered.length,
       withFence: filtered.filter((r) => r.hasFence).length,
+      estimated: filtered.filter((r) => r.centreIsEstimate).length,
       plottable: filtered.filter((r) => r.plottable).length,
+      relocated: filtered.filter((r) => r.relocated).length,
     });
   } catch (err) {
     next(err);
@@ -105,7 +111,11 @@ router.get('/sites.csv', async (req, res, next) => {
       { key: 'lng', label: 'Longitude' },
       { key: 'radius', label: 'Radius (m)' },
       { key: 'effectiveRadius', label: 'Max Effective Radius (m)' },
-      { key: 'source', label: 'Coordinate Source' },
+      { key: 'centreSource', label: 'Centre Source' },
+      { key: 'radiusSource', label: 'Radius Source' },
+      { key: 'centreConfidence', label: 'Centre Confidence' },
+      { key: 'fenceOnRecord', label: 'Fence On Record' },
+      { key: 'fenceMovedMetres', label: 'Fence Moved (m)' },
       { key: 'validations', label: 'Geofence Checks' },
       { key: 'outsideEvents', label: 'Outside Events' },
       { key: 'graceEvents', label: 'Accuracy-Grace Events' },

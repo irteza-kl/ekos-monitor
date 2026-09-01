@@ -188,6 +188,8 @@ router.get('/meta', async (req, res, next) => {
         label: s.label,
         hasFence: s.hasFence,
         radius: s.radius,
+        centreSource: s.centreSource,
+        radiusSource: s.radiusSource,
         address: s.address,
       }));
     } catch (err) {

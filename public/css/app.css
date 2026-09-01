@@ -479,7 +479,12 @@ td .truncate { max-width: 260px; }
 .bar-meter > i { display: block; height: 100%; border-radius: 3px; }
 
 /* -------------------------------------------------------------------- maps */
-.map { position: relative; height: 460px; width: 100%; background: var(--map-ground); }
+/* isolation is load-bearing: leaflet gives its own panes and controls z-index up
+   to 1000, and position:relative alone does not contain them, so they compete in
+   the root stacking context and paint over the drawer (z-index 91), the sticky
+   topbar and the filter dropdowns. isolate makes .map a stacking context, so the
+   whole map stays inside it and layers above the map win as written. */
+.map { position: relative; isolation: isolate; height: 460px; width: 100%; background: var(--map-ground); }
 .map.tall { height: calc(100vh - 260px); min-height: 460px; }
 .map.mini { height: 250px; border-radius: var(--radius-sm); overflow: hidden; }
 /* A hairline over the tiles: the pale canvas otherwise bleeds into the card. */

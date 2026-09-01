@@ -221,22 +221,33 @@ window.PMMap = (function () {
   }
 
   /** Geofence circle plus a centre pin. Dashed when the radius is unknown. */
+  /**
+   * A solid circle is a claim about a boundary, so it is only drawn when the
+   * radius came off the geofence log. A site whose centre is estimated from
+   * device fixes gets a dashed uncertainty ring at the spread of those fixes -
+   * that is what is actually known, and it must not read as a fence.
+   */
   function siteCircle(map, site, opts) {
     const options = opts || {};
     if (site.lat === null || site.lat === undefined) return null;
-    const known = site.radius !== null && site.radius !== undefined;
-    const color = options.color || (known ? C.series[6] : C.muted);
+    const fence = site.radiusIsAuthoritative && site.radius !== null && site.radius !== undefined;
+    const estimate = site.centreEstimate || null;
+    const color = options.color || (fence ? C.series[6] : C.muted);
     const layers = [];
+
+    // Radius to draw: the fence, or the spread of the fixes the centre was
+    // estimated from (floor 25 m so a tight cluster is still visible).
+    const spread = estimate && estimate.spreadMetres ? Math.max(25, estimate.spreadMetres) : 40;
 
     layers.push(
       L.circle([site.lat, site.lng], {
-        radius: known ? site.radius : 60,
+        radius: fence ? site.radius : spread,
         color,
         weight: 1.5,
         opacity: 0.9,
-        dashArray: known ? null : '5 5',
+        dashArray: fence ? null : '5 5',
         fillColor: color,
-        fillOpacity: 0.07,
+        fillOpacity: fence ? 0.07 : 0.04,
       }).bindPopup(sitePopup(site))
     );
 
@@ -255,7 +266,8 @@ window.PMMap = (function () {
     );
 
     if (options.label !== false) {
-      layers[1].bindTooltip(site.siteId != null ? 'Site ' + site.siteId : 'Fence', {
+      const name = site.siteId != null ? 'Site ' + site.siteId : 'Fence';
+      layers[1].bindTooltip(fence ? name : name + ' (est.)', {
         permanent: true,
         direction: 'top',
         offset: [0, -6],
@@ -267,17 +279,44 @@ window.PMMap = (function () {
   }
 
   function sitePopup(site) {
+    const fence = site.radiusIsAuthoritative && site.radius != null;
+    const estimate = site.centreEstimate || null;
+    const centreNote = {
+      recorded: 'from the geofence log',
+      'fence-record': 'from a fence record',
+      estimated: estimate ? 'estimated from ' + fmt.int(estimate.fixes) + ' on-site fixes' : 'estimated',
+      weak: estimate ? 'rough estimate from ' + fmt.int(estimate.fixes) + ' fixes' : 'rough estimate',
+      disputed: estimate
+        ? 'disputed - ' + fmt.int(estimate.fixes) + ' of ' + fmt.int(estimate.fixesTotal) + ' fixes here, the rest elsewhere'
+        : 'disputed',
+      unknown: 'unknown',
+    }[site.centreConfidence || (fence ? 'recorded' : 'unknown')];
+
     return popupCard({
-      color: site.radius != null ? C.series[6] : C.muted,
+      color: fence ? C.series[6] : C.muted,
       title: site.label || 'Site ' + site.siteId,
       sub: site.address || null,
       rows: [
         ['Site ID', site.siteId != null ? String(site.siteId) : null],
+        ['Centre', '<span class="mp-note">' + centreNote + '</span>'],
         [
           'Radius',
-          site.radius != null
+          fence
             ? fmt.metres(site.radius) + (site.effectiveRadius ? '<span class="mp-note">max effective ' + fmt.metres(site.effectiveRadius) + '</span>' : '')
-            : '<span class="mp-note">not on record - centre derived from device fixes</span>',
+            : '<span class="mp-note">no fence on record' + (site.candidateFences && site.candidateFences.length ? ' - ' + site.candidateFences.length + ' nearby fence record(s)' : '') + '</span>',
+        ],
+        [
+          'Moved',
+          site.fenceMovedMetres
+            ? fmt.metres(site.fenceMovedMetres) + '<span class="mp-note">since the previous fence</span>'
+            : null,
+        ],
+        [
+          'Also reported from',
+          estimate && estimate.alternates && estimate.alternates.length
+            ? fmt.metres(estimate.alternates[0].metresAway) +
+              ' away<span class="mp-note">' + fmt.int(estimate.alternates[0].fixes) + ' fixes at another location</span>'
+            : null,
         ],
         ['Checks', site.validations ? fmt.int(site.validations) + ' · outside ' + fmt.int(site.outsideEvents || 0) : null],
         ['On site now', site.occupancy ? site.occupancy.total + ' (' + site.occupancy.inside + ' inside)' : null],
@@ -285,7 +324,6 @@ window.PMMap = (function () {
       foot: site.mapsUrl ? '<a href="' + site.mapsUrl + '" target="_blank" rel="noopener">↗ Open in Maps</a>' : null,
     });
   }
-
   /**
    * How a gap between two consecutive fixes is drawn. A trail is only as
    * trustworthy as its sampling: a 40-minute hole or a 200 km/h jump between
@@ -659,7 +697,8 @@ window.PMMap = (function () {
     '<span><i style="background:' + C.out + '"></i>Outside fence</span>' +
     '<span><i style="background:' + C.warning + '"></i>Uncertain (accuracy overlaps boundary)</span>' +
     '<span><i style="background:' + C.unknown + '"></i>No fence on record</span>' +
-    '<span><i class="ring" style="border-color:' + C.series[6] + '"></i>Geofence radius</span>' +
+    '<span><i class="ring" style="border-color:' + C.series[6] + '"></i>Geofence radius (on record)</span>' +
+    '<span><i class="ring" style="border-color:' + C.muted + '"></i>Estimated centre - no fence on record</span>' +
     '<span><i class="ring" style="border-style:solid;border-color:' + C.muted + '"></i>GPS accuracy halo</span>' +
     '</div>';
 

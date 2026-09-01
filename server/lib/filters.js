@@ -438,6 +438,7 @@ function sortSpec(q, allowed, fallback) {
 
 module.exports = {
   SNAP,
+  dateRange,
   LOG,
   snapshotMatch,
   snapshotPostMatch,
