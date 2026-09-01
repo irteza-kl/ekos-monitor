@@ -35,9 +35,9 @@ Static assets are not logged, colour is only used when a terminal is attached, a
 If the `SLOW` lines bother you, `npm run indexes -- --yes` adds the indexes those
 aggregations want.
 
-The dashboard opens straight away — no login. `APP_PASSWORD` is empty in `.env`, which
-turns the gate off; set it to any value to require that password again (the login screen
-and the API cookie check come back automatically).
+The dashboard opens straight away — no password, because none is configured. Set
+`APP_USERNAME` and `APP_PASSWORD` and the browser starts asking for them itself.
+See [The password](#the-password).
 
 `.env` is already filled in with the staging Atlas connection copied from
 `phantom-be/.env`:
@@ -49,8 +49,8 @@ and the API cookie check come back automatically).
 | `COLLECTION_SNAPSHOTS` | `ekosClientState` | device/user heartbeats |
 | `COLLECTION_CLOCKIN_LOGS` | `validateClockInLogs` | geofence validation calls |
 | `COLLECTION_EXIT_WINDOWS` | *(empty)* | leave empty: auto-detected |
-| `APP_PASSWORD` | *(empty)* | empty = open dashboard, no login; set it to require a password |
-| `SESSION_SECRET` | dev string | only used when `APP_PASSWORD` is set |
+| `APP_USERNAME` | *(empty)* | set both to switch the password gate on |
+| `APP_PASSWORD` | *(empty)* | leave either empty and the console is open |
 | `PORT` | `4310` | local only |
 | `QUERY_TIMEOUT_MS` | `25000` | per-query cap |
 
@@ -73,9 +73,9 @@ vercel --prod
 Then set the environment variables in **Project → Settings → Environment Variables**
 (at minimum `MONGODB_URI` and `MONGODB_DB`) and redeploy.
 
-**Before deploying publicly, consider setting `APP_PASSWORD` (plus `SESSION_SECRET`).**
-With it empty the dashboard is open to anyone with the URL, and the raw-document views
-include employee PII from `tenantAccount` — email, phone, SSN and bank details.
+**Before deploying publicly, set `APP_USERNAME` and `APP_PASSWORD`.** With them empty
+the dashboard is open to anyone with the URL, and the raw-document views include
+employee PII from `tenantAccount` — email, phone, SSN and bank details.
 `.env` is gitignored and never uploaded.
 
 Or from the dashboard: import the repo, leave the framework as *Other*, output
@@ -111,16 +111,53 @@ Details that make this work unchanged on Vercel:
   `public/js/maps.js` at an internal tile server; markers, fences and trails render fine
   without tiles.
 
-Note on the gate (when `APP_PASSWORD` is set): HTML pages are served from Vercel's CDN,
-so the password protects the **API** — every page is an empty shell that redirects to
-`/login.html` until `/api/auth/me` succeeds, and no data leaves the server without the
-cookie.
+Note on the gate and Vercel: for the browser to ask for a password, the **page**
+request has to be refused, not just the data. So `vercel.json` sends every HTML path
+and `/api/*` through the function, and leaves only `/css`, `/js`, `/vendor` and the
+favicon on the CDN — those hold no data. This is a change from serving the whole of
+`public/` from the edge; pages now cost a function invocation, which for an internal
+console is a fair trade for a gate that actually appears.
+
+## The password
+
+```bash
+APP_USERNAME=irteza
+APP_PASSWORD=a-long-random-password
+```
+
+Both set switches the gate on; either one empty leaves the console open (and says so
+loudly on startup, because a half-finished gate that silently lets everyone in is the
+worst failure mode). There is no login page and nothing to maintain: unauthenticated
+requests get a `401` carrying `WWW-Authenticate: Basic`, which is what makes the
+browser show its own password box.
+
+It covers **pages as well as the API**. Guarding only `/api` would leave every page
+readable and never raise a prompt at all — browsers do not reliably show the dialog
+for a `fetch()`, only for a top-level navigation.
+
+Three things to know, none of them fixable from here:
+
+- **No sign-out.** Browsers hold Basic credentials until the window closes, and there
+  is no way for a site to clear them. The topbar says so rather than offering a button
+  that would not work. Changing `APP_PASSWORD` is what revokes access.
+- **The credentials go out on every request**, base64-encoded — encoding, not
+  encryption. Over https that is fine (Vercel terminates TLS). Over plain http on a
+  shared network they are readable, so `npm start` on a laptop is for you, not for the
+  office wifi.
+- **One shared account.** Everyone uses the same username and password, so the topbar
+  can say who is signed in but nothing can tell two people apart.
+
+The comparison itself is constant-time over SHA-256 digests of both halves, so neither
+the password nor its length leaks through timing, and a wrong username costs exactly
+what a wrong password does. Pages served through the gate are sent
+`Cache-Control: private, no-store` so no shared cache can hold an authorised copy and
+hand it to the next visitor.
 
 ## What the pages show
 
 | Page | What it answers |
 |---|---|
-| **Overview** | Who is reporting, who is on the clock, inside/outside fences, accuracy and battery health, geofence state and accuracy over time, site activity, and a live map. Flags devices whose app-reported fence state disagrees with the geometry. |
+| **Overview** | **What is wrong, first.** A severity strip opens the page, then the current-state tiles, then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. The live map and the trend charts follow as context. |
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
 | **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. |
@@ -198,6 +235,64 @@ session (logged in + clocked in), the device geofence flag beside the recomputed
 distance to the boundary, site, lat/lng, accuracy band, battery, network and device-local
 time. Wide rows scroll sideways inside the table rather than wrapping, and `↓ CSV`
 (`/api/snapshots.csv`) exports the same columns.
+
+### The Overview leads with problems
+
+Counts are not findings. "9 devices reporting, median accuracy 14 m" says nothing
+about whether anything is wrong, and the old Overview made the reader know which
+numbers were bad in order to spot them. So the page now opens with a severity strip -
+how many critical, serious and warning findings there are - followed by the state tiles,
+and then the ranked feed of what those findings actually are.
+
+Each row is one problem: severity, how many, a sentence of what it means, who it
+happened to, when it was last seen, the collection and field it came from, and a
+link to that page already filtered to the documents behind the number - so every
+count on the feed is checkable in one click.
+
+The feed is split by who has to act. **People in the field** is a supervisor's list:
+on the clock outside the fence, stopped reporting while clocked in, background
+location denied, battery about to die, auto clock-outs, checks that failed the
+geometry. **App & data** is an engineer's: the app and the geometry disagreeing on a
+fence, exit windows never resolving, windows judged against a fence kilometres away,
+clock drift, devices clustering outside the fence they are judged by, silence nothing
+explains.
+
+Two rules keep it honest. A detector only fires on evidence in the data - nothing is
+inferred from an absence, and nothing is rolled into a single health score, because
+one number that falls for unrelated reasons tells nobody what to do. And severity is
+assigned by consequence, not by count: one person who stopped reporting mid-shift
+outranks a hundred cosmetic warnings.
+
+The harder rule is what stays out. A supported flow is not a fault, however unusual it
+looks in the data: a site is allowed to have no geofence, and clocking in without one is
+a normal path through the app - both were detectors here until someone who knows the
+product said so, and both were removed rather than downgraded. A feed that reports
+normal behaviour teaches the reader to skip it, which costs more than the finding was
+ever worth. When in doubt about whether something is a fault or a flow, ask.
+
+`GET /api/issues` returns the feed, `/api/issues.csv` exports it, and both take the
+same filters as every other endpoint. Detection costs a few seconds, so the route
+caches for 60 s (`?refresh=1` bypasses it).
+
+#### Silence is a finding
+
+Every other number on the page is computed from documents that exist. The problem
+with a device that stopped reporting is documents that do not, so gaps between one
+device's consecutive heartbeats are detected explicitly.
+
+Two things keep that from being noise. Silence while someone is **off** the clock is
+not a fault - the overnight gap between shifts is the largest gap in this data and
+means nothing - so only silence on the clock is reported. And the state carried by
+the heartbeat *before* the gap is read back, so a silence can be attributed: logged
+out, device offline, battery at or under 15%, background location denied, location
+not always-on. Silence with none of those is the app failing quietly, and gets its
+own entry.
+
+It runs as two queries rather than one wide one. `$setWindowFields` sorts each
+partition in memory, `allowDiskUse` is not honoured on this deployment, and sorting
+whole documents exceeds the 32 MB sort budget outright - so the window pass projects
+down to two fields and the pre-gap state is fetched afterwards for only the gaps
+that were found.
 
 ### Where fence geometry comes from
 
@@ -373,7 +468,7 @@ npm run indexes -- --yes   # create them
 All endpoints are behind the session cookie and take the same filter parameters.
 
 ```
-POST /api/auth/login {password}      GET /api/auth/me       POST /api/auth/logout
+GET /api/auth/me                     (who is signed in; the gate itself is HTTP Basic)
 GET  /api/health                     GET /api/meta          GET /api/stats
 GET  /api/users                      GET /api/users.csv     GET /api/users/:id
 GET  /api/users/:id/track            GET /api/snapshots     GET /api/snapshots.csv

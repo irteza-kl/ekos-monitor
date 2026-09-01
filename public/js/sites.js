@@ -81,7 +81,10 @@
       tile('Sites seen', fmt.int(sites.length), data.plottable + ' can be plotted'),
       tile('Occupied now', fmt.int(occupied.length), sites.reduce((a, s) => a + s.occupancy.total, 0) + ' people on site'),
       tile('People outside their fence', fmt.int(outside), 'from the newest snapshot each', outside ? 'critical' : undefined),
-      tile('No fence on record', fmt.int(noFence.length), 'centre estimated from device fixes', noFence.length ? 'warning' : undefined),
+      // Not a warning: a site is allowed to have no geofence, and clocking in
+      // without one is a supported flow. It changes what can be verified, which
+      // the note says, but it is not a fault to be coloured like one.
+      tile('No fence on record', fmt.int(noFence.length), 'centre estimated from device fixes'),
       tile('Fences edited', fmt.int(relocated.length), 'geometry changed in the log', relocated.length ? 'warning' : undefined),
       tile(
         'Disputed centres',
@@ -197,7 +200,7 @@
     if (site.radius != null) return fmt.metres(site.radius) + '<div class="person-sub">from a fence record, not this site</div>';
     const n = (site.candidateFences || []).length;
     return (
-      '<span class="badge badge-warning">no fence</span>' +
+      '<span class="badge badge-neutral">no fence</span>' +
       (n ? '<div class="person-sub">' + n + ' nearby fence record' + (n > 1 ? 's' : '') + '</div>' : '')
     );
   }

@@ -5,31 +5,19 @@ const geo = require('./geo');
 const { LOG, SNAP, dateRange } = require('./filters');
 
 /**
- * Builds the geofence site registry.
+ * The geofence site registry. One rule: geometry is only presented as a fence
+ * when a fence was actually on record, so every field carries its provenance
+ * (centreSource, radiusSource) and hasFence means the geofence log had one.
  *
- * The one rule this file exists to enforce: geometry is only ever presented as
- * a fence when a fence was actually on record. Three sources feed it, and they
- * are NOT interchangeable -
- *
- *   1. validateClockInLogs  the only authoritative geometry. The site's centre,
- *                           radius and address are embedded on every validation
- *                           call, so the newest call carries the current fence
- *                           and older calls carry the fence as it was.
- *   2. ekosClientState      heartbeats. No geometry at all in this database
- *                           (clockedInJobSiteLocation.latitude is null on every
- *                           document), so a site seen only here gets an
- *                           ESTIMATED centre - the centroid of recent fixes
- *                           taken inside the fence - and no radius, ever.
- *   3. exit_window docs     carry fence lat/lng/radius but no site id. They can
- *                           confirm a fence whose radius already agrees; they
- *                           may NOT hand a radius to a site that has none,
- *                           because a 20 m and a 100 m fence sit on the same
- *                           spot here. Those become candidates: listed and
- *                           labelled, never silently adopted.
- *
- * Every geometry field therefore travels with its provenance - centreSource,
- * radiusSource - and hasFence means "the geofence log had a fence", nothing
- * looser.
+ *   1. validateClockInLogs  the only authoritative geometry, embedded on every
+ *                           call - so the newest call carries the current fence.
+ *   2. ekosClientState      no geometry at all here (clockedInJobSiteLocation
+ *                           .latitude is null on every document), so a site seen
+ *                           only here gets an estimated centre and no radius.
+ *   3. exit_window docs     a fence but no site id. May confirm a radius that
+ *                           already agrees, never supply one: a 20 m and a 100 m
+ *                           fence share a centre here, so adopting either would
+ *                           be picking the rule at random.
  */
 
 // The registry is cached per date range, because estimated centres are scoped
@@ -81,10 +69,9 @@ async function getSites({ force = false, from = null, to = null } = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Grouped by site AND geometry, so a site whose location was edited comes back
- * as several revisions instead of one blurred row. The revision embedded in the
- * newest validation call is the current fence; the rest are history, and the
- * jump between them is what "the site was moved" looks like in this data.
+ * Grouped by site AND geometry, so an edited location returns several revisions
+ * instead of one blurred row. The newest call carries the current fence; the jump
+ * from the previous one is what a move looks like in this data.
  */
 async function authoritativeFences(byId) {
   let rows;
@@ -224,15 +211,10 @@ async function authoritativeFences(byId) {
 // ---------------------------------------------------------------------------
 
 /**
- * Activity counts for every site, plus an estimated centre for the ones with no
- * fence on record.
- *
- * The estimate is deliberately not an average of everything ever stored. Fixes
- * are bucketed by time, walked newest-first, and stopped at the first bucket
- * that jumps more than CENTRE_CLUSTER_METRES from the running centroid - so if
- * the site was moved, only the fixes from where it is NOW contribute, and the
- * jump is reported instead of being averaged into a point that was never a
- * place. Everything here is scoped to the caller's date range.
+ * Activity counts for every site, plus an estimated centre where no fence is on
+ * record. Deliberately not an average of everything ever stored: that yields a
+ * point between an old and a new location where nobody has stood. Scoped to the
+ * caller's date range.
  */
 async function estimatedCentres(byId, { from, to }) {
   const range = dateRange({ from, to }, 'createdAt');
@@ -375,17 +357,13 @@ function bucketExpression(from, to) {
 }
 
 /**
- * Groups the time buckets by location and returns the biggest group.
+ * The biggest group of time buckets by location - weight of evidence, not
+ * "newest wins": a phone clocked into site 60 while standing at site 12 puts six
+ * fixes 5 km away, and newest-wins made those six the site. A rival location with
+ * real weight is reported as disputed rather than averaged in or dropped.
  *
- * Deliberately not "newest wins". Devices report the wrong site all the time -
- * a phone clocked into site 60 while standing at site 12 puts six fixes 5 km
- * away - and if the newest bucket seeds the centre, those six become the site.
- * Weight of evidence decides instead, and a second location holding a real
- * share of the fixes is reported as a dispute rather than silently discarded or
- * averaged in. An estimate with two credible answers should say so.
- *
- * Fixes taken while inside the fence are used exclusively when any exist: a fix
- * from outside the fence says where a person was, not where the fence is.
+ * Inside-fence fixes are used exclusively when any exist: a fix from outside says
+ * where a person was, not where the fence is.
  */
 function clusterCentre(buckets) {
   const mapped = buckets
@@ -482,11 +460,9 @@ function groupByLocation(series) {
 // ---------------------------------------------------------------------------
 
 /**
- * Exit windows carry a fence but no site id, so the link is made by coordinates.
- * A fence may CONFIRM a site whose recorded radius already agrees; it may not
- * give a radius to a site that has none. Several fences of different sizes sit
- * on the same spot in this data, so adopting one would be picking a rule at
- * random - they get attached as candidates instead.
+ * No site id on these, so the link is by coordinates. A fence may confirm a
+ * radius that already agrees, never supply one - it would be picking at random
+ * between the fences sharing a centre here. Unadopted ones become candidates.
  */
 async function exitWindowFences(byId) {
   let rows;
@@ -749,12 +725,9 @@ function uniqueCount(...lists) {
 // ---------------------------------------------------------------------------
 
 /**
- * siteId -> fence, for filling in a verdict on a document that carried none.
- *
- * Authoritative geometry ONLY. Judging a real clock-in against a centroid of
- * heartbeat fixes, or against a radius scavenged from a nearby exit window,
- * manufactures an inside/outside verdict out of an estimate - and a site that
- * moves would then retroactively change history's verdicts.
+ * siteId -> fence, for a document that carried none. Authoritative geometry only:
+ * judging a real clock-in against an estimated centre manufactures a verdict, and
+ * a site that moves would retroactively rewrite history's.
  */
 async function siteLookup() {
   const sites = await getSites();
@@ -811,12 +784,4 @@ async function attachWindowSite(row) {
   return row;
 }
 
-module.exports = {
-  getSites,
-  siteLookup,
-  siteForFence,
-  attachWindowSite,
-  invalidate,
-  FENCE_MATCH_METRES,
-  CENTRE_CLUSTER_METRES,
-};
+module.exports = { getSites, siteLookup, attachWindowSite, invalidate, FENCE_MATCH_METRES };

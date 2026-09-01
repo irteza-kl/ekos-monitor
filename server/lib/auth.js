@@ -2,68 +2,71 @@
 const crypto = require('crypto');
 const config = require('../config');
 
-const COOKIE = 'pm_session';
-const MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12h
+/**
+ * HTTP Basic: the browser's own password prompt, no login page.
+ *
+ * Credentials travel on every request, base64-encoded rather than encrypted, and
+ * browsers hold them until the window closes - so there is no sign-out, and
+ * plain http on a shared network exposes them. Changing APP_PASSWORD is what
+ * revokes access.
+ */
 
-function sign(payload) {
-  return crypto.createHmac('sha256', config.sessionSecret).update(payload).digest('hex');
-}
+const REALM = 'Phantom Monitor';
 
-function issue() {
-  const expires = Date.now() + MAX_AGE_MS;
-  const payload = 'v1.' + expires;
-  return payload + '.' + sign(payload);
-}
-
-function verify(token) {
-  if (!token || typeof token !== 'string') return false;
-  const parts = token.split('.');
-  if (parts.length !== 3) return false;
-  const [v, expires, mac] = parts;
-  const payload = v + '.' + expires;
-  const expected = sign(payload);
-  if (mac.length !== expected.length) return false;
-  if (!crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expected))) return false;
-  return Number(expires) > Date.now();
-}
-
-/** Constant-time password check. Always true when no password is configured. */
-function passwordMatches(candidate) {
-  if (!config.authRequired) return true;
-  const a = Buffer.from(String(candidate ?? ''));
-  const b = Buffer.from(config.password);
-  if (a.length !== b.length) return false;
+/** Constant-time, and over digests so the stored length does not leak either. */
+function matches(expected, candidate) {
+  const a = crypto.createHash('sha256').update(String(expected)).digest();
+  const b = crypto.createHash('sha256').update(String(candidate)).digest();
   return crypto.timingSafeEqual(a, b);
 }
 
-function setCookie(res) {
-  res.cookie(COOKIE, issue(), {
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: MAX_AGE_MS,
-  });
+function parseHeader(req) {
+  const header = req.headers.authorization || '';
+  if (!/^basic /i.test(header)) return null;
+  let decoded;
+  try {
+    decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
+  } catch (err) {
+    return null;
+  }
+  // The password may contain colons; the username may not.
+  const at = decoded.indexOf(':');
+  if (at === -1) return null;
+  return { username: decoded.slice(0, at), password: decoded.slice(at + 1) };
 }
 
-function clearCookie(res) {
-  res.clearCookie(COOKIE);
+/** @returns {{username: string}|null} */
+function session(req) {
+  if (!config.authRequired) return { username: '' };
+  const given = parseHeader(req);
+  if (!given) return null;
+  // Both halves are always compared, so a wrong username costs what a wrong
+  // password does and the prompt cannot be used to guess the username.
+  const userOk = matches(config.username, given.username);
+  const passOk = matches(config.password, given.password);
+  return userOk && passOk ? { username: given.username } : null;
 }
 
-function isAuthed(req) {
-  if (!config.authRequired) return true;
-  return verify(req.cookies && req.cookies[COOKIE]);
+/**
+ * Guards pages as well as the API: a 401 on a top-level navigation is what
+ * raises the browser dialog, and browsers do not reliably raise it for a
+ * fetch(). So this must run ahead of the static files, not only before /api.
+ */
+function requireAuth(req, res, next) {
+  if (session(req)) return next();
+  res.setHeader('WWW-Authenticate', 'Basic realm="' + REALM + '", charset="UTF-8"');
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Not signed in', code: 'UNAUTHORIZED' });
+  }
+  return res
+    .status(401)
+    .type('html')
+    .send(
+      '<!doctype html><meta charset="utf-8"><title>Phantom Monitor</title>' +
+        '<body style="font:14px system-ui;padding:40px;color:#333">' +
+        '<h1 style="font-size:17px">Phantom Monitor</h1>' +
+        '<p>This console needs a username and password. Reload the page to be asked again.</p>'
+    );
 }
 
-/** Guards the API: JSON 401 instead of a redirect. */
-function requireApiAuth(req, res, next) {
-  if (isAuthed(req)) return next();
-  return res.status(401).json({ error: 'Not signed in', code: 'UNAUTHORIZED' });
-}
-
-/** Guards pages: bounce to the login screen. */
-function requirePageAuth(req, res, next) {
-  if (isAuthed(req)) return next();
-  const target = encodeURIComponent(req.originalUrl || '/');
-  return res.redirect('/login.html?next=' + target);
-}
-
-module.exports = { COOKIE, setCookie, clearCookie, isAuthed, requireApiAuth, requirePageAuth, passwordMatches };
+module.exports = { session, requireAuth };

@@ -36,8 +36,43 @@
     ]);
 
     root.append(
+      // Problems first: the strip at the top, its detail below the state tiles.
+      el('div', { class: 'section-title', text: 'What is wrong' }),
+      el('div', { class: 'tiles', id: 'issue-summary' }),
+      el('div', { class: 'section-title', text: 'Current state' }),
       el('div', { class: 'tiles', id: 'tiles' }),
-      el('div', { id: 'notices' }),
+      el('div', { class: 'section-title', text: 'What is wrong, in detail' }),
+      el('div', { class: 'grid-2', id: 'issue-columns' }, [
+        el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            el('h2', { text: 'People in the field' }),
+            el('span', { class: 'sub', id: 'people-sub' }),
+            el('div', { class: 'spacer' }),
+            el('button', {
+              class: 'btn btn-sm',
+              text: '↓ CSV',
+              onclick: () => window.open('/api/issues.csv?' + queryString(), '_blank'),
+            }),
+          ]),
+          el('div', { class: 'card-body tight' }, [el('div', { class: 'issue-list', id: 'issues-people' })]),
+        ]),
+        el('div', { class: 'card' }, [
+          el('div', { class: 'card-head' }, [
+            el('h2', { text: 'App & data' }),
+            el('span', { class: 'sub', id: 'app-sub' }),
+          ]),
+          el('div', { class: 'card-body tight' }, [el('div', { class: 'issue-list', id: 'issues-app' })]),
+        ]),
+      ]),
+      el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          el('h2', { text: 'Who is having the worst time' }),
+          el('span', { class: 'sub', text: 'people ranked by the problems they are actually hitting' }),
+          el('div', { class: 'spacer' }),
+          el('a', { class: 'btn btn-sm', href: '/users.html', text: 'All users ↗' }),
+        ]),
+        el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'worst-users' })]),
+      ]),
       el('div', { class: 'card' }, [
         el('div', { class: 'card-head' }, [
           el('h2', { text: 'Where everyone is right now' }),
@@ -130,6 +165,10 @@
 
   async function load() {
     PM.showSkeleton({
+      '#issue-summary': 'tiles:4',
+      '#issues-people': 'table:5x2',
+      '#issues-app': 'table:5x2',
+      '#worst-users': 'table:5x3',
       '#tiles': 'tiles:8',
       '#overview-map': 'map',
       '#chart-geo': 'chart',
@@ -142,19 +181,28 @@
       '#check-tiles': 'tiles:5',
     });
     const qs = queryString();
-    const [stats, users] = await Promise.all([api('/api/stats?' + qs), api('/api/users?' + qs + '&limit=200')]);
+    const [stats, users, problems] = await Promise.all([
+      api('/api/stats?' + qs),
+      api('/api/users?' + qs + '&limit=200'),
+      api('/api/issues?' + qs),
+    ]);
+    renderIssues(problems);
+    renderWorstUsers(problems);
     renderTiles(stats);
-    renderNotices(stats, users);
     renderMap(users.rows);
     renderCharts(stats);
     renderUserTable(stats.perUser || []);
     renderChecks(stats);
+    const c = problems.counts || {};
     PM.setSubtitle(
-      fmt.int((stats.devices || {}).totalSnapshots) +
+      (c.critical + c.serious
+        ? c.critical + ' critical · ' + c.serious + ' serious · ' + c.warning + ' warning'
+        : 'nothing critical') +
+        ' · ' +
+        fmt.int((stats.devices || {}).totalSnapshots) +
         ' snapshots · ' +
         fmt.int((stats.devices || {}).trackedUsers) +
-        ' users in range · buckets by ' +
-        stats.granularity
+        ' users in range'
     );
     PM.markLoaded();
   }
@@ -168,6 +216,124 @@
     ]);
     if (options.href) node.addEventListener('click', () => (location.href = options.href));
     return node;
+  }
+
+  /* The severity strip: the four numbers meant to be read first. */
+  function renderIssues(problems) {
+    const host = document.querySelector('#issue-summary');
+    host.innerHTML = '';
+    const c = problems.counts || {};
+    const worst = (list) => list.reduce((a, i) => a + i.count, 0);
+    const bySeverity = (sev) => (problems.issues || []).filter((i) => i.severity === sev);
+
+    host.append(
+      tile('Critical', fmt.int(c.critical), {
+        tone: c.critical ? 'critical' : 'good',
+        note: c.critical ? worst(bySeverity('critical')) + ' affected' : 'nothing critical',
+      }),
+      tile('Serious', fmt.int(c.serious), {
+        tone: c.serious ? 'serious' : undefined,
+        note: c.serious ? worst(bySeverity('serious')) + ' affected' : 'none',
+      }),
+      tile('Warnings', fmt.int(c.warning), {
+        tone: c.warning ? 'warning' : undefined,
+        note: c.warning ? worst(bySeverity('warning')) + ' affected' : 'none',
+      }),
+      tile('People affected', fmt.int((problems.byUser || []).length), {
+        note: c.people + ' issue type(s) in the field',
+        href: '/users.html',
+      })
+    );
+
+    fillFeed('#issues-people', (problems.issues || []).filter((i) => i.group === 'people'), '#people-sub');
+    fillFeed('#issues-app', (problems.issues || []).filter((i) => i.group === 'app'), '#app-sub');
+
+    if ((problems.unavailable || []).length) {
+      document.querySelector('#app-sub').textContent += ' · not checked: ' + problems.unavailable.join(', ');
+    }
+  }
+
+  function fillFeed(selector, list, subSelector) {
+    const host = document.querySelector(selector);
+    host.innerHTML = '';
+    const sub = document.querySelector(subSelector);
+    if (sub) {
+      sub.textContent = list.length
+        ? list.length + ' issue type(s), worst first'
+        : 'nothing detected';
+    }
+    if (!list.length) {
+      host.append(el('div', { class: 'all-clear', text: '✓ Nothing detected here' }));
+      return;
+    }
+    for (const i of list) host.append(issueRow(i));
+  }
+
+  /* The link opens that page filtered to the documents behind the count. */
+  function issueRow(i) {
+    const who = i.who.length
+      ? '<div class="issue-who">' +
+        i.who.map((w) => '<span>' + esc(w.name) + (w.note ? ' · ' + esc(w.note) : '') + '</span>').join('') +
+        (i.whoTotal > i.who.length ? '<span class="more">+' + (i.whoTotal - i.who.length) + ' more</span>' : '') +
+        '</div>'
+      : '';
+    const node = el('a', {
+      class: 'issue is-' + i.severity,
+      href: i.href || '#',
+      html:
+        '<div class="issue-title">' + esc(i.title) + '</div>' +
+        '<div class="issue-count">' + fmt.int(i.count) + ' ' + esc(i.unit) + (i.count === 1 ? '' : 's') + '</div>' +
+        '<div class="issue-detail">' + esc(i.detail) + '</div>' +
+        '<div class="issue-meta">' + (i.lastAt ? esc(fmt.ago(i.lastAt)) : '') + '</div>' +
+        who +
+        '<div class="issue-evidence">' + esc(i.evidence) + '</div>',
+    });
+    return node;
+  }
+
+  /* The same findings keyed by person: "who needs help". */
+  function renderWorstUsers(problems) {
+    const host = document.querySelector('#worst-users');
+    host.innerHTML = '';
+    const list = problems.byUser || [];
+    if (!list.length) {
+      host.append(el('div', { class: 'all-clear', text: '✓ No user-facing problems in this range' }));
+      return;
+    }
+    const table = el('table');
+    table.innerHTML =
+      '<thead><tr><th>Person</th><th class="num">Problems</th><th>What they are hitting</th></tr></thead>';
+    const body = el('tbody');
+    for (const u of list) {
+      body.append(
+        el('tr', {
+          class: 'clickable',
+          onclick: (event) => PM.openRow('/user.html?userId=' + u.userId, event),
+          html:
+            '<td><div class="person"><div class="avatar">' +
+            esc(fmt.initials(u.name)) +
+            '</div><div class="person-main"><div class="person-name">' +
+            esc(u.name) +
+            '</div><div class="person-sub">id ' + u.userId + '</div></div></div></td>' +
+            '<td class="num"><span class="badge badge-' +
+            (u.worst === 'critical' ? 'critical' : u.worst === 'serious' ? 'serious' : 'warning') +
+            '">' + u.count + '</span></td>' +
+            '<td><div class="hit-list">' +
+            u.issues
+              .map(
+                (x) =>
+                  '<div class="hit-line">' +
+                  esc(x.title) +
+                  (x.note ? ' <span class="hit-note">— ' + esc(x.note) + '</span>' : '') +
+                  '</div>'
+              )
+              .join('') +
+            '</div></td>',
+        })
+      );
+    }
+    table.append(body);
+    host.append(table);
   }
 
   function renderTiles(stats) {
@@ -217,46 +383,6 @@
       }),
       tile('Face checks pending', fmt.int(d.facialPending), { note: 'required but not completed' })
     );
-  }
-
-  /** Only surface a notice when something actually needs a human. */
-  function renderNotices(stats, users) {
-    const host = document.querySelector('#notices');
-    host.innerHTML = '';
-    const notes = [];
-    const d = stats.devices || {};
-
-    const disagreements = (users.rows || []).filter((r) => r.verdictDisagrees);
-    if (disagreements.length) {
-      notes.push(
-        '<b>' +
-          disagreements.length +
-          ' device' +
-          (disagreements.length > 1 ? 's' : '') +
-          ' disagree with the geometry.</b> The app reported one geofence state while the stored coordinates and radius say the other: ' +
-          disagreements
-            .slice(0, 4)
-            .map((r) => esc(r.name || 'user ' + r.userId) + ' (app: ' + (r.isInsideGeofence ? 'inside' : 'outside') + ', computed: ' + r.computedVerdict + ')')
-            .join('; ') +
-          '.'
-      );
-    }
-    if (d.outsideButClockedIn) {
-      notes.push('<b>' + d.outsideButClockedIn + ' clocked-in device(s) are outside their fence.</b> Check the exit windows and the geofence calls.');
-    }
-    if (stats.geofenceChecks && stats.geofenceChecks.grace) {
-      notes.push(
-        '<b>' +
-          stats.geofenceChecks.grace +
-          ' clock-in check(s) passed only because of the accuracy grace.</b> Raw geometry put the device outside, and the accuracy padding pulled it back in.'
-      );
-    }
-    if (!stats.exitWindows || !stats.exitWindows.available) {
-      notes.push(
-        '<b>No exit-window documents in this database yet.</b> The Exit Windows page is wired up and will populate as soon as documents of <code>type: "exit_window"</code> land - no config change needed.'
-      );
-    }
-    for (const text of notes) host.append(el('div', { class: 'notice', html: '<span>⚠</span><span>' + text + '</span>' }));
   }
 
   function renderMap(rows) {

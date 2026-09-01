@@ -309,8 +309,11 @@ window.PM = (function () {
         ...options,
       });
       if (res.status === 401) {
-        location.href = '/login.html?next=' + encodeURIComponent(location.pathname + location.search);
-        throw new Error('Session expired');
+        // The credentials stopped working - the password changed, most likely.
+        // Reloading is the recovery: a top-level request with bad credentials is
+        // what makes the browser ask again. There is no login page to send them to.
+        location.reload();
+        throw new Error('Not authorised - reloading');
       }
       const text = await res.text();
       let body = null;
@@ -1217,14 +1220,12 @@ window.PM = (function () {
         dbLine('clock-in logs', cols.clockInLogs, counts.clockInLogs, cols),
         dbLine('exit windows', cols.exitWindows, counts.exitWindows, cols),
       ]),
+      // No sign-out button: HTTP Basic gives the browser no way to forget the
+      // credentials, so a button that claimed to log you out would be lying.
       state.authRequired
-        ? el('button', {
-            class: 'btn btn-sm btn-ghost',
-            text: 'Sign out',
-            onclick: async () => {
-              await api('/api/auth/logout', { method: 'POST' });
-              location.href = '/login.html';
-            },
+        ? el('div', {
+            class: 'hint',
+            text: (state.username ? 'Signed in as ' + state.username : 'Password protected') + ' - close the browser to sign out',
           })
         : el('div', { class: 'hint', text: 'Open access - no password configured' })
     );
@@ -1330,10 +1331,9 @@ window.PM = (function () {
     try {
       const me = await api('/api/auth/me');
       state.authRequired = me.authRequired !== false;
-      if (!me.authenticated) {
-        location.href = '/login.html?next=' + encodeURIComponent(location.pathname + location.search);
-        return;
-      }
+      state.username = me.username || null;
+      // Nothing to redirect to: the browser asks for the password itself before
+      // this script ever runs, so reaching here means we are already through.
     } catch (err) {
       return;
     }

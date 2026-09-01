@@ -53,28 +53,22 @@ if (process.env.LOG_REQUESTS !== '0') {
 }
 
 // --------------------------------------------------------------------- auth
-app.post('/api/auth/login', (req, res) => {
-  if (!config.authRequired) return res.json({ ok: true, authRequired: false });
-  const password = (req.body || {}).password;
-  if (!auth.passwordMatches(password)) {
-    return res.status(401).json({ error: 'Incorrect password' });
-  }
-  auth.setCookie(res);
-  res.json({ ok: true });
-});
+// HTTP Basic, in front of EVERYTHING - pages included. A 401 on a top-level
+// navigation is what makes the browser show its own password box, so guarding
+// only /api would leave the pages open and never raise a prompt (browsers do
+// not reliably surface the dialog for a fetch()).
+app.use(auth.requireAuth);
 
-app.post('/api/auth/logout', (req, res) => {
-  auth.clearCookie(res);
-  res.json({ ok: true });
-});
-
+// The topbar asks who is signed in. Nothing is gated on the answer - the
+// middleware above already decided - so this is only for display.
 app.get('/api/auth/me', (req, res) => {
-  res.json({ authenticated: auth.isAuthed(req), authRequired: config.authRequired });
+  const current = auth.session(req);
+  res.json({
+    authenticated: !!current,
+    authRequired: config.authRequired,
+    username: (current && current.username) || null,
+  });
 });
-
-// ------------------------------------------------------------------- guard
-// Everything that touches Mongo sits behind the session cookie.
-app.use('/api', auth.requireApiAuth);
 app.use('/api', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -86,6 +80,7 @@ app.use('/api', require('./routes/users'));
 app.use('/api', require('./routes/logs'));
 app.use('/api', require('./routes/exitWindows'));
 app.use('/api', require('./routes/sites'));
+app.use('/api', require('./routes/issues'));
 app.use('/api', require('./routes/query'));
 
 app.get('/api/refresh-schema', async (req, res, next) => {
@@ -108,6 +103,10 @@ app.use(
     setHeaders: (res, filePath) => {
       if (filePath.includes(path.sep + 'vendor' + path.sep)) {
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      } else if (filePath.endsWith('.html')) {
+        // These now come through the password gate, so no shared cache may hold
+        // an authorised copy and hand it to the next visitor.
+        res.setHeader('Cache-Control', 'private, no-store, must-revalidate');
       }
     },
   })

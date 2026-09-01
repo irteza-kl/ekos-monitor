@@ -7,7 +7,7 @@ const F = require('../lib/filters');
 const P = require('../lib/pipelines');
 const normalize = require('../lib/normalize');
 const csv = require('../lib/csv');
-const { getSites, siteForFence, attachWindowSite, FENCE_MATCH_METRES } = require('../lib/sites');
+const { getSites, attachWindowSite, FENCE_MATCH_METRES } = require('../lib/sites');
 const geo = require('../lib/geo');
 const { attributeWindows } = require('../lib/attribution');
 
