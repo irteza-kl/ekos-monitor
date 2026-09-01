@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Query Explorer · Phantom Monitor</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script>
+      // Applied before first paint so the page never flashes the wrong theme.
+      try { var t = localStorage.getItem('pm.theme') || 'light';
+        if (t !== 'system') document.documentElement.setAttribute('data-theme', t); } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="/css/app.css" />
+  </head>
+  <body>
+    <script src="/vendor/chart.umd.js"></script>
+    <script src="/js/core.js"></script>
+    <script src="/js/charts.js"></script>
+    <script src="/js/explorer.js"></script>
+  </body>
+</html>
