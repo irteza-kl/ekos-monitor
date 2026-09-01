@@ -36,7 +36,12 @@ window.PMMap = (function () {
    * basemap or Esri’s "map data not yet available" placeholder.
    */
   const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
-  const MAX_ZOOM = 18; // two steps of upscaling past the canvas, no further
+  // Zoom as far as Leaflet will go. The canvas itself is only rendered to zoom
+  // 16, so past that Leaflet upscales those tiles (maxNativeZoom): street names
+  // go soft and eventually the basemap is just colour, while the overlays -
+  // markers, fences, accuracy circles, trails - stay vector-sharp all the way
+  // down. Beyond ~19 the basemap is context, not detail; the data is the point.
+  const MAX_ZOOM = 21;
   const ATTRIBUTION = 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ';
   const BASEMAPS = {
     light: {
@@ -602,12 +607,14 @@ window.PMMap = (function () {
     const valid = (points || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
     if (!valid.length) return;
     if (valid.length === 1) {
-      map.setView([valid[0].lat, valid[0].lng], (opts && opts.zoom) || 16);
+      map.setView([valid[0].lat, valid[0].lng], (opts && opts.zoom) || 17);
       return;
     }
     map.fitBounds(
       valid.map((p) => [p.lat, p.lng]),
-      { padding: [36, 36], maxZoom: (opts && opts.maxZoom) || 17 }
+      // Fitting frames the data; it deliberately stops short of MAX_ZOOM so a
+      // tight cluster keeps some context. Zooming in by hand goes all the way.
+      { padding: [36, 36], maxZoom: (opts && opts.maxZoom) || 18 }
     );
   }
 

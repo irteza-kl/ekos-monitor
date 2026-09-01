@@ -11,6 +11,7 @@ window.PM = (function () {
     { file: 'index.html', title: 'Overview', icon: '◧', group: 'Monitoring' },
     { file: 'map.html', title: 'Live Map', icon: '◎', group: 'Monitoring' },
     { file: 'users.html', title: 'Users & Devices', icon: '☰', group: 'Monitoring' },
+    { file: 'heartbeats.html', title: 'Heartbeats', icon: '∿', group: 'Monitoring', countKey: 'snapshots' },
     { file: 'checks.html', title: 'Geofence Checks', icon: '⛨', group: 'Geofencing', countKey: 'clockInLogs' },
     { file: 'exit-windows.html', title: 'Exit Windows', icon: '⇥', group: 'Geofencing' },
     { file: 'sites.html', title: 'Geofence Sites', icon: '⬡', group: 'Geofencing' },
@@ -999,7 +1000,9 @@ window.PM = (function () {
         const on = entry.tab.id === initial;
         entry.button.classList.toggle('active', on);
         entry.panel.classList.toggle('active', on);
-        if (on) entry.panel.append(el('div', { class: 'empty', text: 'loading…' }));
+        // A shaped placeholder, not the word "loading" in an empty-state box -
+        // this panel is about to hold a table or a map, so it should look like one.
+        if (on) entry.panel.innerHTML = skeletonMarkup(opts.skeleton || 'table:8x6');
       }
     } else {
       show(initial, true);
@@ -1102,6 +1105,12 @@ window.PM = (function () {
   }
 
   // ---------------------------------------------------------------- shell
+  /**
+   * The app frame. Everything here is known before any request runs - brand,
+   * nav, page title, theme switch, the hosts the page fills - so it goes up
+   * immediately and renderShellMeta() fills in the two parts that need
+   * /api/meta, which is the slowest request on the page.
+   */
   function renderShell() {
     const page = state.page;
     const shell = el('div', { class: 'shell' });
@@ -1124,41 +1133,18 @@ window.PM = (function () {
         nav.append(el('div', { class: 'nav-label', text: p.group }));
         lastGroup = p.group;
       }
-      const counts = (state.meta && state.meta.collections && state.meta.collections.counts) || {};
+      // The count is the only part of a nav row that needs /api/meta, so the row
+      // goes up now and the number lands later.
       nav.append(
         el('a', { href: '/' + p.file, class: state.activeFile === p.file ? 'active' : '' }, [
           el('span', { class: 'ico', text: p.icon }),
           el('span', { text: p.title }),
-          p.countKey && counts[p.countKey] ? el('span', { class: 'count', text: fmt.int(counts[p.countKey]) }) : null,
+          p.countKey ? el('span', { class: 'count', 'data-count-key': p.countKey }) : null,
         ])
       );
     }
     sidebar.append(nav);
-
-    const meta = state.meta || {};
-    const cols = meta.collections || {};
-    sidebar.append(
-      el('div', { class: 'sidebar-foot' }, [
-        el('div', { class: 'db-chip' }, [
-          el('div', {}, [el('b', { text: 'DB ' }), document.createTextNode(meta.database || '--')]),
-          // Document kinds share a collection here, so label by kind and put the
-          // collection name in the tooltip rather than printing it twice.
-          dbLine('snapshots', cols.snapshots, (cols.counts || {}).snapshots, cols),
-          dbLine('clock-in logs', cols.clockInLogs, (cols.counts || {}).clockInLogs, cols),
-          dbLine('exit windows', cols.exitWindows, (cols.counts || {}).exitWindows, cols),
-        ]),
-        state.authRequired
-          ? el('button', {
-              class: 'btn btn-sm btn-ghost',
-              text: 'Sign out',
-              onclick: async () => {
-                await api('/api/auth/logout', { method: 'POST' });
-                location.href = '/login.html';
-              },
-            })
-          : el('div', { class: 'hint', text: 'Open access - no password configured' }),
-      ])
-    );
+    sidebar.append(el('div', { class: 'sidebar-foot', id: 'sidebar-foot' }, [el('div', { class: 'sk sk-line sk-w80' })]));
 
     const main = el('div', { class: 'main' });
     const topbar = el('div', { class: 'topbar' }, [
@@ -1205,6 +1191,45 @@ window.PM = (function () {
     renderThemeSwitch();
   }
 
+  /**
+   * The two parts of the shell that need /api/meta: the collection counts in the
+   * nav, and the database chip in the sidebar foot. Called when that request
+   * answers, which is well after the frame is on screen.
+   */
+  function renderShellMeta() {
+    const meta = state.meta || {};
+    const cols = meta.collections || {};
+    const counts = cols.counts || {};
+    for (const node of document.querySelectorAll('.nav .count[data-count-key]')) {
+      const value = counts[node.getAttribute('data-count-key')];
+      node.textContent = value ? fmt.int(value) : '';
+    }
+
+    const foot = document.querySelector('#sidebar-foot');
+    if (!foot) return;
+    foot.innerHTML = '';
+    foot.append(
+      el('div', { class: 'db-chip' }, [
+        el('div', {}, [el('b', { text: 'DB ' }), document.createTextNode(meta.database || '--')]),
+        // Document kinds share a collection here, so label by kind and put the
+        // collection name in the tooltip rather than printing it twice.
+        dbLine('snapshots', cols.snapshots, counts.snapshots, cols),
+        dbLine('clock-in logs', cols.clockInLogs, counts.clockInLogs, cols),
+        dbLine('exit windows', cols.exitWindows, counts.exitWindows, cols),
+      ]),
+      state.authRequired
+        ? el('button', {
+            class: 'btn btn-sm btn-ghost',
+            text: 'Sign out',
+            onclick: async () => {
+              await api('/api/auth/logout', { method: 'POST' });
+              location.href = '/login.html';
+            },
+          })
+        : el('div', { class: 'hint', text: 'Open access - no password configured' })
+    );
+  }
+
   /** One "kind: count" line, flagged when the collection is shared. */
   function dbLine(label, collection, count, cols) {
     if (!collection) return el('div', { text: label + ': none yet' });
@@ -1238,6 +1263,7 @@ window.PM = (function () {
   }
 
   function markLoaded() {
+    clearSkeletonOverlays();
     state.lastLoadedAt = new Date().toISOString();
     updateLive();
   }
@@ -1296,6 +1322,11 @@ window.PM = (function () {
     state.filters = readUrlState();
     if (!state.filters.range && !state.filters.from) state.filters.range = DEFAULT_RANGE;
 
+    // Frame first, then the requests. Waiting for /api/meta before drawing
+    // anything left the window blank for as long as that query took.
+    renderShell();
+    showSkeleton({ '#page-root': 'boot' });
+
     try {
       const me = await api('/api/auth/me');
       state.authRequired = me.authRequired !== false;
@@ -1313,7 +1344,7 @@ window.PM = (function () {
       state.meta = { error: err.message };
     }
 
-    renderShell();
+    renderShellMeta();
     setRefresh(state.refreshMs);
     if (state.meta && state.meta.error) toast('Metadata failed: ' + state.meta.error, 'error');
 
@@ -1324,7 +1355,10 @@ window.PM = (function () {
     });
 
     try {
-      await init({ root: document.querySelector('#page-root'), meta: state.meta });
+      const root = document.querySelector('#page-root');
+      // The page appends its own containers, so the boot placeholder goes first.
+      root.innerHTML = '';
+      await init({ root, meta: state.meta });
     } catch (err) {
       console.error(err);
       toast(err.message, 'error');
@@ -1373,6 +1407,87 @@ window.PM = (function () {
       out.push(filler);
     }
     return out;
+  }
+
+  // ----------------------------------------------------------- skeletons
+  const rep = (html, n) => new Array(Math.max(0, n)).fill(html).join('');
+
+  /**
+   * Markup for one placeholder shape. Kinds take an argument after a colon:
+   *   tiles:8   table:10x7   text:3   list:5   kv:6   block
+   * The shapes deliberately match the real thing’s geometry, so the layout
+   * does not jump when the data lands.
+   */
+  function skeletonMarkup(kind) {
+    const [name, arg] = String(kind || 'block').split(':');
+    if (name === 'tiles') {
+      return '<div class="sk-tiles">' + rep('<div class="sk sk-tile"></div>', Number(arg) || 4) + '</div>';
+    }
+    if (name === 'table') {
+      const [rows, cols] = (arg || '8x6').split('x').map(Number);
+      const cells = rep('<div class="sk sk-line"></div>', cols || 6);
+      return (
+        '<div class="sk-table">' +
+        '<div class="sk-tr sk-head">' + cells + '</div>' +
+        rep('<div class="sk-tr">' + cells + '</div>', rows || 8) +
+        '</div>'
+      );
+    }
+    if (name === 'list') {
+      return rep(
+        '<div class="sk-tr"><div class="sk sk-dot"></div><div style="flex:1">' +
+          '<div class="sk sk-line sk-w60"></div><div class="sk sk-line sk-w40"></div></div></div>',
+        Number(arg) || 5
+      );
+    }
+    if (name === 'kv') {
+      return rep(
+        '<div class="sk-tr"><div class="sk sk-line sk-w25"></div><div class="sk sk-line"></div></div>',
+        Number(arg) || 6
+      );
+    }
+    if (name === 'text') {
+      return rep('<div class="sk sk-line"></div>', Number(arg) || 3);
+    }
+    if (name === 'boot') {
+      // Stands in for a whole page while the first requests are in flight: the
+      // filter bar, a KPI row and one panel, which is what most pages open with.
+      return (
+        '<div class="card" style="padding:14px">' + skeletonMarkup('text:2') + '</div>' +
+        skeletonMarkup('tiles:4') +
+        '<div class="card">' + skeletonMarkup('table:7x6') + '</div>'
+      );
+    }
+    return '<div class="sk sk-block"></div>';
+  }
+
+  /**
+   * Put placeholders in the containers a load is about to fill.
+   *
+   * Containers that already hold real content are left alone: a refresh keeps
+   * the numbers on screen (the progress bar says something is happening)
+   * rather than blinking everything back to grey. Charts and maps keep their
+   * canvas and get an overlay instead, since replacing it would break them.
+   */
+  function showSkeleton(spec, options) {
+    const opts = options || {};
+    for (const [selector, kind] of Object.entries(spec || {})) {
+      const host = document.querySelector(selector);
+      if (!host) continue;
+      if (kind === 'chart' || kind === 'map') {
+        const target = host.tagName === 'CANVAS' ? host.closest('.chart-wrap') || host.parentElement : host;
+        if (target) target.classList.add('is-loading');
+        continue;
+      }
+      const hasRealContent = host.children.length > 0 && !host.querySelector('.sk');
+      if (hasRealContent && !opts.force) continue;
+      host.innerHTML = skeletonMarkup(kind);
+    }
+  }
+
+  /** Drops every chart/map loading overlay on the page. */
+  function clearSkeletonOverlays() {
+    for (const node of document.querySelectorAll('.is-loading')) node.classList.remove('is-loading');
   }
 
   // --------------------------------------------------------- row navigation
@@ -1424,6 +1539,9 @@ window.PM = (function () {
     jsonHighlight,
     optionsFrom,
     padBuckets,
+    showSkeleton,
+    skeletonMarkup,
+    clearSkeletonOverlays,
     markLoaded,
     setTitle,
     setSubtitle,

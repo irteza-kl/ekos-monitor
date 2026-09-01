@@ -83,6 +83,10 @@
   }
 
   async function load() {
+    PM.showSkeleton({
+      '#live-map': 'map',
+      '#device-list': 'list:6',
+    });
     const [users, siteData] = await Promise.all([
       api('/api/users?' + queryString() + '&limit=200'),
       api('/api/sites?' + queryString()),

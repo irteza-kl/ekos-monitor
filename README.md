@@ -123,6 +123,7 @@ cookie.
 | **Overview** | Who is reporting, who is on the clock, inside/outside fences, accuracy and battery health, geofence state and accuracy over time, site activity, and a live map. Flags devices whose app-reported fence state disagrees with the geometry. |
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
+| **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. |
 | **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** map, **history** charts, **heartbeats** (every stored document, paged, click a row for its full breakdown), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
@@ -170,6 +171,26 @@ data one user shows 3 reporting gaps and 1 suspicious jump across 800 heartbeats
 
 ### Heartbeats
 
+A missing heartbeat is data. A device that stopped reporting looks exactly like a quiet one
+unless the gap is drawn, so silence gets a row of its own:
+
+> ⚠ **Heartbeat lost** · Sep 1, 02:54 → Sep 1, 03:12 · Silent for 18 min · ? unexplained
+
+Ten minutes of silence is flagged and thirty is critical (red) - the same thresholds the
+trail map colours its path with, since a heartbeat normally lands every 25-60 s here. The
+last chip names the likely cause, read off the last heartbeat before the silence: logged
+out, clocked out, device offline, battery at or under 15%, background location denied, or
+not "allow all the time". Anything else reads **unexplained** rather than inventing a reason.
+
+Gaps are measured per device between consecutive *stored* heartbeats, so one spanning a page
+boundary shows on the next page - the banner above the table says so. On the all-users page
+the silences become a **Silence before** column instead, because a gap row drawn between two
+different people’s heartbeats would mean nothing.
+
+The table, the gap rows and the drawer live in `public/js/heartbeats.view.js`, shared by the
+Heartbeats page and the Heartbeats tab on a user page.
+
+
 Each `ekosClientState` document is one **heartbeat** from a device - the app writes one
 every few seconds while it runs. The user page calls them that throughout, and the
 Heartbeats tab lists them raw, one line per document: time, device and app build,
@@ -201,6 +222,28 @@ other, and every colour is a CSS variable in one block at the top of
 runtime, so switching theme repaints them live - no reload - and re-theming the whole
 app means editing that block only. Light mode also leaves the map tiles alone; only dark
 mode inverts them.
+
+## While it loads
+
+Nothing here says "no data" until a query has actually answered.
+
+- The **frame goes up first**. `renderShell()` used to wait for `/api/meta` - the
+  slowest request on the page, since it counts documents - which left the window blank.
+  Now the sidebar, nav, page title and theme switch render immediately and
+  `renderShellMeta()` fills in the collection counts and the database chip when that
+  request lands.
+- Each page declares what it is about to fill: `PM.showSkeleton({ '#user-table':
+  'table:10x9', '#user-tiles': 'tiles:5' })`. Placeholder shapes match the real
+  geometry (tile grid, row height, column count), so the layout does not jump when the
+  data arrives.
+- **Charts and maps keep their canvas** and take a shimmer overlay instead - replacing
+  the element would break Chart.js and Leaflet. `PM.markLoaded()`, which every page
+  already called when its render finished, clears them.
+- **A refresh does not blink.** A container that already holds real content is left
+  alone; the progress bar carries the news instead. Only genuinely empty containers get
+  placeholders (pass `{ force: true }` to override, as the heartbeats pager does).
+- Placeholders honour `prefers-reduced-motion`, and their grey comes from a per-theme
+  token so the dark palette is not a bright flash.
 
 ## Filters
 

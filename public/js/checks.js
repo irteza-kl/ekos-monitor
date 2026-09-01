@@ -95,6 +95,12 @@
   });
 
   async function load() {
+    PM.showSkeleton({
+      '#check-tiles': 'tiles:5',
+      '#chart-scatter': 'chart',
+      '#chart-time': 'chart',
+      '#checks-table': 'table:10x8',
+    });
     const qs = queryString();
     const [data, stats] = await Promise.all([api('/api/logs?' + qs), api('/api/stats?' + qs)]);
     rows = data.rows || [];

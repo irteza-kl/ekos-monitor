@@ -69,6 +69,10 @@
   }
 
   async function load() {
+    PM.showSkeleton({
+      '#user-tiles': 'tiles:5',
+      '#user-table': 'table:10x9',
+    });
     const data = await api('/api/users?' + queryString());
     rows = data.rows || [];
     total = data.total || 0;

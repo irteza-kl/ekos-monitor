@@ -129,6 +129,18 @@
   }
 
   async function load() {
+    PM.showSkeleton({
+      '#tiles': 'tiles:8',
+      '#overview-map': 'map',
+      '#chart-geo': 'chart',
+      '#chart-acc': 'chart',
+      '#chart-hist': 'chart',
+      '#chart-device': 'chart',
+      '#chart-sites': 'chart',
+      '#chart-checks': 'chart',
+      '#user-table': 'table:8x7',
+      '#check-tiles': 'tiles:5',
+    });
     const qs = queryString();
     const [stats, users] = await Promise.all([api('/api/stats?' + qs), api('/api/users?' + qs + '&limit=200')]);
     renderTiles(stats);

@@ -44,6 +44,11 @@
   });
 
   async function load() {
+    PM.showSkeleton({
+      '#site-tiles': 'tiles:6',
+      '#sites-map': 'map',
+      '#sites-table': 'table:8x8',
+    });
     const data = await api('/api/sites?' + queryString());
     sites = data.rows || [];
     renderTiles(data);

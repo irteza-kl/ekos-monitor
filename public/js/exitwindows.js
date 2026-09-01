@@ -111,6 +111,12 @@
   });
 
   async function load() {
+    PM.showSkeleton({
+      '#ew-tiles': 'tiles:11',
+      '#ew-timeline': 'chart',
+      '#ew-verdicts': 'chart',
+      '#ew-table': 'table:10x11',
+    });
     const qs = queryString();
     const [data, stats] = await Promise.all([api('/api/exit-windows?' + qs), api('/api/stats?' + qs)]);
     rows = data.rows || [];

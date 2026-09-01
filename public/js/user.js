@@ -60,7 +60,7 @@
           { id: 'raw', label: 'Raw document', render: renderRawTab },
         ],
         // Nothing to render until the first load() resolves.
-        { defer: true }
+        { defer: true, skeleton: 'block' }
       );
 
       await load();
@@ -78,6 +78,14 @@
   }
 
   async function load() {
+    PM.showSkeleton({
+      '#hero': 'text:2',
+      '#user-tiles': 'tiles:8',
+      '#identity-card': 'kv:8',
+      '#device-card': 'kv:8',
+      '#state-card': 'kv:6',
+      '#shift-card': 'kv:6',
+    });
     try {
       detail = await api('/api/users/' + encodeURIComponent(userId) + '?historyLimit=800&' + queryString());
     } catch (err) {
@@ -691,6 +699,7 @@
   }
 
   async function loadHeartbeats() {
+    PM.showSkeleton({ '#hb-table': 'table:12x8' }, { force: true });
     const table = document.querySelector('#hb-table');
     if (!table) return;
     let data;
@@ -722,56 +731,9 @@
       return;
     }
 
-    const t = el('table');
-    t.innerHTML =
-      '<thead><tr><th>Time</th><th>Device / app</th><th>Session</th><th>Geofence</th>' +
-      '<th class="num">From boundary</th><th>Site</th><th>Lat / lng</th><th class="num">Accuracy</th>' +
-      '<th class="num">Battery</th><th>Network</th><th>Device time</th></tr></thead>';
-    const body = el('tbody');
-    for (const row of rows) {
-      const rel = row.relation;
-      body.append(
-        el('tr', {
-          class: 'clickable',
-          title: 'Open this heartbeat',
-          onclick: () => openHeartbeat(row),
-          html:
-            '<td>' + fmt.dayTime(row.capturedAt) + '<div class="person-sub">' + fmt.ago(row.capturedAt) + '</div></td>' +
-            // device and app version travel together, so they share a cell
-            '<td><span class="badge badge-neutral">' + esc(row.deviceType || '?') + '</span>' +
-            '<div class="person-sub">v' + esc(row.appVersion || '?') +
-            ' <span style="opacity:.65">· ' + esc(row.buildVersion || '?') + '</span></div></td>' +
-            // logged in + clocked in: two facts about the same session
-            '<td><div style="display:flex;gap:4px">' +
-            (row.isUserLoggedIn
-              ? '<span class="badge badge-good" title="user logged in">✓ in</span>'
-              : '<span class="badge badge-warning" title="user logged out">✕ out</span>') +
-            (row.clockedIn
-              ? '<span class="badge badge-info" title="clocked in">clock IN</span>'
-              : '<span class="badge badge-neutral" title="not clocked in">clock OUT</span>') +
-            '</div></td>' +
-            '<td>' + PM.geofenceBadge(row.isInsideGeofence, row.computedVerdict, row.verdictReason) +
-            (row.verdictDisagrees ? ' <span class="badge badge-critical" title="app flag and geometry disagree">⚑</span>' : '') +
-            '</td>' +
-            '<td class="num">' +
-            (rel ? (rel.inside ? '−' : '+') + fmt.metres(Math.abs(rel.distanceFromBoundary)) : '--') +
-            '</td>' +
-            '<td>' + (row.jobSiteId != null ? 'Site ' + row.jobSiteId : '<span class="hint">unmapped</span>') + '</td>' +
-            '<td class="mono">' +
-            (row.location ? fmt.coords(row.location) : '<span class="badge badge-neutral">no fix</span>') +
-            '</td>' +
-            '<td class="num">' + PM.accuracyBadge(row.accuracyBand, row.accuracy) + '</td>' +
-            '<td class="num">' + PM.batteryBadge(row.battery) + '</td>' +
-            '<td>' +
-            (row.offline ? '<span class="badge badge-critical">offline</span>' : '<span class="badge badge-neutral">online</span>') +
-            '</td>' +
-            '<td class="person-sub">' + esc(row.deviceTime || '--') + '</td>',
-        })
-      );
-    }
-    t.append(body);
-    table.append(el('div', { class: 'table-block' }, [el('div', { class: 'table-scroll' }, [t])]));
-
+    // Same table, same gap rows and same drawer as the Heartbeats page - this
+    // is that page filtered to one person.
+    PMHeartbeats.table(table, rows, { gapRows: true, onOpen: openHeartbeat });
     const pager = document.querySelector('#hb-pager');
     pager.innerHTML = '';
     pager.append(
@@ -800,61 +762,10 @@
 
   /** One heartbeat, expanded - the fields that do not fit the table. */
   function openHeartbeat(row) {
-    const rel = row.relation;
-    PM.openDrawer({
-      title: 'Heartbeat ' + fmt.time(row.capturedAt),
-      subtitle: fmt.date(row.capturedAt) + ' · ' + (row.name || 'device') + ' · document ' + row.id,
-      tabs: [
-        {
-          id: 'heartbeat',
-          label: 'Details',
-          render: (panel) =>
-            panel.append(
-              el('div', { class: 'section-title', text: 'Location' }),
-              PM.kv([
-                ['Captured at', fmt.date(row.capturedAt) + ' (' + fmt.ago(row.capturedAt) + ')'],
-                ['Coordinates', row.location ? fmt.coords(row.location) : 'none reported'],
-                ['Accuracy', PM.accuracyBadge(row.accuracyBand, row.accuracy)],
-                ['Geofence (device flag)', PM.geofenceBadge(row.isInsideGeofence)],
-                [
-                  'Geofence (recomputed)',
-                  row.computedVerdict
-                    ? PM.geofenceBadge(null, row.computedVerdict, row.verdictReason) +
-                      (row.verdictReason ? ' <span class="hint">' + esc(row.verdictReason) + '</span>' : '')
-                    : 'no fence on record',
-                ],
-                rel
-                  ? [
-                      'Distance to boundary',
-                      fmt.metres(Math.abs(rel.distanceFromBoundary)) +
-                        (rel.inside ? ' inside' : ' outside') +
-                        ' · ' + fmt.metres(rel.distanceFromCenter) + ' from the centre · bearing ' + rel.bearing + '° ' + rel.compass,
-                    ]
-                  : undefined,
-                ['Site', row.jobSiteId != null ? 'Site ' + row.jobSiteId + (row.site && row.site.address ? ' · ' + esc(row.site.address) : '') : 'unmapped'],
-                ['Geofence entered', fmt.date(row.geofenceIn)],
-                ['Geofence left', fmt.date(row.geofenceOut)],
-              ]),
-              el('div', { class: 'section-title', text: 'Device & session' }),
-              PM.kv([
-                ['Clock', row.clockedIn ? 'on the clock' : 'off the clock'],
-                ['Battery', PM.batteryBadge(row.battery)],
-                ['Connectivity', row.isConnected ? 'connected' : 'disconnected'],
-                ['Reachable', fmt.bool(row.isReachable)],
-                ['Session', (row.sessionLoggedIn ? 'session active' : 'session inactive') + ' · ' + (row.isUserLoggedIn ? 'logged in' : 'logged out')],
-                ['Platform', (row.deviceType || '?') + ' · app ' + (row.appVersion || '?') + ' build ' + (row.buildVersion || '?')],
-                ['Device time', row.deviceTime || '--'],
-                ['Clock drift vs server', row.clockDriftSeconds === null ? '--' : row.clockDriftSeconds + ' s'],
-                ['Permissions granted', (row.permissionsEnabled || []).join(', ') || 'none'],
-                ['Permissions missing', (row.permissionsMissing || []).join(', ') || 'none'],
-                ['Document id', row.id],
-              ])
-            ),
-        },
-      ],
-    });
+    // The row may not carry the person (this page already knows them), so fill
+    // the name in for the drawer subtitle.
+    PMHeartbeats.drawer({ ...row, name: row.name || (detail.current && detail.current.name) || null });
   }
-
   function tabHeader(text, action) {
     return el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap' }, [
       el('span', { class: 'hint', text }),

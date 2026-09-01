@@ -74,6 +74,8 @@
   --map-frame: rgba(11, 11, 11, 0.14);
   --map-shadow: 0 1px 5px rgba(11, 11, 11, 0.26);
   --map-label-bg: rgba(252, 252, 251, 0.9);
+  --sk-base: #e6e5de;
+  --sk-sheen: rgba(255, 255, 255, 0.7);
   --json-key: #1c5cab;
   --json-string: #0f7048;
   --json-number: #96590a;
@@ -142,6 +144,8 @@
     --map-frame: rgba(255, 255, 255, 0.14);
     --map-shadow: 0 1px 5px rgba(0, 0, 0, 0.5);
     --map-label-bg: rgba(13, 13, 13, 0.85);
+    --sk-base: #262625;
+    --sk-sheen: rgba(255, 255, 255, 0.07);
     --json-key: #3987e5;
     --json-string: #8fd6b0;
     --json-number: #c98500;
@@ -204,6 +208,8 @@
   --map-frame: rgba(255, 255, 255, 0.14);
   --map-shadow: 0 1px 5px rgba(0, 0, 0, 0.5);
   --map-label-bg: rgba(13, 13, 13, 0.85);
+  --sk-base: #262625;
+  --sk-sheen: rgba(255, 255, 255, 0.07);
   --json-key: #3987e5;
   --json-string: #8fd6b0;
   --json-number: #c98500;
@@ -329,7 +335,12 @@ input, select, textarea, button {
   border-radius: var(--radius-sm);
   padding: 6px 9px;
 }
-input:focus, select:focus, textarea:focus { outline: 2px solid var(--series-1); outline-offset: -1px; }
+/* Keyboard focus only. A mouse click on a checkbox used to leave a blue ring
+   sitting on it afterwards; :focus-visible still rings text fields and selects
+   (where a caret is expected) and anything reached by Tab. */
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--series-1); outline-offset: -1px;
+}
 input[type='checkbox'] { accent-color: var(--series-1); }
 select[multiple] { min-height: 74px; padding: 4px; }
 select[multiple] option { padding: 2px 4px; }
@@ -906,7 +917,94 @@ select[multiple] { appearance: auto; background-image: none; padding-right: 4px;
 .map-toolbar .chip.is-on {
   background: var(--info-bg); border-color: var(--info-line); color: var(--info-fg); font-weight: 550;
 }
-.map-toolbar .chip:focus-within { box-shadow: 0 0 0 3px var(--info-bg); }
+.map-toolbar .chip:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--info-bg); }
 .map-toolbar .toolbar-field { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-muted); }
 .map-toolbar select { padding: 3px 24px 3px 8px; min-height: 26px; font-size: 12px; }
 
+/* ------------------------------------------------------------- skeletons */
+/* A grey block that says "this is on its way" instead of an empty panel that
+   says "there is nothing here". Only one of those is true while a query is
+   still running, and the numbers here are slow enough for it to matter. */
+.sk {
+  position: relative; overflow: hidden;
+  background: var(--sk-base); border-radius: 6px;
+}
+.sk::after {
+  content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--sk-sheen), transparent);
+  animation: sk-sweep 1.4s ease-in-out infinite;
+}
+@keyframes sk-sweep { to { transform: translateX(100%); } }
+
+.sk-line { height: 11px; }
+.sk-line + .sk-line { margin-top: 8px; }
+.sk-w25 { width: 25%; } .sk-w40 { width: 40%; } .sk-w60 { width: 60%; } .sk-w80 { width: 80%; }
+.sk-title { height: 14px; width: 170px; }
+.sk-pill { height: 20px; width: 74px; border-radius: 999px; }
+.sk-dot { height: 34px; width: 34px; border-radius: 50%; flex: none; }
+.sk-block { height: 120px; border-radius: var(--radius); }
+
+/* tiles: same grid as the real KPI row, so nothing jumps when data lands */
+.sk-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.sk-tile { height: 92px; border-radius: var(--radius); }
+
+/* table: a header strip and rows at row height */
+.sk-table { padding: 0; }
+.sk-tr { display: flex; gap: 18px; align-items: center; padding: 11px 14px; border-bottom: 1px solid var(--border); }
+.sk-tr:last-child { border-bottom: 0; }
+.sk-tr .sk { flex: 1; }
+.sk-tr.sk-head { background: var(--surface-2); }
+.sk-tr.sk-head .sk { height: 9px; }
+
+/* charts and maps keep their canvas - the shimmer goes over the top */
+.chart-wrap.is-loading, .map.is-loading { position: relative; }
+.chart-wrap.is-loading::after, .map.is-loading::after {
+  content: ''; position: absolute; inset: 0; z-index: 402; pointer-events: none;
+  background: var(--sk-base);
+  background-image: linear-gradient(90deg, transparent, var(--sk-sheen), transparent);
+  background-repeat: no-repeat; background-size: 60% 100%; background-position: -60% 0;
+  animation: sk-slide 1.4s ease-in-out infinite;
+  border-radius: inherit;
+}
+@keyframes sk-slide { to { background-position: 160% 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .sk::after, .chart-wrap.is-loading::after, .map.is-loading::after { animation: none; }
+}
+
+/* ------------------------------------------------- heartbeat gaps (user page) */
+/* Silence between heartbeats gets a row of its own. Subtracting two timestamps
+   by eye is not a reasonable way to notice that a device stopped reporting. */
+.notice.is-critical { border-color: var(--critical-line); background: var(--critical-bg); }
+
+.hb-gap > td {
+  padding: 9px 12px; white-space: nowrap;
+  background: var(--warning-bg);
+  border-top: 1px dashed var(--warning-line);
+  border-bottom: 1px dashed var(--warning-line);
+}
+.hb-gap.is-critical > td {
+  background: var(--critical-bg);
+  border-top-color: var(--critical-line); border-bottom-color: var(--critical-line);
+}
+.hb-gap:hover > td { background: var(--warning-bg); }
+.hb-gap.is-critical:hover > td { background: var(--critical-bg); }
+
+.hb-gap-label {
+  font-weight: 650; font-size: 12px; color: var(--warning-fg); margin-right: 10px;
+}
+.hb-gap.is-critical .hb-gap-label { color: var(--critical-fg); }
+.hb-gap-chip {
+  display: inline-flex; align-items: center; margin-right: 6px;
+  padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.hb-gap-chip.is-strong { font-weight: 600; color: var(--ink); border-color: var(--border-strong); }
+.hb-gap-chip.is-warning { background: var(--warning-bg); border-color: var(--warning-line); color: var(--warning-fg); }
+.hb-gap-chip.is-serious { background: var(--serious-bg); border-color: var(--serious-line); color: var(--serious-fg); }
+
+/* The heartbeats host holds a gap banner and a table - two blocks, so they take
+   the same spacing as any other pair of sections instead of touching. */
+.hb-stack { display: flex; flex-direction: column; gap: 14px; }
+.card-body.tight .hb-stack > .notice { margin: 14px 14px 0; }
