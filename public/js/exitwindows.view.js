@@ -59,9 +59,12 @@ window.PMExitWindows = (function () {
     if (!a || a.method === 'none' || (a.userId === null && a.method !== 'userId')) {
       const candidates = a && a.candidates && a.candidates.length ? a.candidates : null;
       if (candidates) {
+        // person-sub is a single ellipsised line, so the full list goes in the
+        // tooltip too - otherwise the names past the first are unrecoverable.
+        const names = candidates.map((c) => c.name || 'user ' + c.userId).join(', ');
         return (
           '<span class="badge badge-warning" title="' + esc(a.note || '') + '">≈ ' + candidates.length + ' candidates</span>' +
-          '<div class="person-sub">' + esc(candidates.map((c) => c.name || 'user ' + c.userId).join(', ')) + '</div>'
+          '<div class="person-sub" title="' + esc(names) + '">' + esc(names) + '</div>'
         );
       }
       return (

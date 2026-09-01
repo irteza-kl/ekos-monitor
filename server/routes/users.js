@@ -9,6 +9,7 @@ const normalize = require('../lib/normalize');
 const geo = require('../lib/geo');
 const csv = require('../lib/csv');
 const { attachWindowSite, siteLookup, getSites } = require('../lib/sites');
+const { redact } = require('../lib/redact');
 const { windowsForUser } = require('../lib/attribution');
 
 const router = express.Router();
@@ -422,7 +423,7 @@ router.get('/users/:userId', async (req, res, next) => {
 
     res.json({
       current,
-      raw: latestDoc,
+      raw: redact(latestDoc),
       stats: agg
         ? {
             snapshots: agg.snapshots,

@@ -8,6 +8,7 @@ const { LOG } = F;
 const normalize = require('../lib/normalize');
 const csv = require('../lib/csv');
 const { siteLookup } = require('../lib/sites');
+const { redact } = require('../lib/redact');
 
 const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
@@ -84,7 +85,7 @@ router.get('/logs/:id', async (req, res, next) => {
     if (ObjectId.isValid(req.params.id)) doc = await col.findOne({ _id: new ObjectId(req.params.id) });
     if (!doc) return res.status(404).json({ error: 'Log not found' });
     const lookup = await siteLookup();
-    res.json({ row: normalize.clockInLog(doc, lookup), raw: doc });
+    res.json({ row: normalize.clockInLog(doc, lookup), raw: redact(doc) });
   } catch (err) {
     next(err);
   }

@@ -74,9 +74,8 @@ Then set the environment variables in **Project → Settings → Environment Var
 (at minimum `MONGODB_URI` and `MONGODB_DB`) and redeploy.
 
 **Before deploying publicly, set `APP_USERNAME` and `APP_PASSWORD`.** With them empty
-the dashboard is open to anyone with the URL, and the raw-document views include
-employee PII from `tenantAccount` — email, phone, SSN and bank details.
-`.env` is gitignored and never uploaded.
+the dashboard is open to anyone with the URL, and it shows live coordinates and
+employee contact details. `.env` is gitignored and never uploaded.
 
 Or from the dashboard: import the repo, leave the framework as *Other*, output
 directory `public`, add the env vars, deploy.
@@ -152,6 +151,30 @@ the password nor its length leaks through timing, and a wrong username costs exa
 what a wrong password does. Pages served through the gate are sent
 `Cache-Control: private, no-store` so no shared cache can hold an authorised copy and
 hand it to the next visitor.
+
+## What is redacted
+
+The heartbeat documents embed the whole employee record, which in this store carries
+SSN, bank account and routing numbers, home address and emergency contacts. None of
+it is needed to answer a question about geofences or device health, and every
+raw-document view — the Query Explorer, the **Raw document** drawer tabs — would
+otherwise put it on screen.
+
+[`server/lib/redact.js`](server/lib/redact.js) strips those fields from every
+response that carries a raw document: `/api/query`, `/api/logs/:id`,
+`/api/exit-windows/:id` and `/api/users/:id`. Matching is by field **name** at any
+depth, so it keeps working when the writers add a field or move one, and a value
+becomes `[redacted]` rather than vanishing — redaction should not look like missing
+data.
+
+One rule is context-sensitive. An `address` is personal inside a person's record and
+is stripped there, but a **job site** address is the whole point of the Sites page and
+is kept. Redacting by name alone broke the site address in the Checks raw view, which
+is why the distinction exists.
+
+What deliberately remains: names, employee reference, role, email and phone. An ops
+console needs to say who a device belongs to and how to reach them. If a viewer
+should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 
 ## What the pages show
 

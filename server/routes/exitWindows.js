@@ -8,6 +8,7 @@ const P = require('../lib/pipelines');
 const normalize = require('../lib/normalize');
 const csv = require('../lib/csv');
 const { getSites, attachWindowSite, FENCE_MATCH_METRES } = require('../lib/sites');
+const { redact } = require('../lib/redact');
 const geo = require('../lib/geo');
 const { attributeWindows } = require('../lib/attribution');
 
@@ -170,7 +171,7 @@ router.get('/exit-windows/:id', async (req, res, next) => {
     if (!doc) return res.status(404).json({ error: 'Exit window not found' });
     const row = await attachWindowSite(normalize.exitWindow(doc));
     await attributeWindows([row]);
-    res.json({ row, raw: doc });
+    res.json({ row, raw: redact(doc) });
   } catch (err) {
     next(err);
   }

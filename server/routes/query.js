@@ -4,6 +4,7 @@ const { EJSON } = require('bson');
 const config = require('../config');
 const { getDb, resolveCollections } = require('../db');
 const F = require('../lib/filters');
+const { redact } = require('../lib/redact');
 
 const router = express.Router();
 
@@ -59,7 +60,7 @@ router.post('/query', async (req, res, next) => {
         took: Date.now() - started,
         count: docs.length,
         limit,
-        rows: EJSON.serialize(docs, { relaxed: true }),
+        rows: redact(EJSON.serialize(docs, { relaxed: true })),
       });
     }
 
@@ -92,7 +93,7 @@ router.post('/query', async (req, res, next) => {
       total,
       limit,
       skip,
-      rows: EJSON.serialize(docs, { relaxed: true }),
+      rows: redact(EJSON.serialize(docs, { relaxed: true })),
       plan: explain
         ? {
             stage: explain.queryPlanner && explain.queryPlanner.winningPlan,
