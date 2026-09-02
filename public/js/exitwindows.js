@@ -15,9 +15,12 @@
   const { resolutionLabel } = PMExitWindows;
 
   PM.boot('exit-windows.html', async ({ root, meta }) => {
-    const ew = meta.exitWindows || {};
+    // A function, not a value: the filter bar is built before /api/meta
+    // answers and rebuilt when it does, so a snapshot taken here would keep
+    // these dropdowns empty for the life of the page.
+    const ew = () => meta.exitWindows || {};
 
-    PM.buildFilterBar([
+    PM.buildFilterBar(() => [
       { kind: 'daterange' },
       {
         kind: 'multi',
@@ -25,15 +28,15 @@
         label: 'User (matched)',
         options: PM.optionsFrom(meta.users || [], 'id', 'name', 'snapshots'),
       },
-      { kind: 'multi', key: 'status', label: 'Status', options: PM.optionsFrom(ew.statuses || [], 'key', 'key', 'count') },
+      { kind: 'multi', key: 'status', label: 'Status', options: PM.optionsFrom(ew().statuses || [], 'key', 'key', 'count') },
       {
         kind: 'multi',
         key: 'resolution',
         label: 'Resolution',
-        options: (ew.resolutions || []).map((r) => ({ value: r.key, label: resolutionLabel(r.key), count: r.count })),
+        options: (ew().resolutions || []).map((r) => ({ value: r.key, label: resolutionLabel(r.key), count: r.count })),
       },
-      { kind: 'multi', key: 'openedBy', label: 'Opened by', options: PM.optionsFrom(ew.openedBy || [], 'key', 'key', 'count') },
-      { kind: 'multi', key: 'deviceType', label: 'Device', options: PM.optionsFrom(ew.deviceTypes || [], 'key', 'key', 'count') },
+      { kind: 'multi', key: 'openedBy', label: 'Opened by', options: PM.optionsFrom(ew().openedBy || [], 'key', 'key', 'count') },
+      { kind: 'multi', key: 'deviceType', label: 'Device', options: PM.optionsFrom(ew().deviceTypes || [], 'key', 'key', 'count') },
       {
         kind: 'multi',
         key: 'jobSiteId',

@@ -1061,3 +1061,85 @@ select[multiple] { appearance: auto; background-image: none; padding-right: 4px;
    the same spacing as any other pair of sections instead of touching. */
 .hb-stack { display: flex; flex-direction: column; gap: 14px; }
 .card-body.tight .hb-stack > .notice { margin: 14px 14px 0; }
+
+/* ------------------------------------------------- direction of travel
+   A count with no baseline cannot say whether anything is improving, which
+   is most of what a monitor is for. These carry the comparison against the
+   previous window of equal length. Colour follows meaning, not direction:
+   more problems is always "worse", whichever way the arrow points. */
+.delta {
+  font-size: 11px; font-weight: 550; letter-spacing: 0.01em;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: 999px; align-self: flex-start;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.delta.is-worse { background: var(--critical-bg); color: var(--critical-fg); border-color: var(--critical-line); }
+.delta.is-better { background: var(--good-bg); color: var(--good-fg); border-color: var(--good-line); }
+.delta.is-flat { background: var(--surface-3); color: var(--ink-muted); border-color: var(--border); }
+
+/* The same idea inline in a table cell or an issue row, where a full chip
+   would crowd the number it is annotating. */
+.trend {
+  margin-left: 6px; font-size: 10.5px; font-weight: 550;
+  padding: 1px 5px; border-radius: 4px; white-space: nowrap;
+}
+.trend.is-worse { background: var(--critical-bg); color: var(--critical-fg); }
+.trend.is-better { background: var(--good-bg); color: var(--good-fg); }
+.trend.is-flat { background: var(--surface-3); color: var(--ink-muted); }
+.trend.is-new { background: var(--serious-bg); color: var(--serious-fg); }
+
+/* Marks the heartbeat-weighted figure when it disagrees with measured time by
+   ten points or more - the sampling bias made visible in the cell itself. */
+td.is-off { color: var(--ink-muted); }
+
+/* ------------------------------------------------------------ stale banner
+   Shown when a load or refresh fails. It sits above the content because the
+   fact that the figures below are old has to be read before them - the old
+   behaviour was a toast that vanished after seven seconds, leaving stale
+   numbers looking current. */
+.banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; margin-bottom: 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface-2); color: var(--ink);
+  font-size: 13px;
+}
+.banner.is-stale { background: var(--warning-bg); border-color: var(--warning-line); color: var(--warning-fg); }
+.banner-icon {
+  flex: none; width: 20px; height: 20px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 12px;
+  background: var(--warning-fg); color: var(--surface);
+}
+.banner-text { min-width: 0; }
+.banner-text b { font-weight: 600; }
+
+/* A panel whose own request failed, so the rest of the page can still render. */
+.panel-error {
+  padding: 18px 14px; text-align: center; font-size: 13px;
+  color: var(--ink-muted); border: 1px dashed var(--border); border-radius: 10px;
+}
+
+/* ------------------------------------------------------- time on site card
+   Two bodies in one card - padded for the tiles, full-bleed for the table,
+   the way every other table here sits. A single `tight` body put the tiles
+   flush against the card border. This rule is the seam between the two. */
+.card-split { border-top: 1px solid var(--border); }
+
+.muted { color: var(--ink-muted); }
+td.strong { font-weight: 600; color: var(--ink); }
+
+/* Chips on one wrapping line, so every row of this table is the same height.
+   Stacked lines made some rows three times taller than their neighbours, and
+   a column of measurements cannot be read down if the rows do not line up. */
+.chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
+.fence-table td { vertical-align: middle; }
+.fence-table .chip {
+  font-size: 11px; padding: 1px 8px; gap: 4px; white-space: nowrap;
+  background: var(--surface-3); color: var(--ink-2);
+}
+.fence-table td.num .chip { margin-left: 6px; }
+/* Marks the heartbeat-weighted figure where it disagrees with measured time. */
+.fence-table .chip-warn { background: var(--critical-bg); color: var(--critical-fg); border-color: var(--critical-line); }
+/* A caveat on a number rather than a fault: this count is a floor. */
+.fence-table .chip-soft { background: transparent; color: var(--ink-muted); border-style: dashed; }

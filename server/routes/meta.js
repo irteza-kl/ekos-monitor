@@ -11,7 +11,19 @@ const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
 
 let cache = { at: 0, data: null };
-const TTL_MS = 60 * 1000;
+/**
+ * Ten minutes, not one.
+ *
+ * This endpoint probes every collection in the database and then runs a
+ * seven-way facet over all of it - about six seconds cold. What it returns is
+ * the contents of the filter dropdowns: the list of users, tenants, app builds,
+ * timezones and sites. Those change over days, not minutes, so a one-minute
+ * cache paid a heavy cost repeatedly for an answer that had not moved.
+ *
+ * The Refresh button sends refresh=1 and bypasses this, so a genuinely new
+ * user or site is never more than one click away.
+ */
+const TTL_MS = 10 * 60 * 1000;
 
 router.get('/meta', async (req, res, next) => {
   try {

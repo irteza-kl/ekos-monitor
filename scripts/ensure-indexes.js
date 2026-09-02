@@ -5,9 +5,11 @@
  *   node scripts/ensure-indexes.js         # show what would be created
  *   node scripts/ensure-indexes.js --yes   # create them
  *
- * The dashboard works without these - Mongo just scans more documents. On the
- * staging collection (~87k snapshots) that is a second or two per query; index
- * them if the dataset keeps growing or the pages feel slow.
+ * These are already created on the staging cluster. Re-running is safe: the
+ * script reports what exists and creates only what is missing.
+ *
+ * The dashboard works without them - Mongo just scans - but every per-user,
+ * per-site and per-tenant query was a full collection scan before they existed.
  *
  * Index builds on Atlas are background operations, but they are still writes to
  * a shared database, so nothing happens unless you pass --yes.

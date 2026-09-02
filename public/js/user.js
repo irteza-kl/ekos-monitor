@@ -20,7 +20,7 @@
     'user.html',
     async ({ root }) => {
       PM.buildFilterBar(
-        [
+        () => [
           { kind: 'daterange' },
           {
             kind: 'multi',
@@ -384,9 +384,14 @@
                 ')',
             ]
           : undefined,
-        ['Geofence entered', fmt.date(row.geofenceIn)],
-        ['Geofence left', fmt.date(row.geofenceOut)],
-        ['Last snapshot', fmt.date(row.capturedAt) + ' (' + fmt.ago(row.capturedAt) + ')'],
+        ['Geofence entered', fmt.dateIn(row.geofenceIn, row.timezone)],
+        ['Geofence left', fmt.dateIn(row.geofenceOut, row.timezone)],
+        [
+          'Last snapshot',
+          // Their local time answers "when", the relative time answers "how
+          // fresh"; a viewer eleven hours away needs both.
+          fmt.dateIn(row.capturedAt, row.timezone) + ' (' + fmt.ago(row.capturedAt) + ')',
+        ],
       ])
     );
   }
@@ -399,10 +404,16 @@
     host.append(
       PM.kv([
         ['Time entry', te ? '#' + te.id + ' · ' + (te.status || '?') + (te.date ? ' · ' + te.date : '') : 'none open'],
-        ['Clock in', te ? fmt.date(te.clockIn) + (te.clockInNetworkStatus ? ' (' + te.clockInNetworkStatus + ')' : '') : '--'],
-        ['Clock out', te ? fmt.date(te.clockOut) + (te.clockOutNetworkStatus ? ' (' + te.clockOutNetworkStatus + ')' : '') : '--'],
-        ['Geofence clock in', te ? fmt.date(te.geoFenceClockIn) : '--'],
-        ['Geofence clock out', te ? fmt.date(te.geoFenceClockOut) : '--'],
+        [
+          'Clock in',
+          te ? fmt.dateIn(te.clockIn, row.timezone) + (te.clockInNetworkStatus ? ' (' + te.clockInNetworkStatus + ')' : '') : '--',
+        ],
+        [
+          'Clock out',
+          te ? fmt.dateIn(te.clockOut, row.timezone) + (te.clockOutNetworkStatus ? ' (' + te.clockOutNetworkStatus + ')' : '') : '--',
+        ],
+        ['Geofence clock in', te ? fmt.dateIn(te.geoFenceClockIn, row.timezone) : '--'],
+        ['Geofence clock out', te ? fmt.dateIn(te.geoFenceClockOut, row.timezone) : '--'],
         ['Site area', te && te.siteAreaId != null ? 'Site area ' + te.siteAreaId : '--'],
         [
           'Face verification',

@@ -1,28 +1,94 @@
 'use strict';
 const express = require('express');
 const issues = require('../lib/issues');
+const cache = require('../lib/cache');
 const csv = require('../lib/csv');
 
 const router = express.Router();
 
 /**
  * Detection costs a few seconds - it walks every heartbeat in range twice - and
- * the Overview page reloads it on every auto-refresh tick. A short cache keyed by
- * the query keeps the page responsive without letting the feed go stale enough to
- * matter; ?refresh=1 bypasses it.
+ * the Overview page reloads it on every auto-refresh tick, so it goes through the
+ * shared short-lived cache; ?refresh=1 bypasses it.
  */
-const CACHE_TTL_MS = 60 * 1000;
-const CACHE_MAX_KEYS = 8;
-const cache = new Map();
+const store = cache.create({ ttlMs: 60 * 1000, maxKeys: 12 });
 
-async function detectCached(query) {
-  const key = JSON.stringify(query || {}, Object.keys(query || {}).sort());
-  const hit = cache.get(key);
-  if (query.refresh !== '1' && hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.data;
-  const data = await issues.detect(query);
-  if (cache.size >= CACHE_MAX_KEYS) cache.delete(cache.keys().next().value);
-  cache.set(key, { at: Date.now(), data });
-  return data;
+const detectCached = (query) => store.through(query, () => issues.detect(query));
+
+/**
+ * The window immediately before the one being asked about, same length.
+ *
+ * A count on its own does not say whether anything is getting worse, which is
+ * most of what a monitor is for. The filter bar resolves its presets to an
+ * explicit `from`, so the length is known and the period before it is the
+ * natural baseline.
+ *
+ * Returns null for an unbounded range: with no start there is no previous
+ * period, and inventing one would be worse than showing no comparison.
+ *
+ * The open end is rounded down to the minute. Taken raw it moves every
+ * millisecond, which gave every request a slightly different baseline window:
+ * the comparison never hit the cache, and the number it produced drifted
+ * between two refreshes of the same page.
+ */
+const BASELINE_GRANULARITY_MS = 60 * 1000;
+
+function previousWindow(query) {
+  const from = query.from ? new Date(query.from).getTime() : null;
+  if (from === null || Number.isNaN(from)) return null;
+  const to = query.to
+    ? new Date(query.to).getTime()
+    : Math.floor(Date.now() / BASELINE_GRANULARITY_MS) * BASELINE_GRANULARITY_MS;
+  if (Number.isNaN(to) || to <= from) return null;
+  const length = to - from;
+  return { from: new Date(from - length).toISOString(), to: new Date(from).toISOString() };
+}
+
+/** Same filters, shifted back one window, with the comparison flag dropped. */
+function shiftQuery(query, window) {
+  const shifted = { ...query, from: window.from, to: window.to };
+  delete shifted.compare;
+  delete shifted.refresh;
+  return shifted;
+}
+
+/**
+ * Adds "and how does that compare with before?" to a detection result.
+ *
+ * The baseline runs through the same cache, so flipping between filters costs
+ * one extra aggregation the first time and nothing after that. A failure to
+ * build it is not a failure of the endpoint: the current picture is still worth
+ * showing, so the comparison is simply reported as unavailable.
+ */
+async function withComparison(data, query) {
+  const window = previousWindow(query);
+  if (!window) return { ...data, previous: null, previousUnavailable: 'no start date to compare against' };
+  let before;
+  try {
+    before = await detectCached(shiftQuery(query, window));
+  } catch (err) {
+    return { ...data, previous: null, previousUnavailable: err.message };
+  }
+  const wasCounted = new Map(before.issues.map((i) => [i.id, i.count]));
+  return {
+    ...data,
+    // Each issue carries what it was last period, so a row can say "up from 6"
+    // instead of leaving the reader to remember yesterday.
+    issues: data.issues.map((i) => ({
+      ...i,
+      previousCount: wasCounted.has(i.id) ? wasCounted.get(i.id) : 0,
+      isNew: !wasCounted.has(i.id),
+    })),
+    previous: {
+      from: window.from,
+      to: window.to,
+      counts: before.counts,
+      // Issues that were there last period and have since cleared.
+      resolved: before.issues
+        .filter((i) => !data.issues.some((c) => c.id === i.id))
+        .map((i) => ({ id: i.id, title: i.title, severity: i.severity, count: i.count })),
+    },
+  };
 }
 
 /**
@@ -32,7 +98,8 @@ async function detectCached(query) {
  */
 router.get('/issues', async (req, res, next) => {
   try {
-    res.json(await detectCached(req.query));
+    const data = await detectCached(req.query);
+    res.json(req.query.compare === '1' ? await withComparison(data, req.query) : data);
   } catch (err) {
     next(err);
   }

@@ -252,8 +252,8 @@ window.PMHeartbeats = (function () {
                     ]
                   : undefined,
                 ['Site', row.jobSiteId != null ? 'Site ' + row.jobSiteId + (row.site && row.site.address ? ' · ' + esc(row.site.address) : '') : 'unmapped'],
-                ['Geofence entered', fmt.date(row.geofenceIn)],
-                ['Geofence left', fmt.date(row.geofenceOut)],
+                ['Geofence entered', fmt.dateIn(row.geofenceIn, row.timezone)],
+                ['Geofence left', fmt.dateIn(row.geofenceOut, row.timezone)],
               ]),
               el('div', { class: 'section-title', text: 'Person' }),
               PM.kv([

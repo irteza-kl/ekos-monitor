@@ -94,8 +94,15 @@
   ];
 
   PM.boot('explorer.html', async ({ root, meta }) => {
-    const cols = meta.collections || {};
-    collections = [cols.snapshots, cols.clockInLogs, cols.exitWindows].filter(Boolean);
+    // This page is the one that builds UI out of the metadata rather than
+    // merely filtering by it, so it refreshes those parts when the metadata
+    // arrives instead of holding the empty list it started with.
+    const readCollections = () => {
+      const cols = meta.collections || {};
+      collections = [cols.snapshots, cols.clockInLogs, cols.exitWindows].filter(Boolean);
+      return collections;
+    };
+    readCollections();
 
     PM.buildFilterBar([]);
 
@@ -105,7 +112,7 @@
         el('span', {
           html:
             '<b>Read-only console.</b> Queries run with <code>find</code> or <code>aggregate</code> against ' +
-            esc(collections.join(', ') || 'no collections') +
+            '<span id="explorer-collections">' + esc(collections.join(', ') || 'no collections') + '</span>' +
             '. <code>$where</code>, <code>$function</code>, <code>$accumulator</code>, <code>$out</code>, <code>$merge</code>, <code>$lookup</code> and ' +
             'other write or cross-collection stages are rejected server-side, results are capped at 500 documents, and every query has a ' +
             fmt.int(25) +
@@ -203,7 +210,25 @@
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') run();
     });
     setView('table');
-    await loadFields();
+
+    // The collection list comes from /api/meta, which now answers after the
+    // page is drawn. Fill the picker whenever it arrives, then read the fields
+    // for whatever it selected.
+    const fillCollections = async () => {
+      const select = document.querySelector('#q-collection');
+      if (!select) return;
+      const chosen = select.value;
+      const names = readCollections();
+      select.innerHTML = '';
+      for (const name of names) select.append(el('option', { value: name, text: name }));
+      if (names.includes(chosen)) select.value = chosen;
+      const shown = document.querySelector('#explorer-collections');
+      if (shown) shown.textContent = names.join(', ') || 'no collections';
+      await loadFields();
+    };
+
+    await fillCollections();
+    window.addEventListener('pm:meta', fillCollections);
     window.addEventListener('pm:refresh', run);
   });
 

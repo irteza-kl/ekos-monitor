@@ -9,7 +9,7 @@
   let sites = [];
 
   PM.boot('sites.html', async ({ root, meta }) => {
-    PM.buildFilterBar([
+    PM.buildFilterBar(() => [
       { kind: 'daterange' },
       { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'id', 'snapshots') },
       { kind: 'multi', key: 'tenantId', label: 'Tenant', options: PM.optionsFrom(meta.tenants || [], 'id', 'name', 'snapshots') },

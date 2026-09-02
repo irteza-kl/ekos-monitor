@@ -180,7 +180,7 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 
 | Page | What it answers |
 |---|---|
-| **Overview** | **What is wrong, first.** A severity strip opens the page, then the current-state tiles, then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. The live map and the trend charts follow as context. |
+| **Overview** | **What is wrong, first.** A severity strip opens the page - each tile carrying its change against the previous window of equal length - then the current-state tiles, then **time on site** measured per person, then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. The live map and the trend charts follow as context. |
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
 | **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. |
@@ -299,6 +299,19 @@ caches for 60 s (`?refresh=1` bypasses it).
 
 #### Silence is a finding
 
+One flat threshold cannot fit this fleet. With cadence spanning a factor of seventy,
+nine minutes of silence from a device that reports every second is a dead app that no
+ten-minute rule catches, while ten minutes from a device that reports every five
+minutes is barely two missed beats. Each gap is therefore also compared against the
+median gap **for that same device** - one device’s median is 1,002 ms, which makes
+the flat ten-minute threshold six hundred times its normal cadence.
+
+The absolute thresholds stay, because ten and thirty minutes of silence matter to
+anybody whatever the device’s habits. On top of them sits one more finding, *silence
+far beyond what the device normally does*, for gaps too short for a flat rule to see
+but many times that device’s own cadence. Every note carries the multiple and the
+baseline, so "723 min silent · 1219× its usual 36s" can be judged on sight.
+
 Every other number on the page is computed from documents that exist. The problem
 with a device that stopped reporting is documents that do not, so gaps between one
 device's consecutive heartbeats are detected explicitly.
@@ -316,6 +329,110 @@ partition in memory, `allowDiskUse` is not honoured on this deployment, and sort
 whole documents exceeds the 32 MB sort budget outright - so the window pass projects
 down to two fields and the pre-gap state is fetched afterwards for only the gaps
 that were found.
+
+### Counting heartbeats is not measuring time
+
+Reporting rates in this fleet differ by more than two hundred times. One device
+lands a heartbeat every second; another sends one every five minutes. Two devices
+alone produce about four fifths of every heartbeat in the store.
+
+So any percentage computed over heartbeats is largely a statement about those two
+phones. "38% of heartbeats were inside the fence" and "the average person was
+inside 57% of the time" are both true and nowhere near each other, and only the
+second is an answer to the question anybody asked.
+
+`/api/fence-time` ([`server/lib/fence.js`](server/lib/fence.js)) measures it
+properly, by integrating state instead of sampling it: the interval between two
+consecutive heartbeats is credited to the state the earlier one reported. A device
+reporting every second and one reporting every five minutes then give the same
+answer for the same shift.
+
+Each interval is capped at fifteen minutes - the same staleness threshold the rest
+of the console uses. Past that the device was silent and its state is genuinely
+unknown, so the time is dropped rather than credited, and reported separately as
+**silent** time: the span where nobody knew where that person was, which is a
+finding rather than a rounding error.
+
+The method was checked against the two devices that report densely enough for a
+heartbeat count to be close to the truth anyway: integration gives 47% where
+counting gives 51%. For a device whose reporting rate itself changes with the thing
+being measured the two diverge by nearly twenty points, and integration is the
+correct one. The Overview shows both side by side, and flags any person where they
+disagree by ten points or more - seeing them disagree is what makes the difference
+believable.
+
+`/api/stats` reports `dominance` for the same reason: how much of the evidence comes
+from the two loudest devices, so the page can caveat its own heartbeat-weighted
+charts instead of implying they were evenly sampled. It deliberately does **not**
+offer a per-person share of fence time - a share of one person’s heartbeats is
+still rate-biased, and averaging those per person weights somebody with four minutes
+of data equally with somebody with a full day. One endpoint owns that question.
+
+### Fence crossings, and the exits that never arrive
+
+Every heartbeat can also carry `geofenceIn` and `geofenceOut`, the moment of the
+last crossing in each direction. Two things about them, both learned the hard way:
+
+- **They are transient markers, not state.** Most heartbeats carry neither, even
+  while `isInsideGeofence` is true. Grouping heartbeats by their `geofenceIn` value
+  therefore does *not* recover a visit - the first attempt at this credited one
+  person 203% of their own watched time. The crossings are collected as a set of
+  events and paired on their own timeline instead.
+- **An exit is only recorded if a heartbeat was sent while the marker was set,** so
+  exits go missing. An entry followed by another entry means they had left in
+  between; the visit is closed at that second entry and marked `endInferred`, so a
+  reasoned end is never presented as a measured one. An unclosed entry is credited
+  only up to the last heartbeat - beyond that, being on site is an assumption.
+
+Marker coverage is wildly uneven: one device emitted two crossings in 41 hours while
+another emitted forty in a day. Visit counts are therefore a **floor**, never a
+total, `eventCoverage` says how far to trust them per person, and no percentage is
+ever derived from them.
+
+What this makes visible that a heartbeat count cannot: a fence **entered and never
+left** (still inside on the newest heartbeat, an entry recorded, no exit ever), and
+fence crossings **flapping** - crossed and re-crossed within a minute, repeatedly,
+which is GPS scatter against the boundary rather than anybody moving. Each flap can
+open an exit window, so it manufactures alerts as well as draining battery.
+
+### Network state, and one field left alone
+
+`isConnected` and `isReachable` are separate facts and only the first was read. A
+device that reports a working connection and still cannot reach the server is a
+different problem from one with no signal: it points at the server, DNS or the
+route, not at the person holding the phone. Six devices in this store are in that
+state and nothing used to say so.
+
+Clock-ins taken with `clockInNetworkStatus: OFFLINE` are held on the device and
+sent later, so their timestamp and location are whatever the phone believed and
+were never checked against the server. That makes them the least reliable records
+here and the first place to look when a shift or a fence verdict is disputed.
+
+`batteryOptimizationPermission` is deliberately **not** used. It is null on all
+61,812 iOS heartbeats and a boolean on every Android one, so it is platform
+specific rather than missing - and every Android device reports `true`, which
+could mean the exemption is granted or that optimisation is switched on. Nothing
+in the data settles the polarity, and a detector resting on a guess would either
+invent faults or hide them. It needs an answer from whoever writes the app.
+
+### Whose clock is it?
+
+This fleet spans `America/Bogota`, `America/Chicago` and `Asia/Karachi`, and over
+nine tenths of the heartbeats come from people ten or eleven hours away from a viewer
+in Karachi. Every timestamp used to render in the *viewer’s* browser timezone with
+nothing marking it, so a gap shown as 03:37 actually happened at 17:37 the previous
+afternoon where the person was standing - which makes any reasoning about shifts,
+overnight or end-of-day wrong for almost the whole fleet.
+
+Event times - crossings, clock in, clock out, last seen - now render in the worker’s
+own timezone with the zone named (`fmt.dateIn`), because a bare local time is a worse
+kind of wrong: it looks authoritative and cannot be checked. Relative times ("2 h
+ago") stay as they are, being timezone-independent by nature.
+
+One trap worth recording: `toLocaleString` throws if `dateStyle`/`timeStyle` are
+combined with `timeZoneName`, and the throw landed in a fallback that quietly
+rendered the viewer’s time from the function whose entire purpose is not to. The
+options are spelt out component by component for that reason.
 
 ### Where fence geometry comes from
 
@@ -395,6 +512,58 @@ other, and every colour is a CSS variable in one block at the top of
 runtime, so switching theme repaints them live - no reload - and re-theming the whole
 app means editing that block only. Light mode also leaves the map tiles alone; only dark
 mode inverts them.
+
+## When something fails
+
+A failed refresh used to be the most dangerous state this console could be in.
+Every panel kept exactly the numbers it already had, and the only signal was a
+toast that disappeared after seven seconds - so anyone arriving a moment later
+read stale figures as current. A failed *first* load left every panel shimmering
+as a skeleton indefinitely.
+
+Now a failure raises a **standing banner above the content** naming what could
+not be loaded, what time the figures on screen are actually from, and a Retry
+button. It stays until a load succeeds. Nothing is left in a loading state, and
+the live indicator in the topbar reads `stale - refresh failed` rather than a
+timestamp that implies freshness.
+
+The Overview also requests its four endpoints with `Promise.allSettled` rather
+than `Promise.all`. They answer four independent questions, and `all` discarded
+three good answers whenever the fourth failed - so one slow aggregation blanked
+the whole page. Panels whose own request failed say so individually; the rest
+render as normal, and the banner says which is which.
+
+## Cold starts, caches and drifting windows
+
+`/api/meta` probes every collection and then runs a seven-way facet over all of
+it: about six seconds on a cold instance. It used to be awaited before anything
+was drawn, so the window stayed empty for those six seconds - the slowest thing
+about using the console. Nothing on any page needs it in order to request its own
+data; it fills the filter dropdowns and the shell counters. So the page now draws
+and loads immediately, and the dropdowns fill in when metadata arrives.
+
+That is why pages pass a **function** to `PM.buildFilterBar` rather than a built
+spec: the bar is drawn once with empty dropdowns and rebuilt once there is
+something to list. `PM.state.meta` also keeps one object identity for the life of
+the page and is filled in place, because every page destructures it out of its
+init argument and would otherwise hold the empty original. The Query Explorer is
+the one page that builds UI *from* metadata rather than filtering by it, so it
+listens for `pm:meta` and refills its collection picker.
+
+The aggregating endpoints go through a shared 60-second per-query cache
+([`server/lib/cache.js`](server/lib/cache.js)), which also collapses concurrent
+requests for the same key so the Overview firing four requests at once cannot run
+the same aggregation twice. Metadata is cached for ten minutes, since the contents
+of a dropdown change over days. Refresh sends `refresh=1` and bypasses all of it.
+
+**Two drifting windows had been quietly defeating every one of those caches.** A
+rolling preset like "last 24 hours" resolved to `Date.now() - 24h` on every call,
+so no two requests ever shared a cache key and every auto-refresh tick paid full
+price. And the baseline window for the period-on-period comparison was derived
+from `Date.now()` the same way, so it never cached *and its numbers moved between
+two refreshes of the same page*. Both are rounded down to the minute now. A window
+that starts up to sixty seconds early changes no answer here, and the comparison
+is stable.
 
 ## While it loads
 
@@ -478,8 +647,17 @@ as an unmapped fence rather than folded into site 12.
 
 ## Indexes
 
-The dashboard runs unindexed (Mongo scans; ~1–2 s per query on 87k snapshots). If it
-grows, add the indexes the queries want:
+**These are now created on the staging cluster.** All twelve were missing except
+`createdAt_desc`, which meant every per-user, per-site, per-tenant and
+inside/outside query was a collection scan. A per-user query now examines 50
+documents instead of 65,000, in about a millisecond.
+
+They do not speed up the whole-range facets behind `/api/meta` and `/api/stats` -
+nothing indexes a full-collection group - so those rely on the caches above.
+What the indexes fix is every *filtered* view: the tables, the user pages, and
+each dropdown selection.
+
+The script is idempotent - it reports what already exists and creates only what does not:
 
 ```bash
 npm run indexes            # dry run, explains each index
@@ -488,7 +666,7 @@ npm run indexes -- --yes   # create them
 
 ## API
 
-All endpoints are behind the session cookie and take the same filter parameters.
+All endpoints sit behind the password gate and take the same filter parameters.
 
 ```
 GET /api/auth/me                     (who is signed in; the gate itself is HTTP Basic)
@@ -498,5 +676,7 @@ GET  /api/users/:id/track            GET /api/snapshots     GET /api/snapshots.c
 GET  /api/logs                       GET /api/logs.csv      GET /api/logs/:id
 GET  /api/exit-windows               GET /api/exit-windows.csv
 GET  /api/exit-windows/:id           GET /api/sites         GET /api/sites.csv
+GET  /api/issues                     GET /api/issues.csv    (compare=1 adds the previous window)
+GET  /api/fence-time                 GET /api/fence-time.csv (visits=1 returns every visit)
 POST /api/query                      GET /api/query/fields  GET /api/refresh-schema
 ```

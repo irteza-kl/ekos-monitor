@@ -1,7 +1,6 @@
 'use strict';
 const path = require('path');
 const express = require('express');
-const cookieParser = require('cookie-parser');
 const config = require('./config');
 const auth = require('./lib/auth');
 const { resolveCollections } = require('./db');
@@ -10,7 +9,6 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '256kb' }));
-app.use(cookieParser());
 
 // -------------------------------------------------------------------- logging
 // One line per API call: what was asked, what came back, how long Mongo took.
@@ -81,6 +79,7 @@ app.use('/api', require('./routes/logs'));
 app.use('/api', require('./routes/exitWindows'));
 app.use('/api', require('./routes/sites'));
 app.use('/api', require('./routes/issues'));
+app.use('/api', require('./routes/fence'));
 app.use('/api', require('./routes/query'));
 
 app.get('/api/refresh-schema', async (req, res, next) => {

@@ -8,7 +8,7 @@
   let mapLayers = [];
 
   PM.boot('index.html', async ({ root, meta }) => {
-    PM.buildFilterBar([
+    PM.buildFilterBar(() => [
       { kind: 'daterange' },
       {
         kind: 'multi',
@@ -41,6 +41,26 @@
       el('div', { class: 'tiles', id: 'issue-summary' }),
       el('div', { class: 'section-title', text: 'Current state' }),
       el('div', { class: 'tiles', id: 'tiles' }),
+      el('div', { class: 'section-title', text: 'Time on site' }),
+      el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          el('h2', { text: 'How long people were actually inside a fence' }),
+          el('span', { class: 'sub', id: 'fence-sub' }),
+          el('div', { class: 'spacer' }),
+          el('button', {
+            class: 'btn btn-sm',
+            text: '\u2193 CSV',
+            onclick: () => window.open('/api/fence-time.csv?' + queryString(), '_blank'),
+          }),
+        ]),
+        // Two bodies: the tiles need the normal padding, the table is
+        // full-bleed like every other table here. A single 'tight' body put
+        // the tiles flush against the card border.
+        el('div', { class: 'card-body' }, [el('div', { class: 'tiles tiles-4', id: 'fence-tiles' })]),
+        el('div', { class: 'card-body tight card-split' }, [
+          el('div', { class: 'table-scroll', id: 'fence-table' }),
+        ]),
+      ]),
       el('div', { class: 'section-title', text: 'What is wrong, in detail' }),
       el('div', { class: 'grid-2', id: 'issue-columns' }, [
         el('div', { class: 'card' }, [
@@ -166,6 +186,8 @@
   async function load() {
     PM.showSkeleton({
       '#issue-summary': 'tiles:4',
+      '#fence-tiles': 'tiles:4',
+      '#fence-table': 'table:5x5',
       '#issues-people': 'table:5x2',
       '#issues-app': 'table:5x2',
       '#worst-users': 'table:5x3',
@@ -181,30 +203,85 @@
       '#check-tiles': 'tiles:5',
     });
     const qs = queryString();
-    const [stats, users, problems] = await Promise.all([
-      api('/api/stats?' + qs),
-      api('/api/users?' + qs + '&limit=200'),
-      api('/api/issues?' + qs),
-    ]);
-    renderIssues(problems);
-    renderWorstUsers(problems);
-    renderTiles(stats);
-    renderMap(users.rows);
-    renderCharts(stats);
-    renderUserTable(stats.perUser || []);
-    renderChecks(stats);
-    const c = problems.counts || {};
+    // allSettled, not all: these four are independent questions, and Promise.all
+    // threw away three good answers whenever the fourth failed - so one slow
+    // aggregation timing out blanked the entire page.
+    // compare=1 adds the same detection over the previous window of equal
+    // length, so every count can say which way it is moving.
+    const [stats, users, problems, fence] = (
+      await Promise.allSettled([
+        api('/api/stats?' + qs),
+        api('/api/users?' + qs + '&limit=200'),
+        api('/api/issues?' + qs + '&compare=1'),
+        api('/api/fence-time?' + qs),
+      ])
+    ).map((r) => (r.status === 'fulfilled' ? r.value : null));
+
+    const failed = [];
+    if (!problems) failed.push('problem detection');
+    if (!stats) failed.push('statistics');
+    if (!users) failed.push('device positions');
+    if (!fence) failed.push('time on site');
+
+    if (problems) {
+      renderIssues(problems);
+    } else {
+      panelFailed('#issue-summary', '#issues-people', '#issues-app', '#worst-users');
+    }
+    if (fence) {
+      renderFenceTime(fence, stats);
+    } else {
+      panelFailed('#fence-tiles', '#fence-table');
+    }
+    if (stats) {
+      renderTiles(stats);
+      renderCharts(stats);
+      renderUserTable(stats.perUser || []);
+      renderChecks(stats);
+    } else {
+      panelFailed('#tiles', '#user-table', '#check-tiles');
+    }
+    if (users) {
+      renderMap(users.rows);
+    } else {
+      panelFailed('#overview-map');
+    }
+    if (problems) renderWorstUsers(problems);
+    const c = (problems || {}).counts || {};
+    // Improvement is worth stating outright: a list of problems that never
+    // acknowledges anything clearing reads as though nothing ever gets fixed.
+    const cleared = (((problems || {}).previous || {}).resolved || []).length;
+    const devices = (stats || {}).devices || {};
     PM.setSubtitle(
       (c.critical + c.serious
         ? c.critical + ' critical · ' + c.serious + ' serious · ' + c.warning + ' warning'
         : 'nothing critical') +
+        (cleared ? ' · ' + cleared + ' cleared since the previous period' : '') +
         ' · ' +
-        fmt.int((stats.devices || {}).totalSnapshots) +
+        fmt.int(devices.totalSnapshots) +
         ' snapshots · ' +
-        fmt.int((stats.devices || {}).trackedUsers) +
+        fmt.int(devices.trackedUsers) +
         ' users in range'
     );
-    PM.markLoaded();
+
+    if (failed.length) {
+      // Some of the page is real and some of it is missing, and the reader has
+      // to be told which - so this is a standing banner, not a toast.
+      PM.markStale('Could not load ' + failed.join(', ') + '. Everything else on this page is current.');
+    } else {
+      PM.markLoaded();
+    }
+  }
+
+  /** Marks the panels whose own request failed, leaving the rest of the page. */
+  function panelFailed(...selectors) {
+    for (const selector of selectors) {
+      const host = document.querySelector(selector);
+      if (!host) continue;
+      host.classList.remove('is-loading');
+      host.innerHTML = '';
+      host.append(el('div', { class: 'panel-error', text: 'Could not load this panel.' }));
+    }
   }
 
   function tile(label, value, opts) {
@@ -212,10 +289,50 @@
     const node = el('div', { class: 'tile ' + (options.tone ? 'is-' + options.tone : '') + (options.href ? ' clickable' : '') }, [
       el('div', { class: 'tile-label', text: label }),
       el('div', { class: 'tile-value', html: value === null || value === undefined ? '--' : String(value) }),
+      deltaChip(options.delta),
       options.note ? el('div', { class: 'tile-note', text: options.note }) : null,
     ]);
     if (options.href) node.addEventListener('click', () => (location.href = options.href));
     return node;
+  }
+
+  /**
+   * Which way a count is moving against the previous window of equal length.
+   *
+   * A bare number cannot say whether things are improving, which is most of
+   * what anyone opens a monitor to find out. Absent when no comparison was
+   * available - an unbounded date range has no previous period - rather than
+   * showing a zero that would read as "no change".
+   */
+  function deltaChip(delta) {
+    if (delta === null || delta === undefined) return null;
+    if (delta === 0) {
+      return el('div', { class: 'delta is-flat', text: 'no change' });
+    }
+    const worse = delta > 0;
+    return el('div', {
+      class: 'delta ' + (worse ? 'is-worse' : 'is-better'),
+      text: (worse ? '▲ +' : '▼ ') + delta + ' vs previous period',
+    });
+  }
+
+  /**
+   * What the affected count is actually counting.
+   *
+   * This used to add every issue’s count together, so ten unresolved exit
+   * windows plus two flat batteries plus one stuck device read as "13 affected"
+   * - a number in no unit at all. Issues are grouped by their own unit instead.
+   */
+  function affectedNote(list) {
+    const byUnit = new Map();
+    for (const i of list) {
+      const unit = i.unit || 'item';
+      byUnit.set(unit, (byUnit.get(unit) || 0) + i.count);
+    }
+    return [...byUnit.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([unit, n]) => n + ' ' + unit + (n === 1 ? '' : 's'))
+      .join(' · ');
   }
 
   /* The severity strip: the four numbers meant to be read first. */
@@ -223,27 +340,31 @@
     const host = document.querySelector('#issue-summary');
     host.innerHTML = '';
     const c = problems.counts || {};
-    const worst = (list) => list.reduce((a, i) => a + i.count, 0);
+    const was = (problems.previous || {}).counts || null;
     const bySeverity = (sev) => (problems.issues || []).filter((i) => i.severity === sev);
 
     host.append(
       tile('Critical', fmt.int(c.critical), {
         tone: c.critical ? 'critical' : 'good',
-        note: c.critical ? worst(bySeverity('critical')) + ' affected' : 'nothing critical',
+        note: c.critical ? affectedNote(bySeverity('critical')) : 'nothing critical',
+        delta: was ? c.critical - was.critical : null,
       }),
       tile('Serious', fmt.int(c.serious), {
         tone: c.serious ? 'serious' : undefined,
-        note: c.serious ? worst(bySeverity('serious')) + ' affected' : 'none',
+        note: c.serious ? affectedNote(bySeverity('serious')) : 'none',
+        delta: was ? c.serious - was.serious : null,
       }),
       tile('Warnings', fmt.int(c.warning), {
         tone: c.warning ? 'warning' : undefined,
-        note: c.warning ? worst(bySeverity('warning')) + ' affected' : 'none',
+        note: c.warning ? affectedNote(bySeverity('warning')) : 'none',
+        delta: was ? c.warning - was.warning : null,
       }),
       tile('People affected', fmt.int((problems.byUser || []).length), {
         note: c.people + ' issue type(s) in the field',
         href: '/users.html',
       })
     );
+
 
     fillFeed('#issues-people', (problems.issues || []).filter((i) => i.group === 'people'), '#people-sub');
     fillFeed('#issues-app', (problems.issues || []).filter((i) => i.group === 'app'), '#app-sub');
@@ -282,13 +403,154 @@
       href: i.href || '#',
       html:
         '<div class="issue-title">' + esc(i.title) + '</div>' +
-        '<div class="issue-count">' + fmt.int(i.count) + ' ' + esc(i.unit) + (i.count === 1 ? '' : 's') + '</div>' +
+        '<div class="issue-count">' + fmt.int(i.count) + ' ' + esc(i.unit) + (i.count === 1 ? '' : 's') + trendMark(i) + '</div>' +
         '<div class="issue-detail">' + esc(i.detail) + '</div>' +
         '<div class="issue-meta">' + (i.lastAt ? esc(fmt.ago(i.lastAt)) : '') + '</div>' +
         who +
         '<div class="issue-evidence">' + esc(i.evidence) + '</div>',
     });
     return node;
+  }
+
+  /**
+   * How this issue compares with the previous window.
+   *
+   * "new" is the one worth spotting: an issue that was not happening before is
+   * a change in behaviour, not a standing condition.
+   */
+  function trendMark(i) {
+    if (i.isNew) return '<span class="trend is-new">new</span>';
+    if (i.previousCount === null || i.previousCount === undefined) return '';
+    const delta = i.count - i.previousCount;
+    if (delta === 0) return '<span class="trend is-flat">level</span>';
+    return (
+      '<span class="trend ' + (delta > 0 ? 'is-worse' : 'is-better') + '">' +
+      (delta > 0 ? '▲ ' : '▼ ') + Math.abs(delta) +
+      '</span>'
+    );
+  }
+
+  /**
+   * Time on site, measured by integrating state rather than counting pings.
+   *
+   * The distinction is the whole point of this card. Reporting rates across
+   * this fleet differ by more than two hundred times, so a share of heartbeats
+   * says who reports most often; a share of TIME says who was on site. Both are
+   * shown per person, because seeing them disagree is what makes the difference
+   * believable.
+   */
+  function renderFenceTime(fence, stats) {
+    const tiles = document.querySelector('#fence-tiles');
+    const host = document.querySelector('#fence-table');
+    tiles.innerHTML = '';
+    host.innerHTML = '';
+    const t = (fence && fence.totals) || {};
+    const rows = (fence && fence.perUser) || [];
+    const span = (msValue) => fmt.span(msValue);
+
+    // Colour carries exactly one meaning across these four: amber marks time
+    // that could not be accounted for. The first two are measurements - time on
+    // site is neither good nor bad, and painting it green implied a verdict the
+    // number does not carry.
+    tiles.append(
+      tile('Time inside a fence', span(t.insideMs), {
+        note: 'measured, not sampled',
+      }),
+      tile('Share of measured time inside', fmt.pct((t.insideShareByTime || 0) * 100, 0), {
+        note:
+          'counting heartbeats instead would say ' +
+          fmt.pct((t.insideShareByBeats || 0) * 100, 0),
+      }),
+      tile('Nobody knew where they were', span(t.silentMs), {
+        tone: t.silentMs > 0 ? 'warning' : undefined,
+        note: 'gaps too long to credit to any state',
+      }),
+      tile('No fence verdict at all', span(t.unknownMs), {
+        tone: t.unknownMs > 0 ? 'warning' : undefined,
+        note: 'reporting, but neither inside nor outside',
+      })
+    );
+
+    const sub = document.querySelector('#fence-sub');
+    if (sub) {
+      const skew = (stats && stats.perPerson) || null;
+      // "person-time" is load-bearing: these totals are summed across people,
+      // so eight people watched for a day gives more than 24h and would
+      // otherwise read as impossible.
+      sub.textContent =
+        t.people + ' people · ' + fmt.int(t.visits) + ' crossings · totals are person-time' +
+        (skew && skew.dominance
+          ? ' · ' + fmt.pct(skew.dominance * 100, 0) + ' of heartbeats come from ' + skew.dominanceOf + ' devices'
+          : '');
+    }
+
+    if (!rows.length) {
+      host.append(el('div', { class: 'all-clear', text: 'No fence activity in this range' }));
+      return;
+    }
+
+    const table = el('table', { class: 'fence-table' });
+    table.innerHTML =
+      '<thead><tr><th>Person</th><th class="num">Inside</th><th class="num">Outside</th>' +
+      '<th class="num">Inside %</th><th class="num">If counting pings</th>' +
+      '<th class="num">Crossings</th><th>Not accounted for</th></tr></thead>';
+    const body = el('tbody');
+    for (const u of rows) {
+      const byTime = u.insideShare === null ? null : u.insideShare * 100;
+      const byBeats = u.insideShareByBeats === null ? null : u.insideShareByBeats * 100;
+      // The gap between the two bases, which is the reason this card exists.
+      const spread = byTime === null || byBeats === null ? null : Math.abs(byTime - byBeats);
+
+      // Chips on one wrapping line rather than a stack of divs: three stacked
+      // lines made some rows three times the height of their neighbours, and a
+      // table of measurements is unreadable when the rows do not line up.
+      const gaps = [];
+      if (u.silentMs > 0) gaps.push(esc(span(u.silentMs)) + ' silent');
+      if (u.unknownMs > 0) gaps.push(esc(span(u.unknownMs)) + ' no verdict');
+      if (u.neverExited) gaps.push('never left');
+
+      // The coverage badge only earns its place when it changes the reading of
+      // the number beside it. 'none' next to a count of zero said nothing twice.
+      const crossings =
+        u.visits === 0
+          ? '<span class="muted">0</span>'
+          : fmt.int(u.visits) +
+            (u.eventCoverage === 'sparse'
+              ? '<span class="chip chip-soft" title="This device sends crossing markers rarely, so the count is a floor rather than a total.">at least</span>'
+              : '');
+
+      body.append(
+        el('tr', {
+          class: 'clickable',
+          onclick: (event) => PM.openRow('/user.html?userId=' + u.userId, event),
+          html:
+            '<td><div class="person"><div class="avatar">' +
+            esc(fmt.initials(u.name)) +
+            '</div><div class="person-main"><div class="person-name">' +
+            esc(u.name) +
+            '</div><div class="person-sub">' +
+            esc(u.timezone ? fmt.zoneLabel(u.timezone) + ' · ' + u.beatsPerHour + '/h' : 'id ' + u.userId) +
+            '</div></div></div></td>' +
+            '<td class="num">' + esc(span(u.insideMs)) + '</td>' +
+            '<td class="num">' + esc(span(u.outsideMs)) + '</td>' +
+            '<td class="num strong">' + (byTime === null ? '--' : esc(fmt.pct(byTime, 0))) + '</td>' +
+            '<td class="num' + (spread !== null && spread >= 10 ? ' is-off' : '') + '">' +
+            (byBeats === null ? '--' : esc(fmt.pct(byBeats, 0))) +
+            (spread !== null && spread >= 10
+              ? '<span class="chip chip-warn" title="Counting heartbeats disagrees with measured time by this much for this person.">' +
+                Math.round(spread) +
+                ' pts off</span>'
+              : '') +
+            '</td>' +
+            '<td class="num">' + crossings + '</td>' +
+            (gaps.length
+              ? '<td><div class="chip-row">' + gaps.map((g) => '<span class="chip">' + g + '</span>').join('') + '</div></td>'
+              : '<td><span class="muted">--</span></td>'),
+        })
+      );
+    }
+    table.append(body);
+    host.append(table);
   }
 
   /* The same findings keyed by person: "who needs help". */

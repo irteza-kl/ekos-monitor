@@ -18,7 +18,7 @@
   };
 
   PM.boot('map.html', async ({ root, meta }) => {
-    PM.buildFilterBar([
+    PM.buildFilterBar(() => [
       { kind: 'daterange' },
       { kind: 'multi', key: 'tenantId', label: 'Tenant', options: PM.optionsFrom(meta.tenants || [], 'id', 'name', 'snapshots') },
       { kind: 'multi', key: 'userId', label: 'User', options: PM.optionsFrom(meta.users || [], 'id', 'name', 'snapshots') },

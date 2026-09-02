@@ -14,7 +14,7 @@
       label: o.value === 'null' ? 'unmapped' : 'Site ' + o.label,
     }));
 
-    PM.buildFilterBar([
+    PM.buildFilterBar(() => [
       { kind: 'daterange' },
       { kind: 'multi', key: 'userId', label: 'User', options: PM.optionsFrom(meta.logUsers || [], 'id', 'id', 'validations') },
       { kind: 'multi', key: 'jobSiteId', label: 'Site', options: siteOptions },

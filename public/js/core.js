@@ -32,11 +32,16 @@ window.PM = (function () {
     activeFile: null,
     page: null,
     filterSpec: [],
+    // Set when a page passes a builder, so the bar can be redrawn once the
+    // dropdown contents arrive.
+    filterBuilder: null,
     hideChips: [],
     filters: {},
     refreshMs: Number(localStorage.getItem('pm.refresh') || 0),
     refreshTimer: null,
     lastLoadedAt: null,
+    // Set when a refresh fails, so the page can say the figures are old.
+    staleSince: null,
   };
 
   // ------------------------------------------------------------------ theme
@@ -197,6 +202,110 @@ window.PM = (function () {
         ? '--'
         : d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
     },
+    /**
+     * A moment in the WORKER'S timezone, with the zone named.
+     *
+     * Every other formatter here renders in the viewer’s browser timezone,
+     * which is right for "how long ago" and wrong for "when did this happen".
+     * This fleet spans America/Bogota, America/Chicago and Asia/Karachi, and
+     * over nine tenths of the heartbeats come from people ten or eleven hours
+     * away from a viewer in Karachi - so a gap shown as 03:37 actually happened
+     * at 17:37 the previous afternoon where the person was standing. Shifts,
+     * overnight and end-of-day are unreadable without this.
+     *
+     * The zone is always named, because a bare local time is a different kind
+     * of wrong: it looks authoritative and cannot be checked.
+     */
+    dateIn(v, timezone) {
+      if (!v) return '--';
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return '--';
+      if (!timezone) return fmt.date(v);
+      try {
+        // Spelt out component by component on purpose: dateStyle/timeStyle
+        // cannot be combined with timeZoneName - that throws - and the throw
+        // used to land in the catch below, quietly rendering the VIEWER'S time
+        // under a function whose whole job is not to.
+        return d.toLocaleString(undefined, {
+          timeZone: timezone,
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+          timeZoneName: 'short',
+        });
+      } catch (err) {
+        // An unknown zone name from the device: fall back rather than break.
+        return fmt.date(v);
+      }
+    },
+
+    /** Clock time in the worker’s timezone, zone named. */
+    timeIn(v, timezone) {
+      if (!v) return '--';
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return '--';
+      if (!timezone) return fmt.time(v);
+      try {
+        return d.toLocaleTimeString(undefined, {
+          timeZone: timezone,
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+          timeZoneName: 'short',
+        });
+      } catch (err) {
+        return fmt.time(v);
+      }
+    },
+
+    /**
+     * Both readings of the same instant, for a title attribute: the worker’s
+     * local time and the viewer’s, so neither has to be taken on trust.
+     */
+    bothZones(v, timezone) {
+      if (!v) return '';
+      const mine = fmt.date(v);
+      if (!timezone) return mine + ' (your time)';
+      return fmt.dateIn(v, timezone) + ' where they are' + String.fromCharCode(10) + mine + ' your time';
+    },
+
+    /** Short zone label for a column heading or a chip: "PKT", "-05". */
+    zoneLabel(timezone) {
+      if (!timezone) return '';
+      try {
+        const parts = new Intl.DateTimeFormat(undefined, {
+          timeZone: timezone,
+          timeZoneName: 'short',
+        }).formatToParts(new Date());
+        const hit = parts.find((x) => x.type === 'timeZoneName');
+        return hit ? hit.value : timezone;
+      } catch (err) {
+        return timezone;
+      }
+    },
+
+    /**
+     * A measured span, in whole units: "45s", "42 min", "2h 49m", "1d 4h".
+     *
+     * fmt.duration puts one decimal on anything under ten minutes, so a row of
+     * spans came out as "2h 49m" beside "6.7 min" - the same quantity written two
+     * ways in adjacent tiles. This is for columns of measured time, where they
+     * have to be readable against each other at a glance.
+     */
+    span(ms) {
+      if (ms === null || ms === undefined) return '--';
+      const seconds = Math.round(ms / 1000);
+      if (seconds < 60) return seconds + 's';
+      const minutes = Math.round(ms / 60000);
+      if (minutes < 90) return minutes + ' min';
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return hours + 'h ' + (minutes % 60) + 'm';
+      return Math.floor(hours / 24) + 'd ' + (hours % 24) + 'h';
+    },
+
     ago(v) {
       if (!v) return '--';
       const mins = (Date.now() - new Date(v).getTime()) / 60000;
@@ -396,7 +505,13 @@ window.PM = (function () {
     if (preset !== 'all' && preset !== 'custom') {
       const hit = RANGE_PRESETS.find((p) => p.key === preset);
       if (hit && hit.minutes) {
-        f.from = new Date(Date.now() - hit.minutes * 60000).toISOString();
+        // Rounded down to the minute. Taken raw, a rolling preset produces a
+        // slightly different `from` on every call, so no two requests ever share
+        // a cache key on the server - every auto-refresh tick and every page
+        // navigation paid full price for aggregations that had just been run.
+        // A window that starts up to a minute early changes no answer here.
+        const startedAt = Date.now() - hit.minutes * 60000;
+        f.from = new Date(Math.floor(startedAt / 60000) * 60000).toISOString();
         delete f.to;
       }
     } else if (preset === 'all') {
@@ -429,10 +544,25 @@ window.PM = (function () {
     window.dispatchEvent(new CustomEvent(name, { detail }));
   }
 
-  /** options.hideChips - params that identify the page, not a filter to clear. */
+  /**
+   * Draws the filter bar.
+   *
+   * `spec` may be a function returning the spec, and pages pass one so the bar
+   * can be built twice: once immediately, and again when /api/meta lands with
+   * the contents of the dropdowns. Passing an already-built array still works,
+   * but its options are then frozen at whatever metadata existed at the time.
+   *
+   * options.hideChips - params that identify the page, not a filter to clear.
+   */
   function buildFilterBar(spec, options) {
-    state.filterSpec = spec || [];
-    state.hideChips = (options && options.hideChips) || [];
+    if (typeof spec === 'function') {
+      state.filterBuilder = spec;
+      state.filterSpec = spec() || [];
+    } else {
+      state.filterBuilder = null;
+      state.filterSpec = spec || [];
+    }
+    if (options || !state.hideChips) state.hideChips = (options && options.hideChips) || [];
     const host = document.querySelector('#filters');
     if (!host) return;
     host.innerHTML = '';
@@ -847,7 +977,7 @@ window.PM = (function () {
           title: 'Remove',
           onclick: () => {
             setFilter(key, '');
-            buildFilterBar(state.filterSpec);
+            rebuildFilterBar();
           },
         }),
       ]);
@@ -855,10 +985,22 @@ window.PM = (function () {
     }
   }
 
+  /**
+   * Redraws the bar without losing the dropdown contents.
+   *
+   * Everything internal used to call buildFilterBar(state.filterSpec), which
+   * re-used the ALREADY-BUILT spec - fine when metadata arrived before the page
+   * was drawn, and wrong now that it can arrive after: the options would be
+   * frozen empty forever.
+   */
+  function rebuildFilterBar() {
+    buildFilterBar(state.filterBuilder || state.filterSpec);
+  }
+
   function resetFilters() {
     state.filters = { range: state.filters.range || DEFAULT_RANGE };
     writeUrlState(true);
-    buildFilterBar(state.filterSpec);
+    rebuildFilterBar();
     emit('pm:filters');
   }
 
@@ -901,7 +1043,7 @@ window.PM = (function () {
     if (!name || !views[name]) return;
     state.filters = { ...views[name] };
     writeUrlState(true);
-    buildFilterBar(state.filterSpec);
+    rebuildFilterBar();
     emit('pm:filters');
   }
   function deleteView(name) {
@@ -1182,6 +1324,9 @@ window.PM = (function () {
 
     const content = el('div', { class: 'content' }, [
       el('div', { class: 'filters', id: 'filters', style: 'display:none' }),
+      // Above the content on purpose: if the figures below are stale, that
+      // has to be read before them, not after.
+      el('div', { id: 'stale-banner', style: 'display:none' }),
       el('div', { id: 'page-root' }),
     ]);
 
@@ -1250,6 +1395,57 @@ window.PM = (function () {
     updateLive();
   }
 
+  /**
+   * Says outright that what is on screen is older than it looks.
+   *
+   * A refresh that fails used to leave every panel exactly as it was, with the
+   * only signal a toast that disappeared after seven seconds. Anyone arriving a
+   * moment later read stale figures as current, which is worse than an error:
+   * the page was confidently wrong. On a first load it left every panel
+   * shimmering as a skeleton for good.
+   */
+  function markStale(message) {
+    state.staleSince = state.lastLoadedAt || null;
+    // Nothing should still be pretending to load once the load has failed.
+    clearSkeletonOverlays();
+    const host = document.querySelector('#stale-banner');
+    if (!host) return;
+    host.innerHTML = '';
+    const had = !!state.lastLoadedAt;
+    host.append(
+      el('div', { class: 'banner is-stale' }, [
+        el('span', { class: 'banner-icon', text: '!' }),
+        el('div', { class: 'banner-text' }, [
+          el('b', {
+            text: had
+              ? 'These figures are from ' + fmt.time(state.lastLoadedAt) + ' and did not refresh.'
+              : 'This page could not load.',
+          }),
+          el('span', { text: ' ' + (message || 'The last request failed.') }),
+        ]),
+        el('div', { class: 'spacer' }),
+        el('button', {
+          class: 'btn btn-sm',
+          text: 'Retry',
+          onclick: () => {
+            clearStale();
+            emit('pm:refresh');
+          },
+        }),
+      ])
+    );
+    host.style.display = '';
+    updateLive(had ? 'stale - refresh failed' : 'load failed');
+  }
+
+  function clearStale() {
+    state.staleSince = null;
+    const host = document.querySelector('#stale-banner');
+    if (!host) return;
+    host.innerHTML = '';
+    host.style.display = 'none';
+  }
+
   function updateLive(text) {
     const node = document.querySelector('#live-text');
     const wrap = document.querySelector('#live-indicator');
@@ -1266,6 +1462,7 @@ window.PM = (function () {
   function markLoaded() {
     clearSkeletonOverlays();
     state.lastLoadedAt = new Date().toISOString();
+    clearStale();
     updateLive();
   }
 
@@ -1298,8 +1495,9 @@ window.PM = (function () {
       const message = (event.reason && event.reason.message) || String(event.reason || 'Request failed');
       if (message === 'Session expired') return; // already redirecting
       console.error('[phantom-monitor]', event.reason);
-      toast(message, 'error');
-      updateLive('load failed');
+      // A page load is what usually fails here, so the failure has to persist
+      // on screen rather than fade with a toast.
+      markStale(message);
       event.preventDefault();
     });
   }
@@ -1338,19 +1536,36 @@ window.PM = (function () {
       return;
     }
 
-    try {
-      state.meta = await api('/api/meta');
-    } catch (err) {
-      state.meta = { error: err.message };
-    }
+    // /api/meta probes every collection in the database and then runs a
+    // seven-way facet over all of it - about six seconds on a cold instance.
+    // Nothing on any page needs it in order to ask for its own data: it fills
+    // the filter dropdowns and the shell counters. Awaiting it here left the
+    // window empty for those six seconds, which was the slowest thing about
+    // using this console.
+    //
+    // state.meta keeps ONE identity for the life of the page and is filled in
+    // place, because every page destructures it out of the init argument and
+    // would otherwise hold a reference to the empty original.
+    state.meta = {};
+    const metaLoaded = api('/api/meta').then(
+      (m) => m,
+      (err) => ({ error: err.message })
+    );
+    metaLoaded.then((m) => {
+      Object.assign(state.meta, m);
+      renderShellMeta();
+      // Now the dropdowns have something to list.
+      rebuildFilterBar();
+      emit('pm:meta');
+      if (m && m.error) toast('Metadata failed: ' + m.error, 'error');
+    });
 
     renderShellMeta();
     setRefresh(state.refreshMs);
-    if (state.meta && state.meta.error) toast('Metadata failed: ' + state.meta.error, 'error');
 
     window.addEventListener('popstate', () => {
       state.filters = readUrlState();
-      buildFilterBar(state.filterSpec);
+      rebuildFilterBar();
       emit('pm:filters');
     });
 
@@ -1525,6 +1740,9 @@ window.PM = (function () {
     toast,
     boot,
     buildFilterBar,
+    rebuildFilterBar,
+    markStale,
+    clearStale,
     setFilter,
     queryString,
     resetFilters,

@@ -7,6 +7,7 @@ const P = require('./pipelines');
 const normalize = require('./normalize');
 const geo = require('./geo');
 const { getSites } = require('./sites');
+const { fenceTimeCached } = require('./fence');
 
 /**
  * Problem detection: a ranked list of named faults rather than counts to be
@@ -27,10 +28,30 @@ const CRITICAL_BATTERY = 10;
 const STALE_MINUTES = 15;
 const POOR_ACCURACY = 50;
 const UNUSABLE_ACCURACY = 100;
-/** A heartbeat normally lands every 25-60 s here, so ten minutes of silence is
- *  a fault and thirty is an outage. Same numbers the Heartbeats page draws. */
+/** Ten minutes of silence is a fault and thirty is an outage, whatever the
+ *  device's habits. Same numbers the Heartbeats page draws. */
 const GAP_WARN_MS = 10 * 60 * 1000;
 const GAP_CRITICAL_MS = 30 * 60 * 1000;
+/**
+ * Flat thresholds alone mis-read this fleet. Cadence spans a factor of seventy:
+ * one device lands a heartbeat every second, another every five minutes. Nine
+ * minutes of silence from the first is a dead app that no flat ten-minute rule
+ * catches, while ten minutes from the second is barely two missed beats.
+ *
+ * So each device is also compared against its own median gap. The multiple is
+ * deliberately large, and a floor applies underneath it, because a multiple of
+ * a one-second cadence is still only seconds and nobody needs telling about it.
+ */
+const CADENCE_MULTIPLE = 20;
+const CADENCE_FLOOR_MS = 3 * 60 * 1000;
+/** Kept per device, so a gap discarded as off-clock can fall back to the next. */
+const GAPS_PER_USER = 8;
+/** A fence entry with no exit, standing this long, is a state worth questioning. */
+const NEVER_EXITED_STALE_MS = 6 * 60 * 60 * 1000;
+/** This long on the clock with no fence verdict at all is worth naming. */
+const NO_VERDICT_MS = 2 * 60 * 60 * 1000;
+/** Crossings flapping faster than this are the fence arguing with itself. */
+const JITTER_VISITS_MIN = 4;
 /** Device clock this far from server time makes its own timestamps unusable. */
 const CLOCK_DRIFT_SECONDS = 120;
 /** A fence this far from the device it is judging is not that device's fence. */
@@ -58,6 +79,8 @@ async function detect(query = {}) {
     fromClockInChecks(q).catch(collectionMissing(unavailable, 'geofence checks')),
     fromExitWindows(q).catch(collectionMissing(unavailable, 'exit windows')),
     fromSiteRegistry(q).catch(collectionMissing(unavailable, 'site registry')),
+    fromFenceTime(q, nameHints).catch(collectionMissing(unavailable, 'time on site')),
+    fromNetwork(q, nameHints).catch(collectionMissing(unavailable, 'network state')),
   ]);
 
   for (const found of results) issues.push(...(found || []));
@@ -532,7 +555,11 @@ async function fromHeartbeatGaps(q) {
   const { col, base } = await collectionFor('snapshots');
   const match = F.and([base, F.snapshotMatch(q)]);
 
-  const gaps = await col
+  // One pass yields both halves of the question: what this device normally
+  // does, and the worst silences it actually had. Grouping per device rather
+  // than taking a global top-N also stops one chatty phone from crowding
+  // everybody else out of the list.
+  const perDevice = await col
     .aggregate(
       [
         { $match: match },
@@ -547,14 +574,36 @@ async function fromHeartbeatGaps(q) {
           },
         },
         { $addFields: { _gapMs: { $subtract: ['$createdAt', '$_prevAt'] } } },
-        { $match: { _gapMs: { $gte: GAP_WARN_MS } } },
-        { $project: { _id: 0, user: '$_user', gapMs: '$_gapMs', endedAt: '$createdAt', startedAt: '$_prevAt' } },
-        { $sort: { gapMs: -1 } },
-        { $limit: 500 },
+        { $match: { _gapMs: { $ne: null } } },
+        {
+          $group: {
+            _id: '$_user',
+            intervals: { $sum: 1 },
+            // Approximate keeps this to bounded memory, and a median gap does
+            // not need to be exact to say what normal looks like.
+            cadence: { $percentile: { input: '$_gapMs', p: [0.5], method: 'approximate' } },
+            worst: {
+              $topN: {
+                n: GAPS_PER_USER,
+                sortBy: { _gapMs: -1 },
+                output: { gapMs: '$_gapMs', endedAt: '$createdAt', startedAt: '$_prevAt' },
+              },
+            },
+          },
+        },
       ],
       opts
     )
     .toArray();
+  if (!perDevice.length) return [];
+
+  const cadenceOf = new Map();
+  const gaps = [];
+  for (const d of perDevice) {
+    const median = Array.isArray(d.cadence) ? d.cadence[0] : null;
+    cadenceOf.set(d._id, Number.isFinite(median) && median > 0 ? median : null);
+    for (const g of d.worst || []) gaps.push({ user: d._id, ...g });
+  }
   if (!gaps.length) return [];
 
   // The heartbeat that opened each silence, for the cause and the shift state.
@@ -585,10 +634,24 @@ async function fromHeartbeatGaps(q) {
     if (!before) continue;
     // Off the clock, silence is the expected state, not an incident.
     if (!before.clockedIn) continue;
+
+    const cadenceMs = cadenceOf.get(g.user);
+    const multiple = cadenceMs ? g.gapMs / cadenceMs : null;
+    // Either long enough to matter to anybody, or so far outside what this
+    // device normally does that the app had clearly stopped. The floor keeps
+    // the second rule from firing on multiples of a one-second cadence.
+    const flatFault = g.gapMs >= GAP_WARN_MS;
+    const outOfCharacter = multiple !== null && g.gapMs >= CADENCE_FLOOR_MS && multiple >= CADENCE_MULTIPLE;
+    if (!flatFault && !outOfCharacter) continue;
+
     onClock.push({
       userId: g.user,
       name: before.name || 'user ' + g.user,
       minutes: Math.round(g.gapMs / 60000),
+      gapMs: g.gapMs,
+      cadenceMs,
+      multiple,
+      flatFault,
       startedAt: new Date(g.startedAt).toISOString(),
       endedAt: new Date(g.endedAt).toISOString(),
       cause: explainGap(before),
@@ -616,7 +679,7 @@ async function fromHeartbeatGaps(q) {
         count: outages.length,
         detail:
           'A heartbeat normally lands every 25-60 s, so this is the app not running rather than a quiet shift. Nothing is known about these people for the length of the gap.',
-        who: outages.map((g) => whoOf(g, g.minutes + ' min silent · ' + g.cause)),
+        who: outages.map((g) => whoOf(g, silenceNote(g) + ' · ' + g.cause)),
         lastAt: newest(outages, 'endedAt'),
         href: '/heartbeats.html?clockedIn=true',
         evidence: 'ekosClientState: time between one device\'s consecutive createdAt values, clocked in',
@@ -624,7 +687,7 @@ async function fromHeartbeatGaps(q) {
     );
   }
 
-  const shorter = people.filter((g) => g.minutes < GAP_CRITICAL_MS / 60000);
+  const shorter = people.filter((g) => g.flatFault && g.minutes < GAP_CRITICAL_MS / 60000);
   if (shorter.length) {
     found.push(
       issue({
@@ -634,10 +697,31 @@ async function fromHeartbeatGaps(q) {
         title: 'Reporting gaps while on the clock, 10-30 min',
         count: shorter.length,
         detail: 'Long enough to lose track of where someone was, not long enough to be an outage.',
-        who: shorter.map((g) => whoOf(g, g.minutes + ' min silent · ' + g.cause)),
+        who: shorter.map((g) => whoOf(g, silenceNote(g) + ' · ' + g.cause)),
         lastAt: newest(shorter, 'endedAt'),
         href: '/heartbeats.html?clockedIn=true',
         evidence: 'ekosClientState: time between one device\'s consecutive createdAt values, clocked in',
+      })
+    );
+  }
+
+  // Silence no flat threshold can see: short in absolute terms, but these
+  // devices report every few seconds, so they had already stopped.
+  const outOfCharacter = people.filter((g) => !g.flatFault);
+  if (outOfCharacter.length) {
+    found.push(
+      issue({
+        id: 'heartbeat-gaps-out-of-character',
+        group: 'people',
+        severity: 'serious',
+        title: 'Silence far beyond what the device normally does',
+        count: outOfCharacter.length,
+        detail:
+          'Under ten minutes, so no flat threshold catches these, but the devices involved report every few seconds - a pause this many times their own cadence means the app was not running. Cadence spans a factor of seventy across this fleet, so one threshold cannot fit all of it.',
+        who: outOfCharacter.map((g) => whoOf(g, silenceNote(g))),
+        lastAt: newest(outOfCharacter, 'endedAt'),
+        href: '/heartbeats.html?clockedIn=true',
+        evidence: 'ekosClientState: each gap against the median gap for that same device, clocked in',
       })
     );
   }
@@ -654,7 +738,7 @@ async function fromHeartbeatGaps(q) {
         count: unexplained.length,
         detail:
           'These devices were logged in, on the clock, online, charged and fully permissioned when they stopped reporting. Nothing in the last heartbeat accounts for the gap.',
-        who: unexplained.map((g) => whoOf(g, g.minutes + ' min silent')),
+        who: unexplained.map((g) => whoOf(g, silenceNote(g))),
         lastAt: newest(unexplained, 'endedAt'),
         href: '/heartbeats.html?clockedIn=true',
         evidence: 'ekosClientState: state on the heartbeat immediately before each gap',
@@ -663,6 +747,39 @@ async function fromHeartbeatGaps(q) {
   }
 
   return found;
+}
+
+/**
+ * How long the silence was, and how far out of character it is.
+ *
+ * The multiple is what makes a four-minute gap legible: on a device that
+ * reports every second it means the app stopped, and on one that reports every
+ * five minutes it means nothing at all.
+ */
+function silenceNote(g) {
+  const spell =
+    g.gapMs < 90 * 1000
+      ? Math.round(g.gapMs / 1000) + 's silent'
+      : g.minutes + ' min silent';
+  if (!g.cadenceMs || !g.multiple || g.multiple < 3) return spell;
+  return spell + ' · ' + Math.round(g.multiple) + '× its usual ' + shortDuration(g.cadenceMs);
+}
+
+/** Compact duration for a note: "800ms", "45s", "5 min". */
+function shortDuration(msValue) {
+  if (msValue < 1000) return Math.round(msValue) + 'ms';
+  if (msValue < 90 * 1000) return Math.round(msValue / 1000) + 's';
+  return Math.round(msValue / 60000) + ' min';
+}
+
+/** A span in words, for an issue note: "3h 20m", "45 min". */
+function spanOf(msValue) {
+  if (msValue === null || msValue === undefined) return "unknown";
+  const minutes = msValue / 60000;
+  if (minutes < 90) return Math.round(minutes) + ' min';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return hours + 'h ' + Math.round(minutes % 60) + 'm';
+  return Math.floor(hours / 24) + 'd ' + (hours % 24) + 'h';
 }
 
 /** Reads the cause of a silence off the last heartbeat before it. */
@@ -1025,6 +1142,230 @@ async function fromSiteRegistry(q) {
         who: moved.map((s) => ({ ...named(s), note: 'moved ' + geo.round(s.fenceMovedMetres, 0) + ' m' })),
         href: '/sites.html',
         evidence: 'validateClockInLogs: more than one geometry revision for the site',
+      })
+    );
+  }
+
+  return found;
+}
+
+// ---------------------------------------------------------------------------
+// 6. what measuring time on site turns up
+// ---------------------------------------------------------------------------
+
+/**
+ * Faults that only appear once fence time is measured rather than sampled.
+ *
+ * Counting heartbeats cannot see either of these. A fence entry with no exit
+ * looks like an ordinary run of "inside" heartbeats, and a fence being crossed
+ * every few seconds looks like a healthy device reporting often.
+ */
+async function fromFenceTime(q, nameHints) {
+  const fence = await fenceTimeCached(q);
+  const found = [];
+
+  for (const u of fence.perUser) {
+    if (u.userId !== null && u.userId !== undefined && u.name && !isPlaceholderName(u.name)) {
+      nameHints.set(u.userId, u.name);
+    }
+  }
+
+  // Entered, still inside, and no exit ever recorded. Either the app missed
+  // the crossing or the person is still on site long after their shift - both
+  // mean the fence state on record cannot be trusted for them.
+  const stuck = fence.perUser.filter(
+    (u) => u.neverExited && u.neverExitedForMs !== null && u.neverExitedForMs >= NEVER_EXITED_STALE_MS
+  );
+  if (stuck.length) {
+    found.push(
+      issue({
+        id: 'fence-entered-never-left',
+        group: 'app',
+        severity: 'serious',
+        title: 'Entered a fence and never recorded leaving it',
+        count: stuck.length,
+        unit: 'device',
+        detail:
+          'The newest heartbeat still reports being inside, an entry was recorded, and no exit ever was. Anything that reads fence state for these people - exit windows included - is working from a crossing that was never closed.',
+        who: stuck.map((u) =>
+          whoOf(u, spanOf(u.neverExitedForMs) + ' since entry' + (u.latestOnClock ? ', on the clock' : ''))
+        ),
+        lastAt: newest(stuck, 'latestAt'),
+        href: '/heartbeats.html?insideGeofence=true',
+        evidence: 'ekosClientState: geofenceIn with no geofenceOut anywhere in range, newest heartbeat still inside',
+      })
+    );
+  }
+
+  // A fence crossed and re-crossed within a minute is the fence arguing with
+  // itself: GPS scatter against a boundary, not somebody walking in and out.
+  // Each flap can open an exit window, so this is a source of false alarms.
+  const flapping = fence.perUser.filter((u) => u.jitterVisits >= JITTER_VISITS_MIN);
+  if (flapping.length) {
+    found.push(
+      issue({
+        id: 'fence-crossings-flapping',
+        group: 'app',
+        severity: 'warning',
+        title: 'Fence crossings flapping in under a minute',
+        count: flapping.length,
+        unit: 'device',
+        detail:
+          'These devices crossed a boundary and crossed back within a minute, repeatedly. That is GPS scatter against the fence edge rather than anybody moving, and each flap can open an exit window - so it manufactures alerts as well as burning battery. A wider fence or a hysteresis margin fixes it.',
+        who: flapping.map((u) =>
+          whoOf(u, u.jitterVisits + ' crossings under a minute of ' + u.visits)
+        ),
+        lastAt: newest(fence.perUser, 'latestAt'),
+        href: '/sites.html',
+        evidence: 'ekosClientState: geofenceIn and geofenceOut pairs less than a minute apart',
+      })
+    );
+  }
+
+  // Reported neither inside nor outside for a long stretch while on the clock:
+  // the app was running and sending, but had no fence verdict to send.
+  const noVerdict = fence.perUser.filter(
+    (u) => u.onClock && u.unknownMs >= NO_VERDICT_MS && u.measuredMs > 0
+  );
+  if (noVerdict.length) {
+    found.push(
+      issue({
+        id: 'fence-no-verdict',
+        group: 'app',
+        severity: 'warning',
+        title: 'On the clock with no inside-or-outside verdict',
+        count: noVerdict.length,
+        unit: 'device',
+        detail:
+          'These devices kept reporting but left isInsideGeofence empty for hours at a stretch. The heartbeats are there, so nothing looks missing, yet for that time there is no answer to the only question the fence exists to answer.',
+        who: noVerdict.map((u) =>
+          whoOf(u, spanOf(u.unknownMs) + ' with no verdict of ' + spanOf(u.measuredMs) + ' measured')
+        ),
+        lastAt: newest(fence.perUser, 'latestAt'),
+        href: '/heartbeats.html?clockedIn=true',
+        evidence: 'ekosClientState: time credited to a null isInsideGeofence while clocked in',
+      })
+    );
+  }
+
+  return found;
+}
+
+// ---------------------------------------------------------------------------
+// 7. network state
+// ---------------------------------------------------------------------------
+
+/**
+ * Faults in how the device talked to the server, rather than where it was.
+ *
+ * `isConnected` and `isReachable` are separate facts and only the first was
+ * ever read. A device with a network that cannot reach the server is a
+ * different problem from one with no signal, and it points at the server or the
+ * route rather than at the person holding the phone.
+ *
+ * Deliberately NOT here: batteryOptimizationPermission. It is null on all
+ * 61,812 iOS heartbeats and a boolean on every Android one, so it is platform
+ * specific rather than missing - and every Android device in this store reports
+ * true, which could mean the exemption is granted or that optimisation is on.
+ * Nothing in the data settles which, and a detector built on a guess about
+ * polarity would invent faults or hide them.
+ */
+async function fromNetwork(q, nameHints) {
+  const { col, base } = await collectionFor('snapshots');
+  const match = F.and([base, F.snapshotMatch(q)]);
+
+  const facet = await col
+    .aggregate(
+      [
+        { $match: match },
+        {
+          $facet: {
+            // One row per clock-in, not per heartbeat: the same offline clock-in
+            // is repeated on every heartbeat for the rest of that shift.
+            offlineClockIns: [
+              { $match: { 'clockedInJobDetail.clockInNetworkStatus': 'OFFLINE' } },
+              {
+                $group: {
+                  _id: { user: '$' + SNAP.userId, at: '$clockedInJobDetail.clockIn' },
+                  name: { $max: '$' + SNAP.fullName },
+                  lastAt: { $max: '$createdAt' },
+                  siteId: { $max: '$clockedInJobDetail.jobSiteId' },
+                },
+              },
+              { $sort: { lastAt: -1 } },
+              { $limit: 200 },
+            ],
+            unreachable: [
+              { $match: { isConnected: true, isReachable: false } },
+              {
+                $group: {
+                  _id: '$' + SNAP.userId,
+                  name: { $max: '$' + SNAP.fullName },
+                  beats: { $sum: 1 },
+                  lastAt: { $max: '$createdAt' },
+                },
+              },
+              { $sort: { beats: -1 } },
+            ],
+          },
+        },
+      ],
+      opts
+    )
+    .next();
+
+  const found = [];
+  const offline = (facet && facet.offlineClockIns) || [];
+  const unreachable = (facet && facet.unreachable) || [];
+
+  for (const row of offline.concat(unreachable)) {
+    const id = row._id && row._id.user !== undefined ? row._id.user : row._id;
+    if (id === null || id === undefined) continue;
+    if (row.name && !isPlaceholderName(row.name)) nameHints.set(id, row.name);
+  }
+
+  if (offline.length) {
+    const who = offline.map((r) =>
+      whoOf(
+        { userId: r._id.user, name: r.name },
+        'clocked in offline' + (r._id.at ? ' at ' + String(r._id.at).slice(11, 16) + ' UTC' : '')
+      )
+    );
+    found.push(
+      issue({
+        id: 'clock-in-offline',
+        group: 'app',
+        severity: 'warning',
+        title: 'Clock-ins recorded with no network',
+        count: offline.length,
+        unit: 'clock-in',
+        detail:
+          'The device had no connectivity when these clock-ins were taken, so they were held and sent later. Their timestamp and location are whatever the phone believed at the time and were never checked against the server - which makes them the least reliable records in the store, and the ones to look at first when a shift or a fence verdict is disputed.',
+        who,
+        lastAt: newest(offline, 'lastAt'),
+        href: '/heartbeats.html?clockedIn=true',
+        evidence: 'ekosClientState: clockedInJobDetail.clockInNetworkStatus = OFFLINE, one row per clock-in',
+      })
+    );
+  }
+
+  if (unreachable.length) {
+    found.push(
+      issue({
+        id: 'connected-but-unreachable',
+        group: 'app',
+        severity: 'warning',
+        title: 'On a network but unable to reach the server',
+        count: unreachable.length,
+        unit: 'device',
+        detail:
+          'These devices reported a working connection and still could not reach the server. That is not a person walking into a dead spot - it points at the server, DNS or the route in between, and it is invisible to any check that only looks at whether the device is online.',
+        who: unreachable.map((r) =>
+          whoOf({ userId: r._id, name: r.name }, r.beats + ' heartbeat' + (r.beats === 1 ? '' : 's') + ' unreachable')
+        ),
+        lastAt: newest(unreachable, 'lastAt'),
+        href: '/heartbeats.html?reachable=false',
+        evidence: 'ekosClientState: isConnected true with isReachable false',
       })
     );
   }
