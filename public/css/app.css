@@ -593,6 +593,66 @@ td .truncate { max-width: 260px; }
 }
 .map-label::before { display: none !important; }
 
+/* ---- the map's own time window --------------------------------------- */
+/* It refines the page filter rather than sitting beside it, so while one is set
+   the bar has to be unmistakable - otherwise the filter bar at the top of the
+   page reads as broken. */
+.map-window { border-top: 1px solid var(--border); }
+/* On the Heartbeats tab the same bar sits inside a padded block rather than
+   flush under a map, so it needs its own edges. */
+.tab-block .map-window {
+  border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px;
+}
+.map-window input[type='datetime-local'] {
+  padding: 3px 8px; min-height: 26px; font-size: 12px;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+}
+.map-window .toolbar-sep {
+  width: 1px; height: 18px; background: var(--border-strong); margin: 0 2px; flex: none;
+}
+.map-window.is-active { background: var(--info-bg); border-color: var(--info-line); }
+.map-window.is-active .toolbar-field > span:first-child { color: var(--info-fg); font-weight: 650; }
+
+/* ---- replay ---------------------------------------------------------- */
+.sim-bar { border-top: 1px solid var(--border); background: var(--surface-2); }
+/* While a replay owns the map, the map is deliberately not showing the whole
+   trail. Say so on the control bar, so a half-drawn route is never mistaken for
+   missing data. */
+.sim-bar.is-replaying { background: var(--info-bg); border-color: var(--info-line); }
+.sim-bar.is-replaying .sim-readout { color: var(--info-fg); }
+.sim-controls {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 14px;
+}
+.sim-controls .btn.is-playing { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+.sim-scrub {
+  flex: 1 1 220px; min-width: 160px; height: 4px; accent-color: var(--series-1);
+  cursor: pointer;
+}
+.sim-readout {
+  display: flex; gap: 6px 14px; flex-wrap: wrap; align-items: center;
+  padding: 0 14px 11px; font-size: 12px; color: var(--ink-2);
+}
+.sim-readout .sim-time {
+  font-family: var(--mono); font-size: 12px; font-weight: 650; color: var(--ink);
+}
+.sim-readout .sim-facts { display: contents; }
+.sim-readout .sim-cell { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.sim-readout b { color: var(--ink); font-weight: 650; }
+.sim-readout .sim-hold { color: var(--warning-fg); font-weight: 600; }
+.sim-empty { padding: 11px 14px; font-size: 12px; color: var(--ink-muted); }
+
+/* ---- what the map is NOT showing ------------------------------------- */
+/* A truncated trail or a fence left out of the frame makes a correct map look
+   wrong, so both are said in words directly under it rather than inferred. */
+.trail-note {
+  padding: 9px 14px; border-top: 1px solid var(--warning-line);
+  background: var(--warning-bg); color: var(--warning-fg);
+  font-size: 11.5px; line-height: 1.5;
+}
+.trail-note div + div { margin-top: 4px; }
+.trail-note b { font-weight: 650; }
+
 /* ---- legend under a map ---------------------------------------------- */
 .map-legend {
   display: flex; gap: 7px 16px; flex-wrap: wrap; align-items: center;
@@ -972,6 +1032,11 @@ select[multiple] { appearance: auto; background-image: none; padding-right: 4px;
 }
 .map-toolbar .chip:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--info-bg); }
 .map-toolbar .toolbar-field { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-muted); }
+/* A remembered State filter can be on from a previous visit, with nothing on
+   screen to say why the map is missing heartbeats. Make the control itself say
+   it is filtering. */
+.map-toolbar .toolbar-field.is-filtering { color: var(--warning-fg); font-weight: 600; }
+.map-toolbar .toolbar-field.is-filtering select { border-color: var(--warning-line); background: var(--warning-bg); }
 .map-toolbar select { padding: 3px 24px 3px 8px; min-height: 26px; font-size: 12px; }
 
 /* ------------------------------------------------------------- skeletons */

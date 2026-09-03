@@ -91,6 +91,15 @@ window.PMMap = (function () {
 
     map.setView([20, 0], 2);
     instances.push(map);
+    // A page that re-renders its map (every reload of the user page did) left
+    // the previous instance in here for retheme() to walk and, worse, left its
+    // window resize handler attached to a container that was no longer in the
+    // document. Callers now call map.remove(); this is what keeps the register
+    // honest when they do.
+    map.on('unload', () => {
+      const at = instances.indexOf(map);
+      if (at !== -1) instances.splice(at, 1);
+    });
     return map;
   }
 
@@ -230,7 +239,7 @@ window.PMMap = (function () {
   function siteCircle(map, site, opts) {
     const options = opts || {};
     if (site.lat === null || site.lat === undefined) return null;
-    const fence = site.radiusIsAuthoritative && site.radius !== null && site.radius !== undefined;
+    const fence = !!(site.radiusIsAuthoritative && site.radius !== null && site.radius !== undefined);
     const estimate = site.centreEstimate || null;
     const color = options.color || (fence ? C.series[6] : C.muted);
     const layers = [];
@@ -238,18 +247,18 @@ window.PMMap = (function () {
     // Radius to draw: the fence, or the spread of the fixes the centre was
     // estimated from (floor 25 m so a tight cluster is still visible).
     const spread = estimate && estimate.spreadMetres ? Math.max(25, estimate.spreadMetres) : 40;
+    const drawnRadius = fence ? site.radius : spread;
 
-    layers.push(
-      L.circle([site.lat, site.lng], {
-        radius: fence ? site.radius : spread,
-        color,
-        weight: 1.5,
-        opacity: 0.9,
-        dashArray: fence ? null : '5 5',
-        fillColor: color,
-        fillOpacity: fence ? 0.07 : 0.04,
-      }).bindPopup(sitePopup(site))
-    );
+    const ring = L.circle([site.lat, site.lng], {
+      radius: drawnRadius,
+      color,
+      weight: 1.5,
+      opacity: 0.9,
+      dashArray: fence ? null : '5 5',
+      fillColor: color,
+      fillOpacity: fence ? 0.07 : 0.04,
+    }).bindPopup(() => sitePopup(site));
+    layers.push(ring);
 
     // The centre pin is decoration - the circle around it carries the popup.
     // Left interactive it would win the canvas hit test (last drawn wins) and
@@ -275,7 +284,33 @@ window.PMMap = (function () {
       });
     }
     const group = L.layerGroup(layers).addTo(map);
-    return { group, color };
+    // `radiusMetres` and `extent` are what a caller needs to frame this fence.
+    // Fitting to the centre point alone draws the circle and then zooms past
+    // it: a 300 m fence around a device that never left the middle of it ends
+    // up entirely outside the viewport, which reads as a fence that failed to
+    // load rather than one that is off-screen.
+    return {
+      group,
+      color,
+      circle: ring,
+      radiusMetres: drawnRadius,
+      isFence: fence,
+      extent: extentPoints({ lat: site.lat, lng: site.lng }, drawnRadius),
+    };
+  }
+
+  /** North / south / east / west edge of a circle, for framing it. */
+  function extentPoints(centre, metres) {
+    if (!centre || !Number.isFinite(centre.lat) || !Number.isFinite(centre.lng) || !Number.isFinite(metres)) return [];
+    const dLat = metres / 111320;
+    const cos = Math.cos((centre.lat * Math.PI) / 180);
+    const dLng = Math.abs(cos) < 1e-9 ? dLat : metres / (111320 * cos);
+    return [
+      { lat: centre.lat + dLat, lng: centre.lng },
+      { lat: centre.lat - dLat, lng: centre.lng },
+      { lat: centre.lat, lng: centre.lng + dLng },
+      { lat: centre.lat, lng: centre.lng - dLng },
+    ];
   }
 
   function sitePopup(site) {
@@ -369,69 +404,214 @@ window.PMMap = (function () {
   }
 
   /**
+   * Two fixes closer together than the GPS accuracy that produced them are not
+   * two positions - they are one position sampled twice. This fleet has devices
+   * reporting once a second, so a person standing still for ten minutes lands
+   * 600 fixes inside a 5 m circle: 600 opaque dots stacked on each other, 599
+   * sub-pixel path segments buried underneath them, and 600 accuracy halos at
+   * 6% fill that cancel out into a flat grey disc. The path and the halos were
+   * drawn - they were just invisible under the pile, which is why toggling them
+   * off and on appeared to do nothing at all.
+   *
+   * So the drawing is thinned: a fix is kept when it is far enough from the
+   * last kept one to be a distinguishable position, and always when it carries
+   * something distance does not - the two ends of the trail, a change of fence
+   * or clock state, and either side of a reporting gap or a suspicious jump.
+   * Everything dropped is folded into the fix it sits on, whose popup says how
+   * many and until when, so no heartbeat is silently discarded.
+   *
+   * `stats` is counted over every fix, not the kept ones: how well a device
+   * reported is a fact about the data and must not move when the drawing does.
+   */
+  const THIN_FLOOR_M = 4;
+  const THIN_CEILING_M = 30;
+
+  /** How far a fix must be from the last kept one to be drawn separately. */
+  function thinThreshold(point) {
+    const acc = Number(point && point.accuracy);
+    if (!Number.isFinite(acc)) return THIN_FLOOR_M;
+    return Math.max(THIN_FLOOR_M, Math.min(THIN_CEILING_M, acc));
+  }
+
+  // A gap must survive being merged into a run of normal segments.
+  const KIND_RANK = { normal: 0, gapShort: 1, gapLong: 2, jump: 3 };
+  const worseKind = (a, b) => (KIND_RANK[b] > KIND_RANK[a] ? b : a);
+
+  /**
    * The full trail, as separate layers the caller can toggle:
    *   path, dots, labels (sequence numbers), accuracy (halos)
-   * Returns { layers, points, stats }.
+   * Returns { layers, points, drawn, stats }.
    */
   function trail(map, points, opts) {
     const options = opts || {};
-    const valid = (points || []).filter((p) => p && p.lat !== null && p.lat !== undefined);
+    const valid = (points || []).filter(
+      (p) => p && p.lat !== null && p.lat !== undefined && p.lng !== null && p.lng !== undefined
+    );
     const path = L.layerGroup();
     const dots = L.layerGroup();
     const labels = L.layerGroup();
     const accuracy = L.layerGroup();
-    const stats = { gapShort: 0, gapLong: 0, jump: 0, normal: 0, points: valid.length };
+    const stats = { gapShort: 0, gapLong: 0, jump: 0, normal: 0, points: valid.length, drawn: 0, merged: 0 };
+    // Opt in, not out. Merging near-duplicate fixes makes a stationary cluster
+    // legible, but it also means the map holds fewer marks than the person has
+    // heartbeats - and "show me all my heartbeats" is the more common ask and
+    // the safer default. The caller decides; drawing everything is what happens
+    // if nobody says otherwise.
+    const thin = options.thin === true;
 
+    // ---- pass one: every segment, for the counts and for the kinds --------
+    const kinds = new Array(valid.length).fill(null);
     for (let i = 1; i < valid.length; i += 1) {
-      const a = valid[i - 1];
-      const b = valid[i];
-      const seg = segmentKind(a, b);
+      const seg = segmentKind(valid[i - 1], valid[i]);
+      kinds[i] = seg;
       stats[seg.kind] += 1;
-      const rule = SEGMENT_RULES[seg.kind];
-      const line = L.polyline(
-        [
-          [a.lat, a.lng],
-          [b.lat, b.lng],
-        ],
-        {
-          color: segmentColour(seg.kind, b),
-          weight: rule.weight,
-          opacity: 0.85,
-          dashArray: rule.dashArray,
-        }
-      );
-      line.bindPopup(
-        popupCard({
-          color: segmentColour(seg.kind, b),
-          title: seg.kind === 'normal' ? 'Path segment' : rule.label,
-          sub: fmt.time(a.at) + ' → ' + fmt.time(b.at),
-          rows: [
-            ['Elapsed', seg.minutes !== null ? fmt.duration(seg.minutes) : null],
-            ['Distance', seg.metres !== null ? fmt.metres(seg.metres) : null],
-            ['Implied speed', seg.kmh !== null ? seg.kmh.toFixed(0) + ' km/h' : null],
-          ],
-        })
-      );
-      path.addLayer(line);
     }
 
-    const labelEvery = valid.length > 40 ? Math.ceil(valid.length / 25) : 1;
+    // ---- pass two: which fixes get drawn ---------------------------------
+    // Each kept fix records the run of fixes it stands for and the worst
+    // segment kind crossed to reach it from the previous kept fix.
+    const kept = [];
+    let anchor = null;
+    let carried = 'normal';
     valid.forEach((p, index) => {
+      const seg = kinds[index];
+      const kind = seg ? seg.kind : 'normal';
       const isEdge = index === 0 || index === valid.length - 1;
-      const colour = verdictColor(p.verdict, p.insideGeofence);
+      const notable = kind !== 'normal';
+      // The fix *before* a gap has to be drawn too, or the dashed segment
+      // starts from nowhere.
+      const nextNotable = kinds[index + 1] ? kinds[index + 1].kind !== 'normal' : false;
+      const stateChanged =
+        anchor && (anchor.insideGeofence !== p.insideGeofence || anchor.clockedIn !== p.clockedIn);
+      const far = !anchor || (geoDistance(anchor, p) || 0) >= thinThreshold(anchor);
 
+      if (!thin || !anchor || isEdge || notable || nextNotable || stateChanged || far) {
+        kept.push({ point: p, index, count: 1, kind: kept.length ? worseKind(carried, kind) : 'normal' });
+        anchor = p;
+        carried = 'normal';
+      } else {
+        // Folded into the last kept fix, and the kind it crossed is carried
+        // forward so the next drawn segment still reports the gap.
+        const last = kept[kept.length - 1];
+        last.count += 1;
+        last.until = p.at;
+        carried = worseKind(carried, kind);
+      }
+    });
+    stats.drawn = kept.length;
+    stats.merged = valid.length - kept.length;
+
+    // ---- the path, as runs rather than one polyline per pair -------------
+    // A normal 800-fix trail used to be 799 separate canvas paths, each with
+    // its popup HTML built up front. Consecutive segments of the same kind are
+    // one polyline now, and every popup is a function the popup calls on open.
+    let run = null;
+    const runs = [];
+    const flushRun = () => {
+      if (!run || run.latlngs.length < 2) {
+        run = null;
+        return;
+      }
+      const active = run;
+      const rule = SEGMENT_RULES[active.kind];
+      const colour = segmentColour(active.kind, active.endPoint);
+      const line = L.polyline(active.latlngs, {
+        color: colour,
+        weight: rule.weight,
+        opacity: 0.85,
+        dashArray: rule.dashArray,
+      });
+      line.bindPopup(() => {
+        const first = active.startPoint;
+        const last = active.endPoint;
+        const minutes =
+          first.at && last.at ? (new Date(last.at).getTime() - new Date(first.at).getTime()) / 60000 : null;
+        let metres = 0;
+        for (let i = 1; i < active.points.length; i += 1) {
+          metres += geoDistance(active.points[i - 1], active.points[i]) || 0;
+        }
+        const kmh = minutes && minutes > 0 ? metres / 1000 / (minutes / 60) : null;
+        const segments = active.latlngs.length - 1;
+        return popupCard({
+          color: colour,
+          title: active.kind === 'normal' ? (segments > 1 ? 'Path · ' + segments + ' segments' : 'Path segment') : rule.label,
+          sub: fmt.time(first.at) + ' → ' + fmt.time(last.at),
+          rows: [
+            ['Elapsed', minutes !== null ? fmt.duration(minutes) : null],
+            ['Distance', fmt.metres(metres)],
+            ['Implied speed', kmh !== null ? kmh.toFixed(0) + ' km/h' : null],
+          ],
+        });
+      });
+      path.addLayer(line);
+      // Replay reveals the path run by run, so each one records the stretch of
+      // `kept` it covers and the style it was drawn with. Sharing the runs rather
+      // than re-deriving them is what keeps a played trail identical to the static
+      // one - same breaks, same colours, same dashes.
+      runs.push({
+        kind: active.kind,
+        fromOrder: active.fromOrder,
+        toOrder: active.toOrder,
+        color: colour,
+        weight: rule.weight,
+        dashArray: rule.dashArray,
+        line,
+      });
+      run = null;
+    };
+
+    for (let i = 1; i < kept.length; i += 1) {
+      const a = kept[i - 1];
+      const b = kept[i];
+      if (!run || run.kind !== b.kind) {
+        flushRun();
+        run = {
+          kind: b.kind,
+          latlngs: [[a.point.lat, a.point.lng]],
+          points: [a.point],
+          startPoint: a.point,
+          endPoint: a.point,
+          fromOrder: i - 1,
+          toOrder: i - 1,
+        };
+      }
+      run.latlngs.push([b.point.lat, b.point.lng]);
+      run.points.push(b.point);
+      run.endPoint = b.point;
+      run.toOrder = i;
+      // A gap or a jump stands alone - its popup is about those two fixes.
+      if (b.kind !== 'normal') flushRun();
+    }
+    flushRun();
+
+    // ---- dots, halos and sequence numbers, over the kept fixes only ------
+    const labelEvery = kept.length > 40 ? Math.ceil(kept.length / 25) : 1;
+    // One record per drawn mark, in draw order. The layer groups above show the
+    // whole trail at once; `marks` is for showing it a heartbeat at a time, and
+    // both hold the SAME layer objects - a replay that built its own would be
+    // drawing a second, subtly different trail on top of the first.
+    const marks = [];
+    kept.forEach((entry, order) => {
+      const p = entry.point;
+      const isEdge = entry.index === 0 || entry.index === valid.length - 1;
+      const colour = verdictColor(p.verdict, p.insideGeofence);
+      // Sequence numbers name the heartbeat in the table, so they come from the
+      // document's own ordinal when the caller supplied one - a state filter
+      // must not renumber what is left.
+      const seq = p.seq === undefined || p.seq === null ? entry.index + 1 : p.seq;
+
+      let halo = null;
       if (p.accuracy) {
-        accuracy.addLayer(
-          L.circle([p.lat, p.lng], {
-            radius: p.accuracy,
-            color: colour,
-            weight: 1,
-            opacity: 0.35,
-            fillColor: colour,
-            fillOpacity: 0.06,
-            interactive: false,
-          })
-        );
+        halo = L.circle([p.lat, p.lng], {
+          radius: p.accuracy,
+          color: colour,
+          weight: 1,
+          opacity: 0.55,
+          fillColor: colour,
+          fillOpacity: 0.1,
+          interactive: false,
+        });
+        accuracy.addLayer(halo);
       }
 
       const marker = L.circleMarker([p.lat, p.lng], {
@@ -441,10 +621,15 @@ window.PMMap = (function () {
         fillColor: colour,
         fillOpacity: isEdge ? 1 : 0.85,
       });
-      marker.bindPopup(
+      marker.bindPopup(() =>
         popupCard({
           color: colour,
-          title: index === 0 ? 'First heartbeat' : index === valid.length - 1 ? 'Latest heartbeat' : 'Heartbeat ' + (index + 1),
+          title:
+            entry.index === 0
+              ? 'First heartbeat'
+              : entry.index === valid.length - 1
+                ? 'Latest heartbeat'
+                : 'Heartbeat ' + seq,
           sub: fmt.date(p.at),
           rows: [
             ['Position', fmt.coords(p)],
@@ -452,24 +637,38 @@ window.PMMap = (function () {
             ['Fence', p.insideGeofence === true ? 'inside' : p.insideGeofence === false ? 'outside' : 'no flag'],
             ['Battery', p.battery !== undefined && p.battery !== null ? p.battery + '%' : null],
             ['Clock', p.clockedIn === undefined ? null : p.clockedIn ? 'on the clock' : 'off the clock'],
+            [
+              'Merged here',
+              entry.count > 1
+                ? entry.count -
+                  1 +
+                  ' further fix' +
+                  (entry.count > 2 ? 'es' : '') +
+                  ' within ' +
+                  fmt.metres(thinThreshold(p)) +
+                  (entry.until ? ', through ' + fmt.time(entry.until) : '')
+                : null,
+            ],
           ],
         })
       );
       dots.addLayer(marker);
 
-      if (isEdge || index % labelEvery === 0) {
-        labels.addLayer(
-          L.marker([p.lat, p.lng], {
-            interactive: false,
-            icon: L.divIcon({
-              className: '',
-              html: '<div class="map-seq" style="background:' + colour + '">' + (index + 1) + '</div>',
-              iconSize: [22, 22],
-              iconAnchor: [11, 11],
-            }),
-          })
-        );
+      let label = null;
+      if (isEdge || order % labelEvery === 0) {
+        label = L.marker([p.lat, p.lng], {
+          interactive: false,
+          icon: L.divIcon({
+            className: '',
+            html: '<div class="map-seq" style="background:' + colour + '">' + seq + '</div>',
+            iconSize: [22, 22],
+            iconAnchor: [11, 11],
+          }),
+        });
+        labels.addLayer(label);
       }
+
+      marks.push({ point: p, order, index: entry.index, colour, dot: marker, halo, label });
     });
 
     const layers = { path, dots, labels, accuracy };
@@ -479,7 +678,15 @@ window.PMMap = (function () {
         layer.addTo(map);
       }
     }
-    return { layers, points: valid, stats, group: L.layerGroup(Object.values(layers)) };
+    return {
+      layers,
+      points: valid,
+      drawn: kept.map((k) => k.point),
+      marks,
+      runs,
+      stats,
+      group: L.layerGroup(Object.values(layers)),
+    };
   }
 
   /**
@@ -489,6 +696,9 @@ window.PMMap = (function () {
   function clockIns(map, logs, opts) {
     const options = opts || {};
     const group = L.layerGroup();
+    // Ordered by when the check happened, so a replay can let them arrive as it
+    // reaches them instead of showing every check from the first frame.
+    const marks = [];
     for (const log of logs || []) {
       if (!log.location) continue;
       const colour = log.actualIsWithinRadius === false ? C.critical : log.graceApplied ? C.warning : C.good;
@@ -516,11 +726,417 @@ window.PMMap = (function () {
         })
       );
       group.addLayer(marker);
+      const atMs = new Date(log.capturedAt).getTime();
+      if (Number.isFinite(atMs)) marks.push({ atMs, marker, log });
     }
+    marks.sort((a, b) => a.atMs - b.atMs);
     if (options.add !== false) group.addTo(map);
-    return { group };
+    return { group, marks };
   }
 
+  /* ======================================================================
+     Replay
+     ----------------------------------------------------------------------
+     A trail answers "where did they go". It does not answer "when, and how
+     fast, and what was the device saying at the time" - for that you have to
+     read a table next to a map and join the two by eye. So the same points can
+     be played back: a timeline built once, then seeked to any instant.
+
+     Two rules keep the replay honest, because a smooth animation is very good
+     at implying knowledge that is not there:
+
+     - Position is interpolated between two fixes only across a NORMAL segment.
+       Across a reporting gap or a suspicious jump the marker holds still at the
+       last known fix until the next one arrives, because we do not know where
+       the device was in between and drawing it gliding across is a lie.
+     - Everything reported at an instant - accuracy, fence state, battery - is
+       the value from the fix at or before that instant, never blended. A device
+       is inside the fence or outside it; there is no halfway.
+     ====================================================================== */
+
+  /**
+   * The trail, revealed a heartbeat at a time.
+   *
+   * Replaying with the finished trail still on the map answers the wrong
+   * question: the whole route is already drawn, so a marker sliding along it
+   * shows only *where* someone is, never what had happened by then. Cleared
+   * first and drawn as it plays, the map answers "what did we know at 14:32" -
+   * which is the question a replay is for.
+   *
+   * The hard part is doing it without the per-frame cost growing with the
+   * trail. Three things keep it flat:
+   *
+   * - Marks are the SAME layer objects the static trail built (`trail().marks`),
+   *   so revealing one is an addLayer, never a rebuild. Leaflet's canvas
+   *   renderer redraws only the bounds that changed, so adding one dot costs
+   *   about one dot.
+   * - A path run that is entirely behind the playhead is the SAME prebuilt
+   *   polyline (`trail().runs`), added whole. No re-projection, and the played
+   *   route keeps the static one's colours, breaks and dashes exactly.
+   * - Only the run being walked is redrawn, and it is chunked: every CHUNK
+   *   points the tail is frozen into its own polyline and never touched again.
+   *   `setLatLngs` re-projects the entire line, so a single growing polyline is
+   *   O(points) every frame - which is exactly what makes a long replay stutter.
+   *
+   * Cost per step is therefore bounded by CHUNK and by the number of runs, not
+   * by the length of the trail, whether that is 500 heartbeats or 50,000.
+   *
+   * Because the layers are shared with the static trail, the caller must take
+   * the static groups off the map before using this - the same object cannot be
+   * in two places at once.
+   */
+  const CHUNK = 250;
+
+  function progressiveTrail(map, spec) {
+    const options = spec || {};
+    const marks = options.marks || [];
+    const runs = options.runs || [];
+    const clockMarks = options.clockMarks || [];
+    // A copy: the layer toolbar can be used mid-replay, and this has to track it
+    // without writing back into the caller.
+    const show = Object.assign({}, options.show || {});
+
+    const dots = L.layerGroup();
+    const halos = L.layerGroup();
+    const labels = L.layerGroup();
+    const clock = L.layerGroup();
+    const path = L.layerGroup();
+    const chunks = L.layerGroup(); // frozen chunks + the one live tail
+    const group = L.layerGroup([halos, path, chunks, clock, labels, dots]);
+
+    let shown = -1; // highest mark order revealed
+    let clockShown = -1;
+    let live = null;
+    let liveRun = -1;
+    let liveStart = -1;
+
+    const styleOf = (run) => ({
+      color: run.color,
+      weight: run.weight,
+      opacity: 0.85,
+      dashArray: run.dashArray,
+      interactive: false,
+    });
+
+    function dropLive() {
+      chunks.clearLayers();
+      live = null;
+      liveRun = -1;
+      liveStart = -1;
+    }
+
+    function revealMark(mark) {
+      if (show.dots !== false) dots.addLayer(mark.dot);
+      if (show.accuracy && mark.halo) halos.addLayer(mark.halo);
+      if (show.labels && mark.label) labels.addLayer(mark.label);
+    }
+
+    function hideMark(mark) {
+      dots.removeLayer(mark.dot);
+      if (mark.halo) halos.removeLayer(mark.halo);
+      if (mark.label) labels.removeLayer(mark.label);
+    }
+
+    /** The route as far as mark `order`, ending at `head` if given. */
+    function paintPath(order, head) {
+      if (show.path === false) return;
+      // One pass over the runs settles both directions of travel: a run behind
+      // the playhead is on, one ahead is off, and the first one straddling it
+      // is the one being drawn.
+      let current = -1;
+      for (let r = 0; r < runs.length; r += 1) {
+        const run = runs[r];
+        if (run.toOrder <= order) {
+          if (!path.hasLayer(run.line)) path.addLayer(run.line);
+        } else {
+          if (path.hasLayer(run.line)) path.removeLayer(run.line);
+          if (current === -1 && run.fromOrder <= order) current = r;
+        }
+      }
+      if (current === -1) {
+        dropLive();
+        return;
+      }
+
+      const run = runs[current];
+      // A different run, or a seek back behind the frozen chunks, starts over.
+      if (current !== liveRun || order < liveStart) {
+        chunks.clearLayers();
+        live = null;
+        liveRun = current;
+        liveStart = run.fromOrder;
+      }
+      while (order - liveStart >= CHUNK) {
+        const stop = liveStart + CHUNK;
+        const frozen = [];
+        for (let i = liveStart; i <= stop; i += 1) frozen.push([marks[i].point.lat, marks[i].point.lng]);
+        chunks.addLayer(L.polyline(frozen, styleOf(run)));
+        liveStart = stop;
+        live = null;
+      }
+      const tail = [];
+      for (let i = liveStart; i <= order; i += 1) tail.push([marks[i].point.lat, marks[i].point.lng]);
+      if (head) tail.push([head.lat, head.lng]);
+      if (tail.length < 2) {
+        if (live) chunks.removeLayer(live);
+        live = null;
+        return;
+      }
+      if (live) live.setLatLngs(tail);
+      else {
+        live = L.polyline(tail, styleOf(run));
+        chunks.addLayer(live);
+      }
+    }
+
+    return {
+      group,
+      /** Reveal up to mark `order` at instant `atMs`, `head` between two fixes. */
+      set(order, atMs, head) {
+        const target = Math.max(-1, Math.min(order, marks.length - 1));
+        if (target < shown) for (let i = shown; i > target; i -= 1) hideMark(marks[i]);
+        else for (let i = shown + 1; i <= target; i += 1) revealMark(marks[i]);
+        shown = target;
+
+        if (show.clockIns !== false) {
+          // Clock-in checks are events in time too: they arrive when the replay
+          // reaches them rather than sitting there from the first frame.
+          while (clockShown >= 0 && clockMarks[clockShown].atMs > atMs) {
+            clock.removeLayer(clockMarks[clockShown].marker);
+            clockShown -= 1;
+          }
+          while (clockShown + 1 < clockMarks.length && clockMarks[clockShown + 1].atMs <= atMs) {
+            clockShown += 1;
+            clock.addLayer(clockMarks[clockShown].marker);
+          }
+        }
+
+        paintPath(target, head);
+      },
+      /** Follow the layer toolbar while a replay is running. */
+      show(next) {
+        const was = { dots: show.dots, accuracy: show.accuracy, labels: show.labels };
+        Object.assign(show, next || {});
+        // Only walk the revealed marks for the kinds that actually changed. A
+        // toolbar click that toggles labels has no business re-adding every dot.
+        const moved = (k) => was[k] !== show[k];
+        if (moved("dots") || moved("accuracy") || moved("labels")) {
+          for (let i = 0; i <= shown; i += 1) {
+            const m = marks[i];
+            if (moved("dots")) {
+              if (show.dots !== false) dots.addLayer(m.dot);
+              else dots.removeLayer(m.dot);
+            }
+            if (m.halo && moved("accuracy")) {
+              if (show.accuracy) halos.addLayer(m.halo);
+              else halos.removeLayer(m.halo);
+            }
+            if (m.label && moved("labels")) {
+              if (show.labels) labels.addLayer(m.label);
+              else labels.removeLayer(m.label);
+            }
+          }
+        }
+        if (show.path === false) {
+          path.clearLayers();
+          dropLive();
+        } else {
+          paintPath(shown, null);
+        }
+        if (show.clockIns === false) {
+          clock.clearLayers();
+          clockShown = -1;
+        }
+      },
+      /** Back to an empty map, ready to play from the beginning. */
+      reset() {
+        for (let i = 0; i <= shown; i += 1) hideMark(marks[i]);
+        shown = -1;
+        clock.clearLayers();
+        clockShown = -1;
+        path.clearLayers();
+        dropLive();
+      },
+      remove() {
+        this.reset();
+        group.remove();
+      },
+    };
+  }
+  /** Milliseconds a replay will hold on a fix before a gap, so it reads as a pause. */
+  const HOLD_MS = 0;
+
+  /**
+   * Pre-computes what a replay needs: timestamps, cumulative distance, and
+   * whether each step may be interpolated across. O(n) once, so seeking is a
+   * binary search rather than a walk.
+   */
+  function trailTimeline(points) {
+    const valid = (points || []).filter(
+      (p) =>
+        p &&
+        Number.isFinite(p.lat) &&
+        Number.isFinite(p.lng) &&
+        p.at !== null &&
+        p.at !== undefined &&
+        Number.isFinite(new Date(p.at).getTime())
+    );
+    const times = [];
+    const cumMetres = [];
+    const glide = []; // glide[i] === may we interpolate from i to i+1
+    let running = 0;
+    for (let i = 0; i < valid.length; i += 1) {
+      times.push(new Date(valid[i].at).getTime());
+      if (i > 0) running += geoDistance(valid[i - 1], valid[i]) || 0;
+      cumMetres.push(running);
+    }
+    for (let i = 0; i < valid.length - 1; i += 1) {
+      glide.push(segmentKind(valid[i], valid[i + 1]).kind === 'normal');
+    }
+    return {
+      points: valid,
+      times,
+      cumMetres,
+      glide,
+      startMs: times.length ? times[0] : null,
+      endMs: times.length ? times[times.length - 1] : null,
+      durationMs: times.length > 1 ? times[times.length - 1] - times[0] : 0,
+      totalMetres: running,
+    };
+  }
+
+  /** Index of the last fix at or before `whenMs`. -1 when `whenMs` predates the trail. */
+  function indexAt(times, whenMs) {
+    let lo = 0;
+    let hi = times.length - 1;
+    if (!times.length || whenMs < times[0]) return -1;
+    if (whenMs >= times[hi]) return hi;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (times[mid] <= whenMs) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  /**
+   * Where the trail is at an instant.
+   * Returns null for an empty timeline; otherwise
+   * { index, point, next, lat, lng, interpolated, holding, travelledMetres, atMs }.
+   */
+  function seekTimeline(timeline, whenMs) {
+    const { points, times, cumMetres, glide } = timeline;
+    if (!points.length) return null;
+    const clamped = Math.max(times[0], Math.min(whenMs, times[times.length - 1]));
+    const i = Math.max(0, indexAt(times, clamped));
+    const point = points[i];
+    const next = i + 1 < points.length ? points[i + 1] : null;
+
+    // On, or past, the last fix.
+    if (!next) {
+      return {
+        index: i,
+        point,
+        next: null,
+        lat: point.lat,
+        lng: point.lng,
+        interpolated: false,
+        holding: false,
+        travelledMetres: cumMetres[i],
+        atMs: clamped,
+      };
+    }
+
+    const span = times[i + 1] - times[i];
+    const t = span > 0 ? (clamped - times[i]) / span : 0;
+    if (!glide[i]) {
+      // A gap or a jump: hold at the fix we actually have.
+      return {
+        index: i,
+        point,
+        next,
+        lat: point.lat,
+        lng: point.lng,
+        interpolated: false,
+        holding: t > 0,
+        travelledMetres: cumMetres[i],
+        atMs: clamped,
+      };
+    }
+    return {
+      index: i,
+      point,
+      next,
+      lat: point.lat + (next.lat - point.lat) * t,
+      lng: point.lng + (next.lng - point.lng) * t,
+      interpolated: t > 0,
+      holding: false,
+      travelledMetres: cumMetres[i] + (cumMetres[i + 1] - cumMetres[i]) * t,
+      atMs: clamped,
+    };
+  }
+
+  /**
+   * The replay overlay: the route already covered, and a marker on it. Kept
+   * separate from the trail layers so playing does not disturb what the layer
+   * toolbar is showing.
+   */
+  function playhead(map, opts) {
+    const options = opts || {};
+    const covered = L.polyline([], {
+      color: options.color || C.series[0],
+      weight: 4,
+      opacity: 0.95,
+      interactive: false,
+    });
+    const halo = L.circle([0, 0], {
+      radius: 1,
+      color: options.color || C.series[0],
+      weight: 1,
+      opacity: 0.6,
+      fillColor: options.color || C.series[0],
+      fillOpacity: 0.12,
+      interactive: false,
+    });
+    const dot = L.marker([0, 0], {
+      interactive: false,
+      zIndexOffset: 1000,
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="map-marker pulse" style="background:' + (options.color || C.series[0]) + ';color:' + (options.color || C.series[0]) + '"></div>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      }),
+    });
+    const group = L.layerGroup([halo, covered, dot]);
+    if (options.add !== false) group.addTo(map);
+
+    return {
+      group,
+      covered,
+      dot,
+      /** Move the marker, its accuracy halo, and the covered route. */
+      set(state, latlngs, accuracy) {
+        dot.setLatLng([state.lat, state.lng]);
+        halo.setLatLng([state.lat, state.lng]);
+        halo.setRadius(Number.isFinite(accuracy) && accuracy > 0 ? accuracy : 1);
+        halo.setStyle({ opacity: Number.isFinite(accuracy) && accuracy > 0 ? 0.6 : 0 });
+        covered.setLatLngs(latlngs);
+      },
+      setColor(color) {
+        covered.setStyle({ color });
+        halo.setStyle({ color, fillColor: color });
+        const icon = dot.getElement();
+        if (icon && icon.firstChild) {
+          icon.firstChild.style.background = color;
+          icon.firstChild.style.color = color;
+        }
+      },
+      remove() {
+        group.remove();
+      },
+    };
+  }
   /** Legend for the trail view, matching the segment and marker rules above. */
   function trailLegend() {
     const line = (color, dash) =>
@@ -656,6 +1272,51 @@ window.PMMap = (function () {
     );
   }
 
+  /**
+   * Fit to `points`, then include only the `context` points close enough to be
+   * worth seeing next to them.
+   *
+   * The user page fitted the trail and every fence the person had ever touched
+   * in one call. A site registered 40 km away - and this store has them, from
+   * old snapshots and from fences with no site id - framed a 40 km box, in
+   * which a whole shift's trail is one pixel. Nothing was wrong with the trail;
+   * it was two orders of magnitude too small to see.
+   *
+   * Returns how many context points were left out, so the caller can say so
+   * rather than quietly dropping a fence off the edge.
+   */
+  function fitWithContext(map, points, context, opts) {
+    const options = opts || {};
+    const core = (points || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    const extra = (context || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    if (!core.length) {
+      fit(map, extra, options);
+      return { skipped: 0 };
+    }
+
+    const bounds = L.latLngBounds(core.map((p) => [p.lat, p.lng]));
+    const centre = bounds.getCenter();
+    // How far out is still "next to" the data: the span of the data itself, with
+    // a floor so a stationary trail still shows the fence it is standing in.
+    const span = centre.distanceTo(bounds.getNorthEast());
+    const reach = Math.max(options.minReachMetres || 1500, span * (options.reachFactor || 4));
+
+    let skipped = 0;
+    const near = [];
+    for (const p of extra) {
+      if (centre.distanceTo(L.latLng(p.lat, p.lng)) > reach) {
+        skipped += 1;
+        continue;
+      }
+      // A context point with a radius is a circle, and framing it means framing
+      // its edge - fitting to the centre leaves the boundary off-screen.
+      near.push(p);
+      if (Number.isFinite(p.radius)) near.push(...extentPoints(p, p.radius));
+    }
+    fit(map, core.concat(near), options);
+    return { skipped };
+  }
+
   function clear(layers) {
     for (const layer of layers || []) if (layer && layer.group) layer.group.remove();
   }
@@ -713,6 +1374,12 @@ window.PMMap = (function () {
     trailLegend,
     guideLine,
     fit,
+    fitWithContext,
+    trailTimeline,
+    seekTimeline,
+    playhead,
+    progressiveTrail,
+    extentPoints,
     clear,
     legend,
     verdictColor,

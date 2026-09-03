@@ -188,8 +188,41 @@ window.PMExitWindows = (function () {
 
     const points = [];
     if (row.fence) {
-      PMMap.siteCircle(map, { ...row.fence, siteId: row.jobSiteId, label: row.siteAddress, address: row.siteAddress }, { label: false });
-      points.push({ lat: row.fence.lat, lng: row.fence.lng });
+      // The window document carries the fence the device was actually judged
+      // against - centre and radius both. That is a boundary on record, so it
+      // has to be declared as one: siteCircle only draws a real fence when
+      // `radiusIsAuthoritative` is set, and this object was built by spreading
+      // row.fence, which has no such field. The result was a dashed grey 40 m
+      // "estimated centre" ring drawn where a 200 m fence belonged - the site
+      // name and address resolved fine, so the geofence looked simply missing.
+      // A radius from the window itself is on record. Without one there is no
+      // boundary to claim, and the dashed estimate ring is the honest drawing.
+      const onRecord = row.fence.radius !== null && row.fence.radius !== undefined;
+      const siteId = row.jobSiteId != null ? row.jobSiteId : row.site ? row.site.siteId : null;
+      const site = {
+        ...(row.site || {}),
+        lat: row.fence.lat,
+        lng: row.fence.lng,
+        radius: row.fence.radius,
+        siteId,
+        address: row.siteAddress || (row.site ? row.site.address : null),
+        label: siteId != null ? 'Site ' + siteId : 'Unmapped fence',
+        radiusIsAuthoritative: onRecord,
+        hasFence: onRecord,
+        fenceOnRecord: onRecord,
+        // The centre came off the window document with the radius, so it is
+        // recorded whatever the site registry inferred for its own row.
+        centreConfidence: onRecord ? 'recorded' : 'unknown',
+        centreEstimate: null,
+        centreIsEstimate: false,
+      };
+      const drawn = PMMap.siteCircle(map, site);
+      // Frame the fence, not just its centre: every sample in one of these
+      // windows sits within a few hundred metres of it, so fitting to the
+      // centre point alone zoomed straight past the boundary and left the
+      // circle outside the viewport.
+      if (drawn) points.push({ lat: row.fence.lat, lng: row.fence.lng }, ...drawn.extent);
+      else points.push({ lat: row.fence.lat, lng: row.fence.lng });
     }
     const trail = PMMap.track(map, row.samples);
     if (trail) for (const p of trail.points) points.push(p);

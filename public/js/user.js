@@ -14,7 +14,9 @@
   let tabs = null;
   let heartbeatPage = 1;
   let map = null;
-  let mapLayers = [];
+  // Where the user last left the trail map. The panel is thrown away and rebuilt
+  // on every reload, so without this a refresh threw away their zoom too.
+  let mapView = null;
 
   PM.boot(
     'user.html',
@@ -64,7 +66,12 @@
       );
 
       await load();
-      window.addEventListener('pm:filters', load);
+      // The page filter is the authority: changing it drops any narrower map
+      // window, or the filter bar would appear to do nothing.
+      window.addEventListener('pm:filters', () => {
+        mapWindow = null;
+        load();
+      });
       window.addEventListener('pm:refresh', load);
     },
     { activeFile: 'users.html', title: 'User' }
@@ -87,7 +94,9 @@
       '#shift-card': 'kv:6',
     });
     try {
-      detail = await api('/api/users/' + encodeURIComponent(userId) + '?historyLimit=800&' + queryString());
+      detail = await api(
+        '/api/users/' + encodeURIComponent(userId) + '?historyLimit=' + fixLimit() + '&' + scopedQuery()
+      );
     } catch (err) {
       renderLoadFailure(err);
       return;
@@ -202,7 +211,16 @@
         'best ' + fmt.accuracy(stats.bestAccuracy) + ' · worst ' + fmt.accuracy(stats.worstAccuracy),
         stats.avgAccuracy > 50 ? 'warning' : undefined
       ),
-      tile('Distance travelled', fmt.metres(stats.travelledMetres), 'summed between heartbeats'),
+      // Travelled distance is summed over the plotted track, which is the newest
+      // `historyLimit` heartbeats - not the range - whenever a device reports
+      // faster than that. Every other tile here is over the whole range, so the
+      // one that is not has to say so.
+      tile(
+        'Distance travelled',
+        fmt.metres(stats.travelledMetres),
+        detail.trackTruncated ? 'over the plotted trail, not the range' : 'summed between heartbeats',
+        detail.trackTruncated ? 'warning' : undefined
+      ),
       tile('Battery range', battery, 'across the window', stats.minBattery !== null && stats.minBattery <= 10 ? 'warning' : undefined),
       tile('Offline pings', fmt.int(stats.offline), 'heartbeats with no connectivity', stats.offline ? 'serious' : undefined),
       tile(
@@ -449,6 +467,29 @@
     { key: 'poor', label: 'Poor accuracy (>50 m)' },
   ];
 
+  /**
+   * How many heartbeats to pull for the trail.
+   *
+   * This page asked for 800, hard-coded, and the server capped anything at
+   * 5,000 - so on a device reporting once a second the map could not show a
+   * whole shift no matter what you did, and never said why. It is a choice now,
+   * remembered per browser. A day of one 1 Hz device is 86,400 heartbeats, so
+   * the top of this list is a real answer to "all of them" rather than a
+   * gesture; the map warns when a number this large makes it slow.
+   */
+  const FIX_LIMITS = [800, 2000, 5000, 20000, 50000, 100000];
+  const DEFAULT_FIX_LIMIT = 5000;
+
+  function fixLimit() {
+    let saved = null;
+    try {
+      saved = Number(localStorage.getItem('pm.trail.limit'));
+    } catch (err) {
+      saved = null;
+    }
+    return FIX_LIMITS.includes(saved) ? saved : DEFAULT_FIX_LIMIT;
+  }
+
   function trailPrefs() {
     const prefs = {};
     for (const layer of TRAIL_LAYERS) {
@@ -465,6 +506,13 @@
     } catch (err) {
       prefs.state = 'all';
     }
+    // Off by default: every heartbeat gets its own mark unless asked otherwise.
+    try {
+      prefs.merge = localStorage.getItem('pm.trail.merge') === '1';
+    } catch (err) {
+      prefs.merge = false;
+    }
+    prefs.limit = fixLimit();
     return prefs;
   }
 
@@ -484,10 +532,511 @@
     return true;
   }
 
+  /* ---------------------------------------------------------------- window
+     A time window scoped tighter than the page's filter bar.
+
+     Narrowing the range is the one thing that always makes a trail complete:
+     the Fixes limit takes the NEWEST n heartbeats, so a window small enough to
+     hold fewer than n of them is never truncated. The filter bar can do this
+     with a custom range, but it is at the top of the page, it reloads
+     everything, and it has no idea what the map is short of - so the map now
+     carries its own, seeded from what actually loaded, with Earlier/Later
+     stepping so a dense day can be walked one complete window at a time.
+
+     It refines the page filter rather than sitting beside it: the request is
+     the same request, so every count on the page agrees with the map. That is
+     worth being loud about, and the bar says so whenever a window is set. */
+  let mapWindow = null;
+
+  const WINDOW_PRESETS = [
+    { key: 15, label: '15 min' },
+    { key: 60, label: '1 hour' },
+    { key: 180, label: '3 hours' },
+    { key: 360, label: '6 hours' },
+    { key: 720, label: '12 hours' },
+    { key: 1440, label: '24 hours' },
+  ];
+
+  /** `datetime-local` wants local wall-clock with no zone, to the minute. */
+  function toLocalInput(iso) {
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return (
+      d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes())
+    );
+  }
+
+  function fromLocalInput(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
+  /**
+   * Every request this page makes, scoped the same way.
+   *
+   * The map window was applied in load() only, so the Heartbeats tab - which
+   * fetches its own page from /api/snapshots - kept answering for the whole page
+   * range while the map beside it answered for fifteen minutes. Two tabs of the
+   * same person disagreeing about how many heartbeats exist is worse than either
+   * number on its own, so the scope lives here and every caller goes through it.
+   *
+   * `range: 'custom'` matters: queryString() resolves a preset like "last 24h"
+   * into its own `from` and deletes `to`, so an explicit window has to say it is
+   * not a preset or it would be silently overwritten.
+   */
+  function scopedQuery(extra) {
+    const scope = mapWindow ? { range: "custom", from: mapWindow.from, to: mapWindow.to } : null;
+    if (!scope && !extra) return queryString();
+    return queryString(Object.assign({}, scope, extra));
+  }
+
+  function setMapWindow(next) {
+    mapWindow = next;
+    load();
+  }
+
+  /** Move the window by its own length. */
+  function stepMapWindow(direction) {
+    if (!mapWindow) return;
+    const from = new Date(mapWindow.from).getTime();
+    const to = new Date(mapWindow.to).getTime();
+    const span = Math.max(60000, to - from);
+    setMapWindow({
+      from: new Date(from + direction * span).toISOString(),
+      to: new Date(to + direction * span).toISOString(),
+    });
+  }
+
+  function renderWindowBar(host, opts) {
+    const options = opts || {};
+    host.innerHTML = '';
+    const loadedFrom = detail.trackFrom;
+    const loadedTo = detail.trackTo;
+
+    const fromInput = el('input', {
+      type: 'datetime-local',
+      value: mapWindow ? toLocalInput(mapWindow.from) : loadedFrom ? toLocalInput(loadedFrom) : '',
+    });
+    const toInput = el('input', {
+      type: 'datetime-local',
+      value: mapWindow ? toLocalInput(mapWindow.to) : loadedTo ? toLocalInput(loadedTo) : '',
+    });
+
+    const apply = () => {
+      const from = fromLocalInput(fromInput.value);
+      const to = fromLocalInput(toInput.value);
+      if (!from || !to) {
+        PM.toast('Give the window both a start and an end.', 'error');
+        return;
+      }
+      if (new Date(from).getTime() >= new Date(to).getTime()) {
+        PM.toast('The window has to start before it ends.', 'error');
+        return;
+      }
+      setMapWindow({ from, to });
+    };
+
+    // Anchored on the newest heartbeat that loaded, because that is where a
+    // truncated trail is: "the last hour" of the range, not of the wall clock.
+    const anchor = loadedTo ? new Date(loadedTo).getTime() : Date.now();
+    const preset = (minutes) =>
+      setMapWindow({
+        from: new Date(anchor - minutes * 60000).toISOString(),
+        to: new Date(anchor).toISOString(),
+      });
+
+    host.append(
+      el('span', { class: 'toolbar-field' }, [
+        el('span', { text: 'Window' }),
+        fromInput,
+        el('span', { class: 'hint', text: '→' }),
+        toInput,
+        el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: 'Apply', onclick: apply }),
+      ]),
+      el('span', { class: 'toolbar-sep' }),
+      ...WINDOW_PRESETS.map((p) =>
+        el('button', {
+          type: 'button',
+          class: 'btn btn-sm',
+          text: p.label,
+          title: 'The last ' + p.label + ' of the loaded data',
+          onclick: () => preset(p.key),
+        })
+      ),
+      el('span', { class: 'toolbar-sep' }),
+      el('button', {
+        type: 'button',
+        class: 'btn btn-sm',
+        text: '◀ Earlier',
+        title: 'Move the window back by its own length',
+        disabled: mapWindow ? null : 'disabled',
+        onclick: () => stepMapWindow(-1),
+      }),
+      el('button', {
+        type: 'button',
+        class: 'btn btn-sm',
+        text: 'Later ▶',
+        title: 'Move the window forward by its own length',
+        disabled: mapWindow ? null : 'disabled',
+        onclick: () => stepMapWindow(1),
+      }),
+      el('div', { style: 'flex:1' })
+    );
+
+    // The one-click answer to a truncated trail: shrink the window to exactly
+    // what came back, so the next load is complete, then walk backwards with
+    // Earlier. It talks about the trail, so it is offered on the map only.
+    if (options.narrow !== false && detail.trackTruncated && loadedFrom && loadedTo) {
+      host.append(
+        el('button', {
+          type: 'button',
+          class: 'btn btn-sm btn-primary',
+          text: '⤡ Narrow to what loaded',
+          title: 'Set the window to the span the trail actually covers, so nothing is cut off',
+          onclick: () => setMapWindow({ from: loadedFrom, to: loadedTo }),
+        })
+      );
+    }
+    if (mapWindow) {
+      host.append(
+        el('button', {
+          type: 'button',
+          class: 'btn btn-sm',
+          text: '✕ Clear window',
+          title: 'Go back to the page filter',
+          onclick: () => setMapWindow(null),
+        })
+      );
+    }
+
+    host.classList.toggle('is-active', !!mapWindow);
+  }
+
+  /* ---------------------------------------------------------------- replay
+     A trail says where someone went. It does not say when, how fast, or what
+     the device was reporting at the time - for that you read a table beside a
+     map and join the two by eye. Replay puts them together: a marker walks the
+     trail while a readout shows the heartbeat it is standing on.
+
+     PMMap.seekTimeline does the honest part (see maps.js): position is only
+     interpolated across a normal reporting interval, and every value shown is
+     read off a real heartbeat rather than blended between two. */
+  let sim = null;
+
+  const SPEEDS = [
+    { key: 'auto', label: 'Auto (~30 s)' },
+    { key: '1', label: 'Real time' },
+    { key: '60', label: '1 min/s' },
+    { key: '300', label: '5 min/s' },
+    { key: '1800', label: '30 min/s' },
+    { key: '7200', label: '2 h/s' },
+  ];
+  // The highlighted tail behind the marker, in fixes. Bounded on purpose: a
+  // polyline that grows to the whole track has to be re-projected every frame,
+  // which is what makes a replay of 50,000 points stutter.
+  const TAIL_FIXES = 200;
+  function stopSim() {
+    if (!sim) return;
+    if (sim.raf) cancelAnimationFrame(sim.raf);
+    // Order matters: the reveal has to hand the shared layer objects back
+    // before the playhead goes, or marks stay orphaned on a dead map.
+    if (sim.reveal) sim.reveal.remove();
+    if (sim.head) sim.head.remove();
+    sim = null;
+  }
+
+  function buildSim(map, points, host, spec) {
+    const timeline = PMMap.trailTimeline(points);
+    const source = spec || {};
+    host.innerHTML = '';
+    if (timeline.points.length < 2 || timeline.durationMs <= 0) {
+      host.append(
+        el('div', {
+          class: 'sim-empty',
+          text:
+            timeline.points.length < 2
+              ? 'Replay needs at least two heartbeats with coordinates in this window.'
+              : 'Every heartbeat in this window carries the same timestamp, so there is nothing to play back.',
+        })
+      );
+      return;
+    }
+
+    // The replay walks the fixes the map actually drew. With Merge nearby on,
+    // that is the merged set - so the marks appearing during playback are the
+    // marks that were there before it started, never a second, denser trail.
+    // Marks are a subsequence of the timeline (same objects, same order), so one
+    // walk gives, for every fix, the last mark drawn at or before it. With Merge
+    // nearby off they are the same list; with it on, several fixes map to the one
+    // mark that stands for them.
+    const markOf = new Map();
+    (source.marks || []).forEach((m, i) => markOf.set(m.point, i));
+    const orderAt = new Int32Array(timeline.points.length);
+    {
+      let mo = -1;
+      for (let i = 0; i < timeline.points.length; i += 1) {
+        const hit = markOf.get(timeline.points[i]);
+        if (hit !== undefined) mo = hit;
+        orderAt[i] = mo;
+      }
+    }
+    const layerShow = (p) => ({ dots: p.dots, path: p.path, labels: p.labels, accuracy: p.accuracy, clockIns: p.clockIns });
+
+    const scrub = el('input', { type: 'range', min: '0', max: '1000', value: '0', class: 'sim-scrub' });
+    const playBtn = el('button', { type: 'button', class: 'btn btn-sm btn-primary', text: '▶ Play' });
+    const readout = el('div', { class: 'sim-readout' });
+    const speedSelect = el(
+      'select',
+      {},
+      SPEEDS.map((s) => el('option', { value: s.key, text: s.label }))
+    );
+    const followBox = el('input', { type: 'checkbox', checked: 'checked' });
+    const exitBtn = el('button', {
+      type: 'button',
+      class: 'btn btn-sm',
+      text: '✕ Exit replay',
+      title: 'Stop replaying and put the whole trail back on the map',
+      hidden: 'hidden',
+      onclick: () => exitReplay(),
+    });
+
+    host.append(
+      el('div', { class: 'sim-controls' }, [
+        playBtn,
+        el('button', { type: 'button', class: 'btn btn-sm', text: '⏮', title: 'Back one heartbeat', onclick: () => step(-1) }),
+        el('button', { type: 'button', class: 'btn btn-sm', text: '⏭', title: 'Forward one heartbeat', onclick: () => step(1) }),
+        el('button', { type: 'button', class: 'btn btn-sm', text: '↺', title: 'Back to the start', onclick: () => restart() }),
+        scrub,
+        el('span', { class: 'toolbar-field' }, [el('span', { text: 'Speed' }), speedSelect]),
+        el('label', { class: 'chip is-on' }, [followBox, document.createTextNode('Follow')]),
+        exitBtn,
+      ]),
+      readout
+    );
+
+    sim = {
+      timeline,
+      map,
+      tMs: timeline.startMs,
+      playing: false,
+      raf: null,
+      last: 0,
+      dragging: false,
+      // Nothing follows the marker until the user actually drives the replay.
+      // Painting the opening frame would otherwise pan straight off the frame
+      // that rebuild() had just fitted, which reads as the map jumping on load.
+      driven: false,
+      // Replay mode: the map has been cleared back to the start and the trail is
+      // being drawn as it plays. Distinct from `playing`, which is just whether
+      // the clock is running - pausing halfway must not put the whole route back.
+      replaying: false,
+      lastIndex: -1,
+      reveal: null,
+      showLayers: (next) => {
+        if (sim && sim.reveal) sim.reveal.show(next);
+      },
+      head: PMMap.playhead(map, { add: true }),
+      scrub,
+      playBtn,
+      readout,
+      speedSelect,
+      followBox,
+    };
+
+    const timeCell = el('span', { class: 'sim-time' });
+    const factsCell = el('span', { class: 'sim-facts' });
+    readout.append(timeCell, factsCell);
+
+    const factor = () => {
+      const chosen = speedSelect.value;
+      if (chosen === 'auto') return Math.max(1, timeline.durationMs / 30000);
+      return Number(chosen) || 1;
+    };
+
+    function paint() {
+      const at = PMMap.seekTimeline(timeline, sim.tMs);
+      if (!at) return;
+      const p = at.point;
+      if (sim.replaying) {
+        // The revealed trail behind the marker IS the route now, so the comet
+        // tail would just draw a second brighter line along the same points.
+        sim.reveal.set(orderAt[at.index], at.atMs, { lat: at.lat, lng: at.lng });
+        sim.head.set(at, [], p.accuracy);
+      } else {
+        const from = Math.max(0, at.index - TAIL_FIXES);
+        const tail = timeline.points.slice(from, at.index + 1).map((q) => [q.lat, q.lng]);
+        tail.push([at.lat, at.lng]);
+        sim.head.set(at, tail, p.accuracy);
+      }
+
+      if (!sim.dragging) {
+        scrub.value = String(Math.round(((sim.tMs - timeline.startMs) / timeline.durationMs) * 1000));
+      }
+
+      // Only recentre once the marker has drifted out of the middle of the
+      // view: panning every frame fights the user and never settles.
+      if (sim.driven && followBox.checked && !map.getBounds().pad(-0.25).contains(L.latLng(at.lat, at.lng))) {
+        map.panTo([at.lat, at.lng], { animate: true, duration: 0.4 });
+      }
+
+      // The clock moves every frame; the heartbeat behind it does not. Parsing
+      // a row of badges sixty times a second for values that changed once is
+      // most of what would make this stutter, so only the time is written per
+      // frame and the rest is rebuilt when the replay actually reaches the
+      // next heartbeat.
+      timeCell.textContent = fmt.date(p.at);
+      if (at.index === sim.lastIndex) return;
+      sim.lastIndex = at.index;
+
+      sim.head.setColor(PMMap.verdictColor(p.verdict, p.insideGeofence));
+      const silence =
+        at.next && !timeline.glide[at.index]
+          ? (new Date(at.next.at).getTime() - new Date(p.at).getTime()) / 60000
+          : null;
+      factsCell.innerHTML =
+        '<span class="sim-cell">heartbeat <b>' + fmt.int(at.index + 1) + '</b> of ' + fmt.int(timeline.points.length) + '</span>' +
+        '<span class="sim-cell">' + PM.geofenceBadge(p.insideGeofence, p.verdict) + '</span>' +
+        '<span class="sim-cell">' + PM.accuracyBadge(PM.accuracyBandOf(p.accuracy), p.accuracy) + '</span>' +
+        (p.battery === null || p.battery === undefined ? '' : '<span class="sim-cell">' + PM.batteryBadge(p.battery) + '</span>') +
+        '<span class="sim-cell">' + (p.clockedIn ? 'on the clock' : 'off the clock') + '</span>' +
+        '<span class="sim-cell">travelled <b>' + fmt.metres(at.travelledMetres) + '</b></span>' +
+        (silence
+          ? '<span class="sim-cell sim-hold">⚠ no heartbeat for ' + fmt.duration(silence) + ' - holding here</span>'
+          : '');
+    }
+
+    function seek(ms, repaint) {
+      sim.tMs = Math.max(timeline.startMs, Math.min(ms, timeline.endMs));
+      if (repaint !== false) paint();
+    }
+
+    /**
+     * Hand the map over to the replay: clear the finished trail off it, and let
+     * the route be drawn again from the beginning as the clock runs.
+     *
+     * The static layer groups come off rather than being hidden, because the
+     * reveal shows the very same layer objects - one Leaflet layer cannot be in
+     * two places at once, and leaving both on would draw the whole route over the
+     * top of the one being played.
+     */
+    function enterReplay() {
+      if (!sim || sim.replaying) return;
+      const prefs = source.prefs || {};
+      // Everything time-based comes off; the geofences stay. A fence is not
+      // something that happened at a moment, it is the thing the replay is being
+      // judged against, and a trail replaying inside an invisible fence is useless.
+      const statics = (source.staticLayers && source.staticLayers()) || {};
+      for (const key of ['dots', 'path', 'labels', 'accuracy', 'clockIns']) {
+        const layer = statics[key];
+        if (layer && map.hasLayer(layer)) map.removeLayer(layer);
+      }
+      sim.reveal = PMMap.progressiveTrail(map, {
+        marks: source.marks || [],
+        runs: source.runs || [],
+        clockMarks: source.clockMarks || [],
+        show: layerShow(prefs),
+      });
+      sim.reveal.group.addTo(map);
+      sim.replaying = true;
+      exitBtn.hidden = false;
+      host.classList.add("is-replaying");
+    }
+
+    /** Wind right back: an empty map, ready to draw the trail again. */
+    function restart() {
+      pause();
+      enterReplay();
+      if (sim.reveal) sim.reveal.reset();
+      sim.lastIndex = -1;
+      seek(timeline.startMs);
+    }
+
+    /** Give the map back: the whole trail returns exactly as it was. */
+    function exitReplay() {
+      if (!sim) return;
+      pause();
+      if (sim.reveal) {
+        sim.reveal.remove();
+        sim.reveal = null;
+      }
+      sim.replaying = false;
+      exitBtn.hidden = true;
+      host.classList.remove("is-replaying");
+      if (source.restore) source.restore();
+      paint();
+    }
+
+    function step(by) {
+      sim.driven = true;
+      enterReplay();
+      const at = PMMap.seekTimeline(timeline, sim.tMs);
+      const next = Math.max(0, Math.min(at.index + by, timeline.points.length - 1));
+      pause();
+      seek(timeline.times[next]);
+    }
+
+    function frame(now) {
+      if (!sim || !sim.playing) return;
+      const dt = sim.last ? now - sim.last : 16;
+      sim.last = now;
+      sim.tMs += dt * factor();
+      if (sim.tMs >= timeline.endMs) {
+        sim.tMs = timeline.endMs;
+        paint();
+        pause();
+        return;
+      }
+      paint();
+      sim.raf = requestAnimationFrame(frame);
+    }
+
+    function play() {
+      if (!sim || sim.playing) return;
+      // Replaying from the end just sits there; start over instead.
+      if (sim.tMs >= timeline.endMs) sim.tMs = timeline.startMs;
+      sim.driven = true;
+      enterReplay();
+      sim.playing = true;
+      sim.last = 0;
+      playBtn.textContent = '❚❚ Pause';
+      playBtn.classList.add('is-playing');
+      sim.raf = requestAnimationFrame(frame);
+    }
+
+    function pause() {
+      if (!sim) return;
+      sim.playing = false;
+      if (sim.raf) cancelAnimationFrame(sim.raf);
+      sim.raf = null;
+      playBtn.textContent = '▶ Play';
+      playBtn.classList.remove('is-playing');
+    }
+
+    playBtn.addEventListener('click', () => (sim.playing ? pause() : play()));
+    scrub.addEventListener('input', () => {
+      sim.dragging = true;
+      sim.driven = true;
+      enterReplay();
+      pause();
+      seek(timeline.startMs + (timeline.durationMs * Number(scrub.value)) / 1000);
+    });
+    scrub.addEventListener('change', () => {
+      sim.dragging = false;
+    });
+    followBox.addEventListener('change', () => {
+      followBox.parentNode.classList.toggle('is-on', followBox.checked);
+    });
+
+    paint();
+  }
   function renderLocationTab(host) {
     const row = detail.current;
     const prefs = trailPrefs();
     const toolbar = el('div', { class: 'map-toolbar' });
+    const windowBar = el('div', { class: 'map-toolbar map-window' });
+    const simBar = el('div', { class: 'sim-bar' });
     const mapHost = el('div', { class: 'map', id: 'user-map', style: 'height:460px' });
 
     host.append(
@@ -498,23 +1047,60 @@
         el('span', { class: 'sub', id: 'guide-link' }),
       ]),
       toolbar,
+      windowBar,
       mapHost,
+      simBar,
+      el('div', { class: 'trail-note', id: 'trail-note' }),
       el('div', { html: PMMap.trailLegend() })
     );
+    renderWindowBar(windowBar, { narrow: true });
 
+    // The replay owns a requestAnimationFrame loop and a marker on the old map.
+    // This panel is rebuilt on every reload, so the previous one has to be shut
+    // down here or it keeps animating against a map that no longer exists.
+    stopSim();
+
+    // Every reload of this page - a filter change, and every auto-refresh tick -
+    // re-renders this panel, which throws the old map's container away. The old
+    // L.Map object survived that: its window resize handler stayed attached to a
+    // detached container, it stayed in PMMap.instances for retheme() to walk,
+    // and the fresh map re-fitted, so anyone who had zoomed in to read a cluster
+    // was thrown back out to the whole trail every refresh. Tear the old one
+    // down properly, and hand the new one the view the user was looking at.
+    if (map) {
+      try {
+        map.remove();
+      } catch (err) {
+        /* already gone with its container */
+      }
+      map = null;
+    }
     map = PMMap.create(mapHost);
+    const restoring = mapView !== null;
+    if (restoring) map.setView(mapView.center, mapView.zoom);
     setTimeout(() => map.invalidateSize(), 60);
 
     // Layers are built once per data load and toggled by adding / removing.
     let built = null;
+    let skippedFences = 0;
 
-    const rebuild = () => {
+    const rebuild = (options) => {
+      const refit = !(options && options.keepView === true);
+      // Before anything else: a replay from the previous load owns layer objects
+      // that are about to be replaced, and applyVisibility() steps aside while one
+      // is running - so tearing it down later would leave the map with neither the
+      // revealed trail nor the static one.
+      stopSim();
       if (built) {
         for (const layer of Object.values(built.layers)) if (layer) map.removeLayer(layer);
         for (const extra of built.extras) if (extra && extra.group) extra.group.remove();
       }
-      const points = (detail.track || []).filter((p) => stateMatches(p, prefs.state));
-      const trail = PMMap.trail(map, points, { add: false });
+      // Numbered once, over the whole track, before the state filter runs: a
+      // sequence number names a heartbeat in the table below, so "Inside fence"
+      // must not renumber the ones it leaves behind.
+      const all = (detail.track || []).map((p, i) => (p.seq === undefined ? { ...p, seq: i + 1 } : p));
+      const points = all.filter((p) => stateMatches(p, prefs.state));
+      const trail = PMMap.trail(map, points, { add: false, thin: prefs.merge });
       const clock = PMMap.clockIns(map, detail.logs || [], { add: false });
 
       const fences = L.layerGroup();
@@ -529,7 +1115,14 @@
       }
 
       built = {
-        layers: { dots: trail.layers.dots, path: trail.layers.path, labels: trail.layers.labels, accuracy: trail.layers.accuracy, clockIns: clock.group, fences },
+        layers: {
+          dots: trail.layers.dots,
+          path: trail.layers.path,
+          labels: trail.layers.labels,
+          accuracy: trail.layers.accuracy,
+          clockIns: clock.group,
+          fences,
+        },
         extras,
         trail,
         points,
@@ -551,16 +1144,44 @@
 
       applyVisibility();
 
-      const fitPoints = points.slice();
-      for (const site of detail.sites || []) if (site.lat != null) fitPoints.push({ lat: site.lat, lng: site.lng });
-      if (row.location) fitPoints.push(row.location);
-      PMMap.fit(map, fitPoints);
+      // The heartbeats and the current fix decide the frame; fences join it only
+      // if they are near enough to share one. A site 40 km away used to frame a
+      // 40 km box and squash a whole shift's trail into a single pixel.
+      const core = points.slice();
+      if (row.location) core.push(row.location);
+      const context = (detail.sites || [])
+        .filter((s) => s.lat != null)
+        // The radius comes along so a fence near enough to keep is framed to its
+        // boundary rather than to its centre point.
+        .map((s) => ({ lat: s.lat, lng: s.lng, radius: s.radiusIsAuthoritative ? s.radius : null }));
+      // Keeping the user's view is only kind while there is still something in
+      // it. Change the date range to another day and the trail moves somewhere
+      // else entirely - restoring the old frame would hand back a blank map and
+      // look exactly like the failure this whole change is about. So the view is
+      // kept only if at least one heartbeat is actually inside it.
+      let doFit = refit;
+      if (!doFit) {
+        const inView = map.getBounds();
+        const visible = core.some(
+          (p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng) && inView.contains(L.latLng(p.lat, p.lng))
+        );
+        if (!visible) doFit = true;
+      }
+      // Only a refit recomputes which fences fit in the frame; a reload that
+      // keeps the user's view keeps the last answer, so the note under the map
+      // does not blink off while the fence is still off the edge.
+      if (doFit) skippedFences = PMMap.fitWithContext(map, core, context).skipped;
 
       const stats = trail.stats;
       const gaps = stats.gapShort + stats.gapLong;
+      const inRange = (detail.stats || {}).snapshots;
       document.querySelector('#trail-sub').textContent =
-        points.length +
+        // Plotted out of in-range, always, so this line can be reconciled with
+        // the KPI tile above without reading the notes underneath.
+        fmt.int(stats.points) +
+        (inRange && inRange !== stats.points ? ' of ' + fmt.int(inRange) : '') +
         ' heartbeats' +
+        (stats.merged ? ' · ' + fmt.int(stats.drawn) + ' marks' : '') +
         (prefs.state === 'all' ? '' : ' matching "' + (STATES.find((x) => x.key === prefs.state) || {}).label + '"') +
         ' · ' +
         (detail.sites || []).length +
@@ -568,10 +1189,133 @@
         (gaps ? ' · ' + gaps + ' reporting gap(s)' : '') +
         (stats.jump ? ' · ' + stats.jump + ' suspicious jump(s)' : '') +
         ' · travelled ' +
-        fmt.metres((detail.stats || {}).travelledMetres);
+        fmt.metres((detail.stats || {}).travelledMetres) +
+        (detail.trackTruncated ? ' over the plotted trail' : '');
       document.querySelector('#guide-link').innerHTML = row.guide
         ? '<a href="' + row.guide.directionsUrl + '" target="_blank" rel="noopener">↗ Walking directions back to the site</a>'
         : '';
+      renderTrailNote(stats, skippedFences);
+      // The replay walks the same points the map is showing, so a change of
+      // State filter or of window rebuilds it against the new set rather than
+      // animating a trail that is no longer on screen.
+      buildSim(map, points, simBar, {
+        marks: trail.marks,
+        runs: trail.runs,
+        clockMarks: clock.marks,
+        prefs,
+        // Read late: `built` is reassigned on every rebuild, so capturing the
+        // groups here would hand the replay a previous load to switch off.
+        staticLayers: () => (built ? built.layers : {}),
+        restore: applyVisibility,
+      });
+    };
+
+    /**
+     * Where every heartbeat went, said out loud.
+     *
+     * "Not all my heartbeats are showing" had four different causes and the map
+     * reported none of them, so each one looked like the same bug. The chain
+     * from the count above the map down to the marks on it is:
+     *
+     *   in range  ->  loaded (the Fixes limit)  ->  plottable (has coordinates)
+     *             ->  matching (the State filter)  ->  drawn (Merge nearby)
+     *
+     * Every step that removes anything names itself here, with the control that
+     * caused it, so the number on the map can always be reconciled with the KPI
+     * tile above it.
+     */
+    const renderTrailNote = (stats, skippedFences) => {
+      const notes = [];
+      const total = (detail.stats || {}).snapshots;
+      const loaded = detail.trackFetched;
+      const plottable = (detail.track || []).length;
+      const noFix = detail.trackNoFix || 0;
+      const hidden = plottable - stats.points;
+
+      // 1. The Fixes limit: the newest N of the range, not the range.
+      if (detail.trackTruncated && total && loaded < total) {
+        const atCeiling = detail.trackLimit >= (detail.trackCeiling || Infinity);
+        notes.push(
+          '<b>Loaded the newest ' +
+            fmt.int(loaded) +
+            ' of ' +
+            fmt.int(total) +
+            ' heartbeats in range.</b> This device reports faster than the Fixes limit, so the map starts at ' +
+            (detail.trackFrom ? fmt.date(detail.trackFrom) : 'the tail of the range') +
+            ' rather than the beginning of the window. ' +
+            (atCeiling
+              ? 'That is the highest the limit goes - narrow the time range to reach earlier heartbeats.'
+              : 'Raise <b>Fixes</b> above, or narrow the time range.')
+        );
+      }
+
+      // 2. No coordinates: a real heartbeat that no map can place.
+      if (noFix) {
+        notes.push(
+          fmt.int(noFix) +
+            ' of the ' +
+            fmt.int(loaded) +
+            ' loaded heartbeat' +
+            (loaded === 1 ? '' : 's') +
+            ' arrived with no coordinates and cannot be placed on a map. They are in the Heartbeats tab, and in the counts above.'
+        );
+      }
+
+      // 3. The State filter - which is remembered per browser, so it can be on
+      //    from a previous visit with nothing on screen to explain the gap.
+      if (hidden > 0) {
+        const label = (STATES.find((x) => x.key === prefs.state) || {}).label || prefs.state;
+        notes.push(
+          '<b>The State filter is hiding ' +
+            fmt.int(hidden) +
+            ' of ' +
+            fmt.int(plottable) +
+            ' plotted heartbeats.</b> Only those matching "' +
+            esc(label) +
+            '" are drawn. Set State back to "All heartbeats" to see the rest.'
+        );
+      }
+
+      // 4. Merging - only ever on because someone ticked it.
+      if (stats.merged) {
+        notes.push(
+          '<b>Merge nearby</b> is on: ' +
+            fmt.int(stats.merged) +
+            ' fix' +
+            (stats.merged === 1 ? '' : 'es') +
+            ' sat within their own GPS accuracy of the fix before and are folded into it, leaving ' +
+            fmt.int(stats.drawn) +
+            ' mark' +
+            (stats.drawn === 1 ? '' : 's') +
+            ' - click one for the count it stands for. Untick it to draw all ' +
+            fmt.int(stats.points) +
+            '. Either way all ' +
+            fmt.int(stats.points) +
+            ' are counted in the gap and jump figures above.'
+        );
+      }
+
+      // Not a heartbeat problem, but the same class of silent omission.
+      if (skippedFences) {
+        notes.push(
+          fmt.int(skippedFences) +
+            ' fence(s) are too far from this trail to frame with it and are off the map. They are listed under Right now and in the heartbeat rows.'
+        );
+      }
+
+      // Drawing every fix is the default, and on a dense reporter that is a lot
+      // of canvas paths. Say so rather than just feeling slow.
+      if (!stats.merged && stats.drawn > 15000) {
+        notes.push(
+          'Drawing ' +
+            fmt.int(stats.drawn) +
+            ' marks. Panning and zooming will be slow, and fixes this dense overlap into a blob - tick <b>Merge nearby</b> for a faster and more readable map without loading less.'
+        );
+      }
+
+      const hostNote = document.querySelector('#trail-note');
+      hostNote.innerHTML = notes.length ? notes.map((n) => '<div>' + n + '</div>').join('') : '';
+      hostNote.style.display = notes.length ? '' : 'none';
     };
 
     // Bottom to top. Canvas layers are drawn - and hit-tested - in the order
@@ -581,6 +1325,14 @@
 
     const applyVisibility = () => {
       if (!built) return;
+      // While a replay is running it owns these layers - the very same objects,
+      // revealed one at a time - so putting the finished trail back on the map
+      // here would draw the whole route over the top of the one being played.
+      // The toolbar still records the change; it lands when the replay exits.
+      if (sim && sim.replaying) {
+        sim.showLayers(prefs);
+        return;
+      }
       // Take everything off first, so re-adding restores the stack order even
       // when a single toggle changed.
       for (const layer of Object.values(built.layers)) {
@@ -605,23 +1357,78 @@
       toolbar.append(chip);
     }
 
+    // Merging is a drawing decision, not a layer, so it gets its own chip -
+    // off by default, because the map should hold one mark per heartbeat until
+    // someone asks for the legible-but-fewer version.
+    const mergeBox = el('input', { type: 'checkbox', checked: prefs.merge ? 'checked' : null });
+    const mergeChip = el(
+      'label',
+      {
+        class: 'chip' + (prefs.merge ? ' is-on' : ''),
+        title: 'Fold fixes that sit within their own GPS accuracy of the previous one into it. Fewer marks, and the path and accuracy halos become visible under a stationary cluster.',
+      },
+      [mergeBox, document.createTextNode('Merge nearby')]
+    );
+    mergeBox.addEventListener('change', () => {
+      prefs.merge = mergeBox.checked;
+      saveTrailPref('merge', mergeBox.checked);
+      mergeChip.classList.toggle('is-on', mergeBox.checked);
+      // A different set of marks, same data - keep the frame the user is on.
+      rebuild({ keepView: true });
+    });
+    toolbar.append(mergeChip);
+
     const stateSelect = el(
       'select',
       {
         onchange: (event) => {
           prefs.state = event.target.value;
           saveTrailPref('state', prefs.state);
+          // A different subset of the trail is a different frame - refit.
           rebuild();
         },
       },
       STATES.map((st) => el('option', { value: st.key, text: st.label, selected: prefs.state === st.key ? 'selected' : null }))
     );
-    toolbar.append(
-      el('div', { style: 'flex:1' }),
-      el('span', { class: 'toolbar-field' }, [el('span', { text: 'State' }), stateSelect])
+
+    // Changing how many heartbeats to pull is a new request, not a redraw.
+    const limitSelect = el(
+      'select',
+      {
+        title: 'How many of the most recent heartbeats in range to load for this map',
+        onchange: (event) => {
+          saveTrailPref('limit', event.target.value);
+          load();
+        },
+      },
+      FIX_LIMITS.map((n) =>
+        el('option', { value: String(n), text: fmt.int(n), selected: prefs.limit === n ? 'selected' : null })
+      )
     );
 
-    rebuild();
+    toolbar.append(
+      el('div', { style: 'flex:1' }),
+      el('span', { class: 'toolbar-field' }, [el('span', { text: 'Fixes' }), limitSelect]),
+      el('span', { class: 'toolbar-field' + (prefs.state === 'all' ? '' : ' is-filtering') }, [
+        el('span', { text: 'State' }),
+        stateSelect,
+      ]),
+      el('button', {
+        type: 'button',
+        class: 'btn btn-sm',
+        text: '⤢ Fit',
+        title: 'Frame the trail again',
+        onclick: () => rebuild(),
+      })
+    );
+
+    rebuild({ keepView: restoring });
+    // Remembered from here on, so the next reload lands where the user left off.
+    // A deliberate refit fires these too, which is right - that frame becomes
+    // the one to come back to.
+    map.on('moveend zoomend', () => {
+      mapView = { center: map.getCenter(), zoom: map.getZoom() };
+    });
   }
 
   /** Leaflet needs a nudge whenever its container was hidden while sizing. */
@@ -640,46 +1447,104 @@
     ]);
   }
 
+  /**
+   * A line chart cannot show more points than the canvas has pixels, and
+   * Chart.js will try anyway: three charts over a 50,000-point track is a hung
+   * tab, and even at 5,000 the lines are denser than they are readable.
+   *
+   * So the track is bucketed into at most MAX_CHART_POINTS contiguous buckets.
+   * Which value represents a bucket is chosen per series rather than by taking
+   * every Nth point, because a stride silently drops exactly the spikes these
+   * charts exist to show:
+   *
+   *   accuracy  -> the WORST in the bucket (the fix least able to judge a fence)
+   *   battery   -> the LOWEST in the bucket (the one that predicts a silence)
+   *   fence     -> the COUNT of each state, which is what the axis already says
+   *
+   * Under the threshold nothing happens and the charts are exactly as before.
+   */
+  const MAX_CHART_POINTS = 1500;
+
+  function bucketTrack(track, maxPoints) {
+    const size = Math.max(1, Math.ceil(track.length / maxPoints));
+    if (size === 1) {
+      return {
+        size: 1,
+        labels: track.map((p) => fmt.dayTime(p.at)),
+        accuracy: track.map((p) => p.accuracy),
+        battery: track.map((p) => p.battery),
+        inside: track.map((p) => (p.insideGeofence === true ? 1 : 0)),
+        outside: track.map((p) => (p.insideGeofence === false ? 1 : 0)),
+        noflag: track.map((p) => (p.insideGeofence === null || p.insideGeofence === undefined ? 1 : 0)),
+      };
+    }
+    const out = { size, labels: [], accuracy: [], battery: [], inside: [], outside: [], noflag: [] };
+    for (let start = 0; start < track.length; start += size) {
+      const bucket = track.slice(start, start + size);
+      const accs = bucket.map((p) => p.accuracy).filter((v) => v !== null && v !== undefined);
+      const batts = bucket.map((p) => p.battery).filter((v) => v !== null && v !== undefined);
+      out.labels.push(fmt.dayTime(bucket[0].at));
+      out.accuracy.push(accs.length ? Math.max(...accs) : null);
+      out.battery.push(batts.length ? Math.min(...batts) : null);
+      out.inside.push(bucket.filter((p) => p.insideGeofence === true).length);
+      out.outside.push(bucket.filter((p) => p.insideGeofence === false).length);
+      out.noflag.push(bucket.filter((p) => p.insideGeofence === null || p.insideGeofence === undefined).length);
+    }
+    return out;
+  }
+
   function renderHistoryTab(host) {
     const track = detail.track || [];
     if (!track.length) {
       host.append(el('div', { class: 'empty', text: 'No heartbeats with coordinates in this time range.' }));
       return;
     }
+    const b = bucketTrack(track, MAX_CHART_POINTS);
+    const per = b.size === 1 ? 'per heartbeat' : 'per ' + fmt.int(b.size) + ' heartbeats';
+    const grouped =
+      b.size === 1
+        ? ''
+        : ' · ' + fmt.int(track.length) + ' heartbeats grouped into ' + fmt.int(b.labels.length) + ' points';
+
     host.append(
       el('div', { class: 'stack' }, [
-        chartBlock('GPS accuracy per heartbeat', 'metres · lower is better', 'chart-acc'),
-        chartBlock('Battery per heartbeat', 'per cent', 'chart-batt'),
-        chartBlock('Geofence state per heartbeat', 'what the device reported in each heartbeat', 'chart-geo', [
-          el('div', {
-            html: PMChart.legend([
-              { color: C.in, label: 'Inside fence' },
-              { color: C.out, label: 'Outside fence' },
-              { color: C.unknown, label: 'No fence flag' },
-            ]),
-          }),
-        ]),
+        chartBlock('GPS accuracy ' + per, 'metres · lower is better' + (b.size === 1 ? '' : ' · worst in each group') + grouped, 'chart-acc'),
+        chartBlock('Battery ' + per, 'per cent' + (b.size === 1 ? '' : ' · lowest in each group') + grouped, 'chart-batt'),
+        chartBlock(
+          'Geofence state ' + per,
+          b.size === 1 ? 'what the device reported in each heartbeat' : 'heartbeats by reported state in each group' + grouped,
+          'chart-geo',
+          [
+            el('div', {
+              html: PMChart.legend([
+                { color: C.in, label: 'Inside fence' },
+                { color: C.out, label: 'Outside fence' },
+                { color: C.unknown, label: 'No fence flag' },
+              ]),
+            }),
+          ]
+        ),
       ])
     );
 
-    const labels = track.map((p) => fmt.dayTime(p.at));
+    const labels = b.labels;
     PMChart.lineTime(document.querySelector('#chart-acc'), {
       labels,
       yTitle: 'metres',
-      series: [{ label: 'GPS accuracy', data: track.map((p) => p.accuracy), color: C.series[0] }],
+      series: [{ label: b.size === 1 ? 'GPS accuracy' : 'Worst GPS accuracy', data: b.accuracy, color: C.series[0] }],
     });
     PMChart.lineTime(document.querySelector('#chart-batt'), {
       labels,
       yTitle: 'battery %',
-      series: [{ label: 'Battery', data: track.map((p) => p.battery), color: C.series[3] }],
+      series: [{ label: b.size === 1 ? 'Battery' : 'Lowest battery', data: b.battery, color: C.series[3] }],
     });
     PMChart.stackedTime(document.querySelector('#chart-geo'), {
       labels,
       yTitle: 'heartbeats',
       datasets: [
-        { label: 'Inside', data: track.map((p) => (p.insideGeofence === true ? 1 : 0)), color: C.in },
-        { label: 'Outside', data: track.map((p) => (p.insideGeofence === false ? 1 : 0)), color: C.out },
-        { label: 'No flag', data: track.map((p) => (p.insideGeofence === null ? 1 : 0)), color: C.unknown },
+        { label: 'Inside', data: b.inside, color: C.in },
+        { label: 'Outside', data: b.outside, color: C.out },
+        { label: 'No flag', data: b.noflag, color: C.unknown },
       ],
     });
   }
@@ -698,14 +1563,18 @@
           el('button', {
             class: 'btn btn-sm',
             text: '↓ CSV',
-            onclick: () => window.open('/api/snapshots.csv?' + queryString({ userId, limit: 2000 }), '_blank'),
+            onclick: () => window.open('/api/snapshots.csv?' + scopedQuery({ userId, limit: 2000 }), '_blank'),
           })
         ),
+        // The same window the map uses, and the same object behind it - narrowing
+        // here narrows there, because they are two views of one question.
+        el('div', { class: 'map-toolbar map-window', id: 'hb-window' }),
         el('div', { class: 'chips', id: 'hb-summary' }),
         el('div', { id: 'hb-table' }, [el('div', { class: 'empty', text: 'loading heartbeats…' })]),
         el('div', { class: 'pager', id: 'hb-pager' }),
       ])
     );
+    renderWindowBar(document.querySelector('#hb-window'), { narrow: false });
     await loadHeartbeats();
   }
 
@@ -715,7 +1584,7 @@
     if (!table) return;
     let data;
     try {
-      data = await api('/api/snapshots?' + queryString({ userId, limit: 100, page: heartbeatPage }));
+      data = await api('/api/snapshots?' + scopedQuery({ userId, limit: 100, page: heartbeatPage }));
     } catch (err) {
       table.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
       return;

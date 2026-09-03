@@ -272,30 +272,42 @@ router.get('/users/:userId', async (req, res, next) => {
     const { col, base } = await collectionFor('snapshots');
     const idMatch = userId === null ? { [SNAP.userId]: null } : { [SNAP.userId]: userId };
     const match = F.and([base, idMatch, F.snapshotMatch({ ...req.query, userId: undefined })]);
+    // The trail is the NEWEST `historyLimit` heartbeats, which is not the same
+    // thing as the range. Reporting rates here differ by over 200x - one device
+    // sends a heartbeat a second - so for the fast ones 800 documents is the
+    // last quarter of an hour of a 24-hour window, and the map silently showed
+    // that while every count above it described the whole day. The response now
+    // says so and the map prints it.
+    //
+    // The ceiling was 5,000 while the user page asked for 800, so asking for
+    // more than 800 was impossible from the UI and more than 5,000 impossible
+    // at all. A day of one 1 Hz device is 86,400 heartbeats, so "show me all of
+    // them" needs real headroom: the cap is now 100,000 and the page lets you
+    // choose. The projection is nine small fields, so the cost is transfer, not
+    // the query - and the page reports when it hits the ceiling.
+    const HISTORY_CEILING = 100000;
+    const historyLimit = Math.max(1, Math.min(Number(req.query.historyLimit) || 500, HISTORY_CEILING));
 
     const [latestDoc, history, agg] = await Promise.all([
       col.find(match).sort({ createdAt: -1 }).limit(1).maxTimeMS(config.queryTimeoutMs).next(),
       col
         .find(match, {
+          // Exactly what the track emits, and nothing else. This projection
+          // used to pull fourteen fields (including `permissionsEnabled`, an
+          // array) to build a seven-field point - wasted on one document, and
+          // wasted tens of megabytes over the wire from Atlas now that this
+          // limit reaches 100,000 of them. `currentUserLocation` is asked for
+          // whole because the sub-fields are all used.
           projection: {
             createdAt: 1,
             currentUserLocation: 1,
             isInsideGeofence: 1,
             clockedIn: 1,
-            clockedOut: 1,
             batteryPercentage: 1,
-            isConnected: 1,
-            isReachable: 1,
-            geofenceIn: 1,
-            geofenceOut: 1,
-            deviceType: 1,
-            permissionsEnabled: 1,
-            'clockedInJobDetail.jobSiteId': 1,
-            'clockedInJobSiteLocation.jobSiteId': 1,
           },
         })
         .sort({ createdAt: -1 })
-        .limit(Math.min(Number(req.query.historyLimit) || 500, 5000))
+        .limit(historyLimit)
         .maxTimeMS(config.queryTimeoutMs)
         .toArray(),
       col
@@ -347,28 +359,35 @@ router.get('/users/:userId', async (req, res, next) => {
     const sites = await getSites();
     const current = attachSite(normalize.snapshot(latestDoc), sites);
 
-    const track = history
+    // A heartbeat with no coordinates cannot go on a map, but it is still a
+    // heartbeat and it is still in the count above the map. That silent
+    // difference is a third reason "not all my heartbeats are showing" - so it
+    // is counted here and named in the UI rather than left to be inferred from
+    // two numbers that do not match.
+    const trackAll = history
       .slice()
       .reverse()
       .map((d) => {
         const loc = d.currentUserLocation || {};
         return {
+          // Seven fields, and every one of them is read by the map or the
+          // History charts. `accuracyBand`, `connected` and `jobSiteId` used to
+          // ride along here too and nothing on the client ever looked at them -
+          // 52 bytes a point of dead weight, which at the limits this endpoint
+          // now serves is megabytes. The band is derivable from `accuracy`
+          // anyway, and the other two are on `current` and on the Heartbeats
+          // rows, which is where they are actually used.
           at: normalize.iso(d.createdAt),
           lat: normalize.num(loc.latitude),
           lng: normalize.num(loc.longitude),
           accuracy: normalize.num(loc.accuracy),
-          accuracyBand: geo.accuracyBand(normalize.num(loc.accuracy)),
           insideGeofence: d.isInsideGeofence === undefined ? null : d.isInsideGeofence,
           clockedIn: d.clockedIn === true,
           battery: normalize.num(d.batteryPercentage),
-          connected: d.isConnected === true,
-          jobSiteId:
-            (d.clockedInJobDetail && d.clockedInJobDetail.jobSiteId) ||
-            (d.clockedInJobSiteLocation && d.clockedInJobSiteLocation.jobSiteId) ||
-            null,
         };
-      })
-      .filter((p) => p.lat !== null && p.lng !== null);
+      });
+    const track = trackAll.filter((p) => p.lat !== null && p.lng !== null);
+    const trackNoFix = trackAll.length - track.length;
 
     // Distance actually travelled across the tracked window.
     let travelled = 0;
@@ -377,13 +396,25 @@ router.get('/users/:userId', async (req, res, next) => {
       if (d !== null) travelled += d;
     }
 
-    // Related geofence validation calls
+    // Related geofence validation calls.
+    //
+    // These were fetched by user id alone, ignoring the range the rest of the
+    // page is filtered to. So the trail map plotted clock-in checks from months
+    // outside the window - marks with no heartbeat anywhere near them, in a
+    // frame chosen for the heartbeats - and the tab count disagreed with the
+    // Geofence Checks page for the same filters.
     let logs = [];
     try {
       const lookup = await siteLookup();
       const logCol = await collectionFor('clockInLogs');
       const logDocs = await logCol.col
-        .find(userId === null ? { userId: null } : { userId })
+        .find(
+          F.and([
+            logCol.base,
+            userId === null ? { userId: null } : { userId },
+            F.logMatch({ from: req.query.from, to: req.query.to }),
+          ])
+        )
         .sort({ createdAt: -1 })
         .limit(100)
         .maxTimeMS(config.queryTimeoutMs)
@@ -443,6 +474,15 @@ router.get('/users/:userId', async (req, res, next) => {
           }
         : null,
       track,
+      trackLimit: historyLimit,
+      trackCeiling: HISTORY_CEILING,
+      // Heartbeats actually read out of the store, before the ones with no
+      // coordinates were dropped. track.length + trackNoFix === trackFetched.
+      trackFetched: history.length,
+      trackNoFix,
+      trackTruncated: history.length >= historyLimit,
+      trackFrom: track.length ? track[0].at : null,
+      trackTo: track.length ? track[track.length - 1].at : null,
       logs,
       exitWindows,
       // Only the sites this user actually touched. Null must never match: the

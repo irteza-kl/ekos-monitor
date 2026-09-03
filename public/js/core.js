@@ -352,6 +352,36 @@ window.PM = (function () {
     return '<span class="badge badge-neutral">○ No fence</span>';
   }
 
+  /**
+   * The band a metre reading falls into.
+   *
+   * Rows that come from the server carry their own `accuracyBand`, but the
+   * user page's trail deliberately does not - it is thousands of points and the
+   * band is derivable, so shipping it was megabytes of something the client can
+   * work out. The thresholds come from `/api/meta`, which is generated from
+   * `server/lib/geo.js`, so this stays in step with the filter dropdown and the
+   * server's own banding. The literals are the same list, for the moment before
+   * meta arrives.
+   */
+  const FALLBACK_BANDS = [
+    { key: 'excellent', max: 10 },
+    { key: 'good', max: 25 },
+    { key: 'fair', max: 50 },
+    { key: 'poor', max: 100 },
+    { key: 'unusable', max: null },
+  ];
+
+  function accuracyBandOf(accuracy) {
+    const n = Number(accuracy);
+    if (!Number.isFinite(n)) return 'unknown';
+    const bands = (state.meta && state.meta.accuracyBands) || null;
+    const list = bands && bands.length ? bands.filter((b) => b.key !== 'unknown') : FALLBACK_BANDS;
+    for (const band of list) {
+      if (band.max === null || band.max === undefined || n < band.max) return band.key;
+    }
+    return 'unusable';
+  }
+
   function accuracyBadge(band, accuracy) {
     const map = {
       excellent: ['badge-good', 'Excellent'],
@@ -461,6 +491,7 @@ window.PM = (function () {
     { key: '1h', label: 'Last hour', minutes: 60 },
     { key: '3h', label: 'Last 3 hours', minutes: 180 },
     { key: '6h', label: 'Last 6 hours', minutes: 360 },
+    { key: '12h', label: 'Last 12 hours', minutes: 720 },
     { key: '24h', label: 'Last 24 hours', minutes: 1440 },
     { key: '3d', label: 'Last 3 days', minutes: 4320 },
     { key: '7d', label: 'Last 7 days', minutes: 10080 },
@@ -1752,6 +1783,7 @@ window.PM = (function () {
     kv,
     geofenceBadge,
     accuracyBadge,
+    accuracyBandOf,
     batteryBadge,
     meter,
     jsonHighlight,

@@ -238,7 +238,28 @@
             host.append(mapHost, el('div', { html: PMMap.legend() }));
             const map = PMMap.create(mapHost);
             setTimeout(() => map.invalidateSize(), 60);
-            if (row.fence) PMMap.siteCircle(map, { ...row.fence, siteId: row.siteId, label: row.siteAddress, radius: row.fence.radius });
+            // Same fence-provenance trap as the exit-window replay: this fence
+            // came out of the geofence log itself (siteArea.locations), which is
+            // the most authoritative radius in the store, but siteCircle only
+            // draws a boundary when told the radius is on record. Spread from
+            // row.fence it never was, so the check that this whole page audits
+            // was drawn against a dashed grey 40 m guess.
+            const framePoints = [];
+            if (row.fence) {
+              const drawn = PMMap.siteCircle(map, {
+                ...row.fence,
+                siteId: row.siteId,
+                address: row.siteAddress,
+                radiusIsAuthoritative: row.fence.radius !== null && row.fence.radius !== undefined,
+                hasFence: row.fence.radius !== null && row.fence.radius !== undefined,
+                centreConfidence: 'recorded',
+                // The padded radius the API actually judged against, shown in
+                // the popup next to the fence it was padded from.
+                effectiveRadius: row.effectiveRadius,
+              });
+              framePoints.push(row.fence);
+              if (drawn) framePoints.push(...drawn.extent);
+            }
             if (row.location) {
               PMMap.deviceMarker(
                 map,
@@ -264,8 +285,12 @@
                   text: fmt.metres(row.relation.distanceFromBoundary) + ' outside · head ' + (row.relation.compass ? oppositeCompass(row.relation.compass) : ''),
                 });
               }
-              PMMap.fit(map, [row.location, row.fence].filter(Boolean), { zoom: 17 });
             }
+            // Outside the `if (row.location)` it used to live in: a check with a
+            // fence but no usable fix left the map on the world view, which is
+            // the one case where you most want to see the fence on its own.
+            if (row.location) framePoints.push(row.location);
+            PMMap.fit(map, framePoints, { zoom: 17 });
             host.append(
               el('div', { class: 'section-title', text: 'Effective radius' }),
               PM.kv([

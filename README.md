@@ -184,7 +184,7 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
 | **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. |
-| **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** map, **history** charts, **heartbeats** (every stored document, paged, click a row for its full breakdown), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
+| **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** (map, layer toolbar, its own time window, and a replay that walks the trail heartbeat by heartbeat), **history** charts, **heartbeats** (every stored document, paged, click a row for its fix on a map plus its full breakdown), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
 | **Geofence Sites** | The fence registry — centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
@@ -229,6 +229,304 @@ outside), sequence numbers are thinned so they stay legible on a long trail, and
 under the map names every mark. The header counts the gaps and jumps it found - on the live
 data one user shows 3 reporting gaps and 1 suspicious jump across 800 heartbeats.
 
+Clock-in checks on this map are pulled for the **same range as everything else on the page**.
+They were previously fetched by user id alone, so the trail carried marks from months
+outside the window - clock-ins with no heartbeat anywhere near them, plotted in a frame
+chosen for the heartbeats - and the tab count disagreed with the Geofence Checks page under
+identical filters.
+
+#### "Not all my heartbeats are showing" had four separate causes
+
+Four different things removed heartbeats between the count in the KPI tile and the marks on
+the map, and the map reported none of them - so all four looked like the same bug. The chain
+is now printed under the map at every step that drops anything, with the control that caused
+it:
+
+| Step | Control | Why anything goes missing |
+|---|---|---|
+| in range → **loaded** | `Fixes` | the newest N heartbeats, not the whole range |
+| loaded → **plottable** | none | the heartbeat arrived with no coordinates |
+| plottable → **matching** | `State` | remembered per browser, so it can be on from a past visit |
+| matching → **drawn** | `Merge nearby` | near-duplicate fixes folded into one mark |
+
+`stats.points` (every matching fix) and `stats.drawn` (marks on the map) are reported
+separately, and the header always reads *plotted of in-range*, so the map can be reconciled
+with the tile above it without reading the notes.
+
+**Fixes** was the big one. This page asked for `historyLimit=800`, hard-coded, and the
+server clamped anything to 5,000 - so a whole shift of a 1 Hz device could not be plotted no
+matter what you did. It is a choice now (800 → 100,000, default 5,000, remembered per
+browser) and the server ceiling is 100,000. A day of one 1 Hz device is 86,400 heartbeats,
+so the top of that list is a real answer rather than a gesture. The projection is nine small
+fields, so the cost is transfer rather than the query; the response carries `trackLimit`,
+`trackCeiling`, `trackFetched`, `trackNoFix`, `trackTruncated`, `trackFrom` and `trackTo`,
+and the map says which limit it hit and whether raising it would help.
+
+**State** is worth its own mention: it lives in `localStorage`, so a filter set weeks ago is
+still on today with nothing on screen to explain the missing marks. The control now
+highlights itself while it is filtering, and the note says how many it is hiding.
+
+#### Two fixes 3 m apart are one position, and drawing both hides everything under them
+
+Reporting rates across this fleet differ by over 200x. A device sending a heartbeat a
+second, parked inside a 3 m circle for ten minutes, produces 600 fixes at effectively one
+place. Drawn literally that is 600 opaque dots stacked on each other, 599 sub-pixel path
+segments buried underneath them, and 600 accuracy halos at 6% fill that add up to a flat
+grey disc. **Nothing was missing** - the Path and Accuracy layers were being built and
+added exactly as the toolbar said. They were invisible under the pile, which is why turning
+them off and on looked like a broken toggle.
+
+`PMMap.trail()` can thin what it *draws*, behind the **Merge nearby** chip. A fix is kept
+when it is farther from the last kept one than the accuracy that produced it (floor 4 m,
+ceiling 30 m - two fixes closer than their own error bars are not two positions), and always
+when it carries something distance does not:
+
+- the first and last fix of the trail,
+- a change of fence state or clock state,
+- either side of a reporting gap or a suspicious jump.
+
+Everything dropped is folded into the fix it sits on, whose popup says how many and through
+when. On the 800-fix stationary case that is 2 marks and 798 merged.
+
+**It is off by default.** Merging makes a stationary cluster legible, but it also means the
+map holds fewer marks than the person has heartbeats, and "show me all of them" is both the
+more common ask and the safer default - so `trail()` thins only when told to (`thin: true`),
+and drawing everything is what happens if nobody says otherwise.
+
+`stats` is counted over **every** fix either way - how well a device reported is a fact
+about the data and must not move when the drawing does - so the gap and jump counts in the
+header never change with the chip.
+
+The path is also built as runs rather than one polyline per pair: consecutive segments of
+the same kind become one `L.polyline`, and gaps and jumps stay separate so their popup is
+about those two fixes. An 800-fix trail was ~2,400 canvas paths with ~2,400 popup HTML
+strings built up front; popups are now functions Leaflet calls on open. That is what makes
+drawing every fix affordable at all, and the note warns past 15,000 marks that panning will
+be slow and suggests the chip.
+
+Sequence numbers come from the heartbeat's own ordinal in the track, not its index in the
+filtered array, so selecting "Inside fence" no longer renumbers the survivors out of step
+with the table below.
+
+#### The History charts bucket instead of hanging
+
+The three charts on the History tab plotted one point per heartbeat straight off the track.
+At the old hard-coded 800 that was fine; at 50,000 it is a hung tab, and even at 5,000 the
+lines are denser than the canvas has pixels. `bucketTrack()` groups the track into at most
+1,500 contiguous buckets, and which value represents a bucket is chosen per series rather
+than by taking every Nth point - a stride silently drops exactly the spikes these charts
+exist to show:
+
+| Series | Bucket value |
+|---|---|
+| GPS accuracy | the **worst** in the bucket - the fix least able to judge a fence |
+| Battery | the **lowest** in the bucket - the one that predicts a silence |
+| Geofence state | the **count** of each state, which is what the axis already said |
+
+Under 1,500 points nothing happens and the charts are exactly as before. Above it every
+title says what it is showing ("GPS accuracy per 34 heartbeats · worst in each group ·
+50,000 heartbeats grouped into 1,471 points"), so a smoothed line is never mistaken for a
+quiet device.
+
+#### A fence 40 km away is not context
+
+The map used to fit the trail and every fence the person had ever touched in one call. This
+store holds sites registered tens of kilometres from where anyone works - from old
+snapshots, and from fences with no site id - and one of those framed a 40 km box in which
+a whole shift's trail is a single pixel. `PMMap.fitWithContext(map, points, context)` frames
+the heartbeats and the current fix, then includes only the fences within reach of them (the
+span of the data itself, floor 1.5 km), **to the fence boundary rather than its centre** -
+fitting to the centre point drew a 300 m circle and then zoomed past it. Whatever it leaves
+out is reported and printed under the map, rather than dropped off the edge in silence.
+
+#### Raising that limit meant the response had to fit through Vercel
+
+A Vercel serverless function may return at most **4.5 MB**. The trail is one JSON array of
+heartbeats, so a limit of 100,000 is not a UI choice on its own - it is a payload question,
+and getting it wrong is not a slow page but a dead one (`FUNCTION_RESPONSE_PAYLOAD_TOO_LARGE`).
+Two changes make it fit, and both were measured rather than assumed.
+
+**The track carries only what is read.** Each point was 189 bytes and three of its ten fields
+- `accuracyBand`, `connected`, `jobSiteId` - were never touched by the map or the charts. The
+band is derivable from `accuracy` anyway, and the other two live on `current` and on the
+Heartbeats rows, which is where they are actually used. The Mongo projection behind it asked
+for fourteen fields (including `permissionsEnabled`, an array) to build a seven-field point;
+it now asks for five. 189 bytes → 134.
+
+**JSON responses are gzipped**, by about sixty lines of `zlib` in `server/app.js` rather than
+a dependency - `compression` would have been the first runtime package here that is not
+Express or the driver. Thousands of objects with identical keys and near-identical values is
+the best case DEFLATE has, and it measures like it:
+
+| Track | Raw | On the wire | |
+|---|---|---|---|
+| 5,000 | 0.64 MB | 0.07 MB | |
+| 20,000 | 2.55 MB | 0.26 MB | |
+| 50,000 | 6.53 MB | 0.65 MB | 10x |
+| 100,000 | 12.75 MB | 1.30 MB | fits, uncompressed would not |
+
+Only JSON is touched: HTML, CSS and JS are served by `express.static` and by the CDN on
+Vercel, which compresses them itself, and the vendored images are already-compressed formats
+that gzip would only make bigger. Bodies under 1 KB are sent as-is, `Vary: Accept-Encoding`
+is set so no cache hands a gzipped body to a client that did not ask for one, a client
+sending `Accept-Encoding: identity` still gets plain JSON, and a compression failure falls
+back to the uncompressed body rather than failing the request - compression is an
+optimisation and must never be the reason a response dies.
+
+**For this store the ceiling is not reachable.** `ekosClientState` holds 79,372 documents in
+total, so 100,000 is more than every heartbeat from every device ever recorded: no single
+user, over any range, can be truncated by it. The default of 5,000 is what truncates - on the
+two dense reporters, which is exactly where the map says so and offers the control.
+
+The limit that does still bite is **drawing**, not loading. Past roughly 15,000 marks the
+canvas is slow to pan and zoom and the fixes overlap into a blob; that is what **Merge
+nearby** is for, and the note says so at that threshold. Counts, gaps, jumps and the charts
+are exact either way.
+
+#### The map survives a reload
+
+Every reload of this page - a filter change and every auto-refresh tick - re-renders the
+panel and throws the map's container away. The old `L.Map` used to survive that: its window
+resize handler stayed attached to a detached container, it stayed in `PMMap.instances` for
+`retheme()` to walk, and the replacement re-fitted, so anyone who had zoomed in to read a
+cluster was thrown back out on every tick. The old instance is now torn down with
+`map.remove()` (which prunes `PMMap.instances`), and the replacement is handed the view the
+user was looking at - unless no heartbeat is left inside it, in which case it refits rather
+than hand back a blank frame.
+
+### Where a fence circle gets its radius
+
+`PMMap.siteCircle()` draws a solid circle at the recorded radius only when told
+`radiusIsAuthoritative`; otherwise it draws a dashed 40 m *estimated centre* ring, because
+drawing a circle is a claim about a boundary and an unrecorded one should not be made to
+look like a fence.
+
+That contract was quietly violated by two callers that built their site object by spreading
+a document's own `fence` field - which carries `lat`, `lng` and `radius` but no provenance:
+
+- the **exit-window replay** drawer, and
+- the **Geofence Checks** drawer.
+
+Both therefore drew a dashed grey 40 m guess where a 200 m fence belonged. The site name,
+site id and address all resolved correctly from the matched registry row, so the fence
+looked simply absent rather than wrong. Both fences are as authoritative as this store
+gets - the exit-window document records the boundary the device was judged against, and the
+check's fence comes out of the geofence log itself (`siteArea.locations`) - so both callers
+now declare it, and both frame the circle's edge instead of its centre. The Checks drawer
+also fits its map even when the check has no usable fix, which is the one case where the
+fence on its own is all there is to see.
+### The map's own time window
+
+The filter bar at the top of the page sets the range for everything. The trail map now
+carries a second, tighter one, because narrowing the range is the one thing that *always*
+makes a trail complete: the Fixes limit takes the newest **n** heartbeats, so a window small
+enough to hold fewer than n of them cannot be truncated.
+
+```
+Window [ 2026-09-03 14:00 ] → [ 2026-09-03 14:15 ]  [Apply]
+  15 min · 1 hour · 3 hours · 6 hours · 12 hours · 24 hours │ ◀ Earlier  Later ▶ │ ⤡ Narrow to what loaded
+```
+
+Presets run 15 min · 1 hour · 3 hours · 6 hours · 12 hours · 24 hours, and the page filter bar
+gained a matching **Last 12 hours** (it already offered 3). They are anchored on the
+**newest heartbeat that loaded**, not the wall clock - "the
+last hour" of the data you are looking at, which on a range that ended yesterday is not the
+same thing. **Earlier** and **Later** shift the window by exactly its own length, so a dense
+day is walked one contiguous, complete window at a time.
+
+**⤡ Narrow to what loaded** appears only when the trail was truncated, and is the one-click
+version of the whole workflow: it sets the window to the span that actually came back, so the
+next load is complete by construction. From there, Earlier walks backwards through the range
+with nothing cut off at any step.
+
+The window *refines the page filter* rather than sitting beside it - the request is the same
+request, so every count on the page agrees with the map instead of the map quietly
+disagreeing with the tile above it. That is worth being loud about, so the bar highlights
+itself whenever a window is set, and changing anything in the page's own filter bar clears
+it (otherwise the filter bar would appear to do nothing).
+
+**The same bar is on the Heartbeats tab**, driving the same window. That tab fetches its own
+page from `/api/snapshots`, and the window was applied in `load()` only - so it kept answering
+for the whole page range while the map beside it answered for fifteen minutes. Two tabs of the
+same person disagreeing about how many heartbeats exist is worse than either number on its own,
+so every request this page makes now goes through one `scopedQuery()`. The map keeps
+**⤡ Narrow to what loaded** to itself, because that button is about the trail.
+
+### Replay
+
+A trail says where someone went. It does not say when, how fast, or what the device was
+reporting at the time - for that you read the Heartbeats table next to the map and join the
+two by eye. Replay puts them together: **the map is cleared back to empty and the trail is
+drawn again as it plays**, with a readout showing the heartbeat the marker is standing on.
+
+```
+▶ Play  ⏮ ⏭ ↺  ├────────●──────────┤  Speed [Auto (~30 s)]  ☑ Follow  ✕ Exit replay
+Sep 3, 14:32:07   heartbeat 1,204 of 5,000   ● Inside   Good 12 m   84%   on the clock   travelled 1.4 km
+```
+
+Clearing first is the whole point. Playing a marker along a route that is *already* fully
+drawn answers only "where are they" - the ending is on screen from the first frame. Drawn as
+it goes, the map answers "what did we know at 14:32", which is the question a replay is for.
+Heartbeats, path, sequence numbers, accuracy halos and clock-in checks all arrive as the
+clock reaches them. **Geofences stay** - a fence is not something that happened at a moment,
+it is the thing the replay is being judged against.
+
+- **↺** winds right back to an empty map. **✕ Exit replay** hands it back and the whole
+  trail returns exactly as it was; so does changing the window, the State filter or the
+  Fixes limit, since those rebuild the trail underneath it.
+- **Speed** defaults to *Auto*, which plays whatever is loaded in about thirty seconds
+  regardless of how long the window is. Fixed rates (real time, 1 min/s, 5 min/s, 30 min/s,
+  2 h/s) are there when you want to compare two windows at the same scale.
+- **⏮ / ⏭** step one heartbeat at a time and land exactly on it, which is how you read a
+  specific fix rather than a moment between two.
+- **Follow** recentres the map only once the marker drifts out of the middle of the view -
+  panning every frame fights the user and never settles - and never on the opening frame,
+  which would pan straight off the frame the map had just fitted.
+- The layer toolbar keeps working mid-replay: turning Accuracy on reveals halos for the
+  heartbeats reached so far, not for the whole trail.
+
+Two rules keep it honest, because a smooth animation is very good at implying knowledge that
+is not there:
+
+- **Position is interpolated only across a normal reporting interval.** Across a gap or a
+  suspicious jump the marker *holds still* at the last known fix until the next one arrives,
+  and the readout says `⚠ no heartbeat for 45 min - holding here`. Gliding smoothly across a
+  45-minute silence would be inventing a route.
+- **Nothing is blended.** Accuracy, fence state, battery and clock state are read off the
+  heartbeat at or before the current instant, never averaged with the next one. A device is
+  inside the fence or outside it; there is no halfway.
+
+#### Redrawing a trail 60 times a second, without redrawing the trail
+
+The obvious implementation - rebuild the visible trail from `points.slice(0, i)` each frame -
+is O(points) per frame and hopeless past a few thousand. `PMMap.progressiveTrail()` keeps the
+per-step cost flat instead, and the whole design follows from one decision: **it reveals the
+very same layer objects the static trail already built**, never copies of them.
+
+| | how |
+|---|---|
+| a heartbeat arrives | `addLayer` on the mark `trail()` already made - Leaflet's canvas redraws only the bounds that changed, so one dot costs about one dot |
+| a stretch of route completes | the prebuilt run polyline from `trail().runs`, added whole - no re-projection, and the played path keeps the static one's colours, breaks and dashes exactly |
+| the route being walked | chunked at 250 points: everything behind the current chunk is frozen into its own polyline and never touched again |
+
+`setLatLngs` re-projects an entire polyline, so a single growing line is O(points) every
+frame - which is exactly what makes a long replay stutter. Chunking bounds the redrawn line
+at 250 vertices no matter how long the trail is; a full 1,000-point playback in the tests
+never exceeds 251. Seeking backwards is the same machinery in reverse, so scrubbing is as
+cheap as playing.
+
+Sharing the layer objects is what makes this cheap, and it is also the one thing that can go
+wrong: a Leaflet layer cannot be in two places at once. So the static groups come **off** the
+map when a replay starts rather than being hidden, `applyVisibility()` stands aside while one
+is running, and a rebuild tears the replay down *before* it touches the layers - otherwise
+the map ends up with neither the revealed trail nor the static one.
+
+`PMMap.trailTimeline()` precomputes timestamps, cumulative distance and which steps may be
+glided across in one O(n) pass, so `PMMap.seekTimeline()` is a binary search: scrubbing a
+50,000-point trail costs what scrubbing a 50-point one costs. Only the clock is written per
+frame; the badges are rebuilt when the replay actually reaches the next heartbeat, not sixty
+times a second for values that changed once.
+
 ### Heartbeats
 
 A missing heartbeat is data. A device that stopped reporting looks exactly like a quiet one
@@ -246,6 +544,30 @@ Gaps are measured per device between consecutive *stored* heartbeats, so one spa
 boundary shows on the next page - the banner above the table says so. On the all-users page
 the silences become a **Silence before** column instead, because a gap row drawn between two
 different people’s heartbeats would mean nothing.
+
+#### The drawer opens on a map
+
+Clicking a heartbeat row used to give a column of facts: `24.86072, 67.00114 · Good 12 m ·
+outside · 43 m from the boundary · bearing 190° S`. Those are the right numbers and they are
+close to unreadable - nobody holds a coordinate pair in their head, and "43 m outside" means
+nothing without knowing whether that is across a car park or across a motorway.
+
+So the drawer leads with **Fix & fence**: the fix with its accuracy halo, the fence it was
+judged against, and the walk-back line when it landed outside - the same six values, placed.
+The old column of facts is the second tab, unchanged. It is the map tab first because the
+drawer renders every panel up front and an inactive one is `display:none`, which is how a map
+comes out 0×0.
+
+It draws the fence from `row.site`, which carries its own provenance, so a recorded fence gets
+a solid ring at its real radius and an inferred centre gets the dashed estimate - the trap the
+exit-window and Geofence Checks drawers both fell into by spreading a bare `fence`. It frames
+the fence *edge* rather than its centre, degrades to whatever is known (no site, no fence, no
+coordinates at all), and releases the previous map when another row is opened as well as on
+close - a drawer is reopened far more often than it is closed, and the old instance would
+otherwise keep a resize handler bound to a container that had left the document.
+
+Because the view is shared, this lands on **both** the Heartbeats page and the Heartbeats tab
+of a user page at once.
 
 The table, the gap rows and the drawer live in `public/js/heartbeats.view.js`, shared by the
 Heartbeats page and the Heartbeats tab on a user page.
@@ -596,6 +918,13 @@ lists, per-option record counts, select-all/clear, and a summary on the closed c
 tri-state selects for clocked-in, inside-fence and connectivity; numeric thresholds for
 accuracy, battery and staleness; and free-text search. Picking several values inside a
 dropdown is debounced into a single request.
+
+The accuracy-band dropdown now offers **Unknown (no accuracy)** alongside the five metre
+bands. `filters.js` has always matched that band and every row can already be labelled with
+it - a fix that arrived with no accuracy at all - but it was never listed, so the one band
+you most want to isolate (a position that cannot be judged against a fence) was the only one
+you could not select. It is added in `/api/meta` rather than to `ACCURACY_BANDS`, because
+that list is walked as metre ranges.
 
 **Advanced** opens a raw MongoDB **where clause** that is `$and`-ed onto the controls:
 

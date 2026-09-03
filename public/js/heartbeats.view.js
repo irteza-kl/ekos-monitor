@@ -218,6 +218,108 @@ window.PMHeartbeats = (function () {
     return { gaps: found };
   }
 
+  /**
+   * The one live drawer map. A drawer is reopened far more often than it is
+   * closed - clicking a second row replaces the body outright - so the previous
+   * map has to be torn down here as well as on close, or its window resize
+   * handler stays bound to a container that is no longer in the document and
+   * PMMap.instances grows for the life of the page.
+   */
+  let drawerMap = null;
+
+  function releaseDrawerMap() {
+    if (!drawerMap) return;
+    try {
+      drawerMap.remove();
+    } catch (err) {
+      /* the container went with the drawer body */
+    }
+    drawerMap = null;
+  }
+  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+
+  /**
+   * Where this one heartbeat was, against the fence it was judged by.
+   *
+   * The Details tab says "24.86072, 67.00114 · 12 m · outside · 43 m from the
+   * boundary". Those are the right numbers and they are nearly unreadable: no
+   * one holds a coordinate pair in their head, and "43 m outside" means nothing
+   * without knowing whether that is across a car park or across a motorway.
+   * This is the same six values, placed.
+   */
+  function renderFixMap(panel, row) {
+    if (!row.location) {
+      panel.append(
+        el('div', { class: 'empty', text: 'This heartbeat arrived with no coordinates, so there is nothing to place on a map.' })
+      );
+      return;
+    }
+
+    const mapHost = el('div', { class: 'map mini', style: 'height:320px' });
+    panel.append(mapHost, el('div', { html: PMMap.legend() }));
+
+    releaseDrawerMap();
+    const map = PMMap.create(mapHost);
+    drawerMap = map;
+    // The drawer animates open; Leaflet measured the container mid-transition.
+    setTimeout(() => map.invalidateSize(), 60);
+
+    const frame = [];
+
+    // `row.site` carries its own provenance (radiusIsAuthoritative and friends),
+    // so siteCircle draws a real fence for a recorded one and a dashed estimate
+    // ring for a centre we only inferred - which is the honest drawing, and the
+    // trap two other callers of this fell into by spreading a bare `fence`.
+    if (row.site && row.site.lat != null) {
+      const drawn = PMMap.siteCircle(map, row.site);
+      if (drawn) {
+        frame.push({ lat: row.site.lat, lng: row.site.lng }, ...drawn.extent);
+      }
+    }
+
+    PMMap.deviceMarker(map, row, { pulse: true, permanentLabel: true });
+    frame.push(row.location);
+
+    // The walk back to the fence, when this fix was outside it. Same line the
+    // user page draws, so the two views of one heartbeat agree.
+    if (row.fence && row.relation && !row.relation.inside) {
+      PMMap.guideLine(map, row.location, row.fence, {
+        text: fmt.metres(Math.abs(row.relation.distanceFromBoundary)) + ' outside · ' + (row.relation.compass || '') + ' of the centre',
+      });
+    }
+
+    PMMap.fit(map, frame, { zoom: 17 });
+
+    panel.append(
+      el('div', { class: 'section-title', text: 'Against the fence' }),
+      PM.kv([
+        ['Verdict', PM.geofenceBadge(row.isInsideGeofence, row.computedVerdict, row.verdictReason)],
+        ['Accuracy', PM.accuracyBadge(row.accuracyBand, row.accuracy)],
+        [
+          'Fence',
+          row.fence
+            ? fmt.coords(row.fence) + ' · radius ' + fmt.metres(row.fence.radius)
+            : row.site && row.site.lat != null
+              ? '<span class="hint">no fence on record - the ring is an estimated centre</span>'
+              : '<span class="hint">no site on record for this heartbeat</span>',
+        ],
+        row.relation
+          ? [
+              'Distance to boundary',
+              fmt.metres(Math.abs(row.relation.distanceFromBoundary)) +
+                (row.relation.inside ? ' inside' : ' outside') +
+                ' · ' + fmt.metres(row.relation.distanceFromCenter) + ' from the centre',
+            ]
+          : undefined,
+        row.guide
+          ? [
+              'Walk back',
+              '<a href="' + row.guide.directionsUrl + '" target="_blank" rel="noopener">Directions to the site ↗</a>',
+            ]
+          : undefined,
+      ])
+    );
+  }
   /** Everything one heartbeat document knows, in a drawer. */
   function drawer(row) {
     const rel = row.relation;
@@ -225,6 +327,11 @@ window.PMHeartbeats = (function () {
       title: 'Heartbeat ' + fmt.time(row.capturedAt),
       subtitle: fmt.date(row.capturedAt) + ' · ' + (row.name || 'device') + ' · document ' + row.id,
       tabs: [
+        {
+          id: 'fix',
+          label: 'Fix & fence',
+          render: (panel) => renderFixMap(panel, row),
+        },
         {
           id: 'heartbeat',
           label: 'Details',

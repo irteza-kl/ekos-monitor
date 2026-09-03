@@ -41,7 +41,14 @@ router.get('/meta', async (req, res, next) => {
         counts: collections.counts,
         available: collections.available,
       },
-      accuracyBands: ACCURACY_BANDS.map((b) => ({ key: b.key, label: b.label, max: b.max === Infinity ? null : b.max })),
+      // "unknown" is a band every row can already be labelled with - a fix that
+      // arrived with no accuracy at all - and filters.js has always matched it.
+      // It was just never offered, so the one band you most want to isolate
+      // (a position we cannot judge against a fence) was unselectable. It is not
+      // in ACCURACY_BANDS itself because that list is walked as metre ranges.
+      accuracyBands: ACCURACY_BANDS.map((b) => ({ key: b.key, label: b.label, max: b.max === Infinity ? null : b.max })).concat([
+        { key: 'unknown', label: 'Unknown (no accuracy)', max: null },
+      ]),
       permissions: ALL_PERMISSIONS,
       generatedAt: new Date().toISOString(),
     };
