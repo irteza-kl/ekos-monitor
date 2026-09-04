@@ -135,6 +135,9 @@ const SNAP = {
   employeeRef: 'currentUser.data.tenantAccount.employeeReferenceId',
   tenantName: 'currentUser.data.tenantAccount.tenant.name',
   accuracy: 'currentUserLocation.accuracy',
+  // The device's own fix time. Epoch today, expected to become an ISODate -
+  // see normalize.flexibleIso and pipelines.capturedAtExpr, which both read it.
+  capturedAt: 'currentUserLocation.capturedAt',
   lat: 'currentUserLocation.latitude',
   lng: 'currentUserLocation.longitude',
   appVersion: 'buildVersion.applicationVersion',
@@ -429,10 +432,22 @@ function pagination(q, defaultLimit = 50, maxLimit = 500) {
 }
 
 /** Whitelisted sort, so a sort param can never inject an expression. */
+/**
+ * Fields whose sort key is computed in the pipeline rather than stored.
+ *
+ * `capturedAt` is the obvious one: it is not a stored field at all, it is the
+ * fix time coalesced with two fallback clocks, and it has to be converted to
+ * a single type before it can be ordered (see pipelines.capturedAtExpr).
+ * Callers add the $addFields stage; this only maps the name.
+ */
+const COMPUTED_SORT = {
+  capturedAt: '_heartbeatAt',
+};
+
 function sortSpec(q, allowed, fallback) {
   const field = str(q.sortBy);
   const dir = str(q.sortDir) === 'asc' ? 1 : -1;
-  if (field && allowed.includes(field)) return { [field]: dir };
+  if (field && allowed.includes(field)) return { [COMPUTED_SORT[field] || field]: dir };
   return fallback;
 }
 
@@ -449,6 +464,7 @@ module.exports = {
   assertReadOnly,
   pagination,
   sortSpec,
+  COMPUTED_SORT,
   and,
   str,
   num,

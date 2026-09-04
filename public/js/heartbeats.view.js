@@ -18,6 +18,14 @@ window.PMHeartbeats = (function () {
   // already worth flagging and half an hour is a failure. Same thresholds the
   // trail map colours its path with.
   const GAP_MINUTES = 10;
+  /**
+   * Below this, the gap between the fix and the insert is network latency, not a
+   * sync lag. Every healthy heartbeat has a few seconds of it, so badging those
+   * would put a warning on every row in the table and make the real ones - the
+   * hours-late ones - invisible among them. The exact value stays on the row for
+   * the CSV and the raw document; this only governs the badge.
+   */
+  const LAG_WORTH_SHOWING = 1;
   const GAP_CRITICAL_MINUTES = 30;
 
   /**
@@ -151,7 +159,19 @@ window.PMHeartbeats = (function () {
     list.forEach((row, index) => {
       const silence = silenceByIndex.get(index);
       const cells = [
-        '<td>' + fmt.dayTime(row.capturedAt) + '<div class="person-sub">' + fmt.ago(row.capturedAt) + '</div></td>',
+        // The device's local clock time, zone named, because a shift is worked in
+        // local time and every question asked of this column is a local one. The
+        // title carries both readings so neither is taken on trust, and a time
+        // that is not a real fix is marked - the reader cannot see that otherwise.
+        '<td title="' +
+          esc(fmt.bothZones(row.capturedAt, row.timezone)) +
+          '">' +
+          fmt.dayTimeIn(row.capturedAt, row.timezone) +
+          '<div class="person-sub">' +
+          fmt.ago(row.capturedAt) +
+          (row.capturedAtSource && row.capturedAtSource !== 'fix' ? ' · <span class="hint">' + (row.capturedAtSource === 'device' ? 'device clock' : 'arrival time') + '</span>' : '') +
+          (row.syncLagMinutes >= LAG_WORTH_SHOWING ? ' · <span class="hint">synced ' + esc(fmt.duration(row.syncLagMinutes)) + ' late</span>' : '') +
+          '</div></td>',
       ];
       if (options.showUser) {
         const href = '/user.html?userId=' + encodeURIComponent(row.userId === null ? 'anonymous' : row.userId);
@@ -219,6 +239,31 @@ window.PMHeartbeats = (function () {
   }
 
   /**
+   * Which clock this time came from, said plainly.
+   *
+   * `capturedAt` is the GPS fix time when the device sent one, the device
+   * clock when it did not, and the server's arrival time as a last resort.
+   * Those are three different claims about the same row and a reader cannot
+   * tell them apart by looking, so the row says which it is.
+   */
+  const CLOCK_SOURCE = {
+    fix: { label: 'GPS fix time', tone: 'good' },
+    device: { label: 'device clock - no fix time on this heartbeat', tone: 'info' },
+    server: { label: 'server arrival - the device sent no usable time', tone: 'warning' },
+  };
+
+  /** The instant, in the worker's timezone and named, with its provenance. */
+  function whenRow(row) {
+    if (!row.capturedAt) return "<span class='hint'>no usable timestamp on this heartbeat</span>";
+    const source = CLOCK_SOURCE[row.capturedAtSource] || null;
+    return (
+      esc(fmt.dateIn(row.capturedAt, row.timezone)) +
+      (row.timezone ? '' : " <span class='hint'>(no timezone on the document - shown in your time)</span>") +
+      " <span class='hint'>" + esc(fmt.ago(row.capturedAt)) + "</span>" +
+      (source ? " <span class='badge badge-" + source.tone + "'>" + esc(source.label) + "</span>" : '')
+    );
+  }
+  /**
    * The one live drawer map. A drawer is reopened far more often than it is
    * closed - clicking a second row replaces the body outright - so the previous
    * map has to be torn down here as well as on close, or its window resize
@@ -226,6 +271,21 @@ window.PMHeartbeats = (function () {
    * PMMap.instances grows for the life of the page.
    */
   let drawerMap = null;
+  // Anything a drawer panel binds outside its own DOM - a window listener, a
+  // timer - registers its undo here and is run when the drawer is replaced or
+  // closed, whichever happens first.
+  const drawerTeardown = [];
+
+  function releaseDrawer() {
+    while (drawerTeardown.length) {
+      try {
+        drawerTeardown.pop()();
+      } catch (err) {
+        /* a teardown must never block the rest */
+      }
+    }
+    releaseDrawerMap();
+  }
 
   function releaseDrawerMap() {
     if (!drawerMap) return;
@@ -236,7 +296,7 @@ window.PMHeartbeats = (function () {
     }
     drawerMap = null;
   }
-  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+  window.addEventListener('pm:drawer-close', releaseDrawer);
 
   /**
    * Where this one heartbeat was, against the fence it was judged by.
@@ -320,11 +380,81 @@ window.PMHeartbeats = (function () {
       ])
     );
   }
+  /**
+   * The document behind the row.
+   *
+   * Every other tab shows a *reading* of the heartbeat: `capturedAt` is really
+   * `createdAt`, the location is lifted out of `currentUserLocation`, the
+   * verdict is recomputed rather than taken from the device. When one of those
+   * numbers looks wrong the next question is always what the normalizer was
+   * working from - a field it does not surface, a shape that changed under it -
+   * and only the stored document answers that.
+   *
+   * Fetched on first view rather than with the row: these documents embed the
+   * whole employee record, so shipping one per table row would be megabytes of
+   * something almost nobody opens. The drawer builds every panel up front but
+   * only shows one, so the fetch waits for `pm:drawer-tab`.
+   */
+  function renderRawDoc(panel, row) {
+    const pre = el('pre', { class: 'json', style: 'max-height:520px' });
+    let raw = null;
+
+    const copy = el('button', {
+      class: 'btn btn-sm',
+      text: '⧉ Copy JSON',
+      onclick: () => {
+        if (!raw) {
+          PM.toast('Nothing loaded yet', 'error');
+          return;
+        }
+        navigator.clipboard
+          .writeText(JSON.stringify(raw, null, 2))
+          .then(() => PM.toast('Raw document copied', 'ok'))
+          .catch(() => PM.toast('Could not copy', 'error'));
+      },
+    });
+
+    panel.append(
+      el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap' }, [
+        el('span', { class: 'hint', text: 'Exactly as stored in MongoDB · document ' + row.id }),
+        el('div', { style: 'flex:1' }),
+        copy,
+      ]),
+      pre
+    );
+    pre.innerHTML = '<span class="hint">Opening this tab fetches the document…</span>';
+
+    let state = 'idle';
+    const load = async () => {
+      if (state === 'loading' || state === 'done') return;
+      state = 'loading';
+      pre.innerHTML = '<span class="hint">fetching the stored document…</span>';
+      try {
+        const data = await PM.api('/api/snapshots/' + encodeURIComponent(row.id));
+        raw = data.raw;
+        pre.innerHTML = PM.jsonHighlight(data.raw);
+        state = 'done';
+      } catch (err) {
+        // Retryable: leave it idle so switching back tries again.
+        state = 'idle';
+        pre.innerHTML = '<span class="hint" style="color:var(--danger-text)">' + esc(err.message) + '</span>';
+      }
+    };
+
+    const onTab = (event) => {
+      if (event.detail && event.detail.id === 'raw') load();
+    };
+    window.addEventListener('pm:drawer-tab', onTab);
+    // A drawer is replaced far more often than it is closed, so the listener is
+    // dropped by whichever comes first.
+    drawerTeardown.push(() => window.removeEventListener('pm:drawer-tab', onTab));
+  }
   /** Everything one heartbeat document knows, in a drawer. */
   function drawer(row) {
+    releaseDrawer();
     const rel = row.relation;
     PM.openDrawer({
-      title: 'Heartbeat ' + fmt.time(row.capturedAt),
+      title: 'Heartbeat ' + fmt.timeIn(row.capturedAt, row.timezone),
       subtitle: fmt.date(row.capturedAt) + ' · ' + (row.name || 'device') + ' · document ' + row.id,
       tabs: [
         {
@@ -339,7 +469,19 @@ window.PMHeartbeats = (function () {
             panel.append(
               el('div', { class: 'section-title', text: 'Location' }),
               PM.kv([
-                ['Captured at', fmt.date(row.capturedAt) + ' (' + fmt.ago(row.capturedAt) + ')'],
+                ['Captured at', whenRow(row)],
+                [
+                  'Stored by the server',
+                  row.receivedAt
+                    ? esc(fmt.dateIn(row.receivedAt, row.timezone)) +
+                      (row.syncLagMinutes >= LAG_WORTH_SHOWING
+                        ? " <span class='badge badge-warning'>" +
+                          esc(fmt.duration(row.syncLagMinutes)) +
+                          " after the fix</span>"
+                        : '')
+                    : undefined,
+                ],
+                ['Your time', row.timezone ? fmt.date(row.capturedAt) : undefined],
                 ['Coordinates', row.location ? fmt.coords(row.location) : 'none reported'],
                 ['Accuracy', PM.accuracyBadge(row.accuracyBand, row.accuracy)],
                 ['Geofence (device flag)', PM.geofenceBadge(row.isInsideGeofence)],
@@ -384,6 +526,11 @@ window.PMHeartbeats = (function () {
                 ['Document id', row.id],
               ])
             ),
+        },
+        {
+          id: 'raw',
+          label: 'Raw document',
+          render: (panel) => renderRawDoc(panel, row),
         },
       ],
     });

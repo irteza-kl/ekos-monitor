@@ -242,6 +242,36 @@ window.PM = (function () {
       }
     },
 
+    /**
+     * `dayTime` in the worker’s timezone, zone named: "Sep 3, 14:32 PKT".
+     *
+     * A table column narrow enough for a date and a time, but rendered where
+     * the work happened. Labelling a viewer-local time with the device’s zone
+     * is worse than either on its own - it reads as authoritative and is off
+     * by the offset between them, which across this fleet is up to ten hours.
+     */
+    dayTimeIn(v, timezone) {
+      if (!v) return '--';
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return '--';
+      if (!timezone) return fmt.dayTime(v);
+      try {
+        return d.toLocaleString(undefined, {
+          timeZone: timezone,
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+          timeZoneName: 'short',
+        });
+      } catch (err) {
+        // An unknown zone from the device: the viewer’s reading, unlabelled,
+        // rather than a wrong label.
+        return fmt.dayTime(v);
+      }
+    },
+
     /** Clock time in the worker’s timezone, zone named. */
     timeIn(v, timezone) {
       if (!v) return '--';

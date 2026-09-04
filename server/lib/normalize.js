@@ -19,6 +19,79 @@ function iso(v) {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+/**
+ * A timestamp whose wire format is not settled.
+ *
+ * `currentUserLocation.capturedAt` is epoch today and is expected to become a
+ * DateTime/ISODate like every other date in the store. Both have to keep
+ * working from the same code, because the collection will hold documents in
+ * both shapes for as long as old heartbeats are kept - there is no migration
+ * that makes one of these go away.
+ *
+ * Accepts: a BSON/JS Date, epoch milliseconds, epoch **seconds**, a numeric
+ * string, or an ISO string. Returns an ISO string, or null when the value
+ * cannot be read as a time.
+ *
+ * The seconds-vs-milliseconds split is the one real trap. A bare number is
+ * ambiguous, so it is resolved by magnitude: 1e11 ms is 1973 and 1e11 seconds
+ * is the year 5138, so nothing plausible sits on both sides of it. Guessing
+ * wrong is not subtle - a fix would read as 1970 - but it would be wrong on
+ * every row, so the boundary is stated here rather than left implicit.
+ */
+const EPOCH_MS_FLOOR = 1e11;
+// Anything outside this is a broken clock or a misread unit, not a heartbeat.
+const SANE_FROM_MS = Date.UTC(2000, 0, 1);
+const SANE_TO_MS = Date.UTC(2100, 0, 1);
+
+function flexibleIso(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  let ms = null;
+  if (value instanceof Date) {
+    ms = value.getTime();
+  } else if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)))) {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    ms = num < EPOCH_MS_FLOOR ? num * 1000 : num;
+  } else if (typeof value === 'string') {
+    const parsed = new Date(value);
+    ms = parsed.getTime();
+  } else if (typeof value === 'object' && typeof value.getTime === 'function') {
+    // Anything Date-like the driver hands back.
+    ms = value.getTime();
+  }
+
+  if (ms === null || !Number.isFinite(ms)) return null;
+  if (ms < SANE_FROM_MS || ms >= SANE_TO_MS) return null;
+  return new Date(ms).toISOString();
+}
+
+/**
+ * When a heartbeat actually happened, and how sure we are of that.
+ *
+ * Three clocks describe one heartbeat and they are not the same:
+ *
+ *   currentUserLocation.capturedAt  when the GPS fix was taken   (the truth)
+ *   currentDateTime                 the device's own clock       (close)
+ *   createdAt                       when the server stored it    (arrival)
+ *
+ * For a live device they are seconds apart and it does not matter. For one that
+ * was offline they are hours apart, and using arrival time puts a morning fix
+ * on the map at the time the phone reconnected in the afternoon. So the fix
+ * time wins where it exists, `source` records which clock was used, and
+ * `receivedAt` keeps arrival so the lag between them stays visible instead of
+ * being flattened away.
+ */
+function heartbeatTime(doc) {
+  const loc = (doc && doc.currentUserLocation) || {};
+  const fix = flexibleIso(loc.capturedAt);
+  if (fix) return { at: fix, source: 'fix' };
+  const deviceClock = flexibleIso(doc && doc.currentDateTime);
+  const arrival = flexibleIso(doc && doc.createdAt);
+  if (deviceClock) return { at: deviceClock, source: 'device' };
+  if (arrival) return { at: arrival, source: 'server' };
+  return { at: null, source: null };
+}
 function minutesSince(v) {
   const t = iso(v);
   if (!t) return null;
@@ -43,11 +116,33 @@ function snapshot(doc) {
   const accuracy = n(loc.accuracy);
   const permissionsEnabled = doc.permissionsEnabled || [];
 
+  const when = heartbeatTime(doc);
+  const receivedAt = iso(doc.createdAt);
+
   return {
     id: String(doc._id),
     kind: 'snapshot',
-    capturedAt: iso(doc.createdAt) || iso(doc.currentDateTime),
-    ageMinutes: minutesSince(doc.createdAt || doc.currentDateTime),
+    // When the heartbeat HAPPENED: the GPS fix time out of
+    // currentUserLocation.capturedAt where the device sent one, not when the
+    // server stored it. For a device that was offline those are hours apart,
+    // and using arrival put a morning fix on the map at the afternoon moment
+    // the phone reconnected.
+    capturedAt: when.at,
+    capturedAtSource: when.source, // 'fix' | 'device' | 'server'
+    // Kept alongside, never folded in: the gap between them IS the offline
+    // sync lag, and it is only visible while both are on the row.
+    receivedAt,
+    syncLagMinutes:
+      when.at && receivedAt && when.source !== 'server'
+        ? geo.round((new Date(receivedAt).getTime() - new Date(when.at).getTime()) / 60000, 1)
+        : null,
+    // How old our knowledge of their POSITION is.
+    ageMinutes: minutesSince(when.at),
+    // How long the device has been SILENT. Not the same question, and not the
+    // same answer for anything that synced late: a phone reporting every minute
+    // can carry a fix from hours ago, and calling that "quiet" is a false alarm
+    // on a critical alert.
+    receivedAgeMinutes: minutesSince(receivedAt),
 
     userId: n(user.id),
     name: user.fullName || [user.firstName, user.lastName].filter(Boolean).join(' ').trim() || null,
@@ -354,4 +449,6 @@ function consecutive(samples, verdict) {
   return count;
 }
 
-module.exports = { snapshot, clockInLog, exitWindow, ALL_PERMISSIONS, iso, num: n };
+module.exports = {
+  flexibleIso,
+  heartbeatTime, snapshot, clockInLog, exitWindow, ALL_PERMISSIONS, iso, num: n };

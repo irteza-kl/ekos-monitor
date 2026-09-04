@@ -17,7 +17,9 @@
     { key: 'currentUserLocation.accuracy', label: 'GPS accuracy', className: 'num' },
     { key: 'batteryPercentage', label: 'Battery', className: 'num' },
     { key: null, label: 'Permissions' },
-    { key: 'createdAt', label: 'Last seen' },
+    // capturedAt, not createdAt: the column shows when they were last seen and
+    // clicking it has to sort by the same thing it displays.
+    { key: 'capturedAt', label: 'Last seen' },
   ];
 
   PM.boot('users.html', async ({ root, meta }) => {

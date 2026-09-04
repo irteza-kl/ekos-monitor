@@ -567,6 +567,23 @@ close - a drawer is reopened far more often than it is closed, and the old insta
 otherwise keep a resize handler bound to a container that had left the document.
 
 Because the view is shared, this lands on **both** the Heartbeats page and the Heartbeats tab
+
+The third tab is **Raw document**: the heartbeat exactly as stored, with a Copy JSON button.
+Every other tab shows a *reading* of it - `capturedAt` is really `createdAt`, the location is
+lifted out of `currentUserLocation`, the verdict is recomputed rather than taken from the
+device flag. When one of those numbers looks wrong the next question is always what the
+normalizer was working from, and only the document answers that.
+
+It comes from `GET /api/snapshots/:id` (redacted, `base`-guarded so a heartbeat lookup cannot
+return an exit window) and is fetched **on first view of that tab**, not with the row. These
+documents embed the whole employee record, so shipping one per table row would be megabytes of
+something almost nobody opens. The drawer builds every panel up front but shows one, so the
+fetch waits on `pm:drawer-tab`; a failed fetch stays retryable by switching back to the tab.
+
+Panels that bind anything outside their own DOM register the undo in `drawerTeardown`, which
+runs when the drawer is replaced **or** closed - whichever comes first. A drawer is reopened far
+more often than it is closed (clicking another row replaces the body with no close event), so
+cleaning up only on close would stack a window listener per row clicked.
 of a user page at once.
 
 The table, the gap rows and the drawer live in `public/js/heartbeats.view.js`, shared by the
@@ -738,6 +755,86 @@ in the data settles the polarity, and a detector resting on a guess would either
 invent faults or hide them. It needs an answer from whoever writes the app.
 
 ### Whose clock is it?
+
+#### Three clocks describe one heartbeat
+
+They are not the same, and which one you use changes what the map says:
+
+| Field | Meaning | Shape |
+|---|---|---|
+| `currentUserLocation.capturedAt` | when the GPS fix was taken — **the truth** | epoch today, expected to become an ISODate |
+| `currentDateTime` | the device’s own clock at send time | ISO string |
+| `createdAt` | when the server stored it | BSON Date, set by `insertMany` |
+
+For a live device they are seconds apart and it does not matter. For one that had been
+offline they are hours apart, and using arrival time puts a **morning fix on the map at the
+afternoon moment the phone reconnected**. So `normalize.heartbeatTime()` takes the fix time
+where it exists, falls back to the device clock, then to arrival, and reports which it used as
+`capturedAtSource` (`fix` / `device` / `server`). Arrival is kept as `receivedAt` rather than
+folded away, because the difference between the two *is* the offline sync lag — surfaced as
+`syncLagMinutes`, and shown on the row as "synced 2h 15m late".
+
+`flexibleIso()` reads all of it: a BSON Date, epoch milliseconds, epoch **seconds**, a numeric
+string, or an ISO string. The collection will hold documents in both shapes for as long as old
+heartbeats are kept — there is no migration that makes one go away — so both have to work from
+the same code rather than one being converted later.
+
+The seconds-versus-milliseconds split is the one real trap, and it is resolved by magnitude:
+`1e11` ms is 1973 and `1e11` seconds is the year 5138, so nothing plausible sits on both sides
+of that line. Anything landing outside 2000–2100 is treated as unreadable and falls through to
+the next clock, rather than being drawn as 1970.
+
+**The trail is re-sorted after mapping.** The query sorts on `createdAt` because that is what is
+indexed, but the trail is drawn on fix time, and for late-synced heartbeats the two orders
+differ. Left in query order the trail would zig-zag back and forth through time and every gap
+and implied speed would be computed from the wrong pair of fixes.
+
+#### Sorting on it, which is not a `sort({...})` away
+
+Ordering by that instant cannot be `sort({"currentUserLocation.capturedAt": -1})`. Mongo orders
+mixed types by **BSON type first and value second**, so while the field is epoch on old
+documents and a Date on new ones that sort produces two blocks - all the numbers, then all the
+dates - each internally ordered and the boundary between them meaningless.
+
+So `pipelines.capturedAtExpr()` converts it to one type in an `$addFields` before anything is
+sorted, and `heartbeatAtExpr()` coalesces it with the same fallbacks the row uses. That lands
+on `_heartbeatAt`, `filters.COMPUTED_SORT` maps the client's `capturedAt` onto it, and it is
+now the **default order** for `/api/snapshots` and for "newest per user" on the Users page -
+a device syncing yesterday's backlog would otherwise present a stale fix as the one describing
+where that person is right now. `firstSeenAt` / `lastSeenAt` per user moved onto it too.
+
+The expression is `normalize.flexibleIso()` written twice, in two languages, which is a real
+risk: one decides what a row *says* and the other decides where it *sorts*, and a table sorted
+by a different reading of a field than it displays is worse than one that cannot sort at all.
+So they are tested against each other over every shape - Date, epoch ms, epoch seconds, numeric
+string, ISO string, absent, garbage, out-of-window - and that test caught a genuine divergence:
+Mongo's string-to-date conversion only accepts ISO-8601, so a quoted epoch (`"1788006000000"`)
+errored into the fallback clock while the row displayed the fix time. The string branch now
+takes the epoch path when the string is numeric, exactly as the JS side does.
+
+**The `$addFields` is only added when it is actually sorted on.** It defeats the index for the
+sort, so asking for `sortBy=createdAt` (or battery, or device) still keeps `$match` + `$sort` at
+the front where `createdAt_desc` serves it. That is the difference between a keyed sort and an
+in-memory one over the whole matched set, and it is why the fast path is still reachable.
+
+The per-user trail is the exception: it selects the newest N on `createdAt` (index-served,
+because the alternative is sorting up to 100,000 full documents inside a 30 s function) and
+then re-sorts by fix time in JS once the page is in memory. Same order, none of the cost.
+
+Two things deliberately still run on arrival time, because they are questions about arrival:
+the `staleMinutes` / `activeMinutes` filters ("has not reported in N minutes") and the
+`firstSeenAt` / `lastSeenAt` aggregates. They also have to — `createdAt` is the indexed field,
+and a range query cannot be run over a field that is epoch on some documents and a Date on
+others.
+
+Gap detection now measures fix-to-fix, which is what a reporting gap actually means. Where two
+rows arrive out of fix order the difference goes negative and the gap is skipped rather than
+drawn backwards — a missed gap, never an invented one.
+
+Times are shown **in the device’s timezone with the zone named** (`fmt.dayTimeIn`,
+`fmt.dateIn`), with both readings in the cell’s title. Labelling a viewer-local time with the
+device’s zone would be worse than either alone: it reads as authoritative and is wrong by the
+offset between them, which across this fleet is up to ten hours.
 
 This fleet spans `America/Bogota`, `America/Chicago` and `Asia/Karachi`, and over
 nine tenths of the heartbeats come from people ten or eleven hours away from a viewer
@@ -1002,6 +1099,7 @@ GET /api/auth/me                     (who is signed in; the gate itself is HTTP 
 GET  /api/health                     GET /api/meta          GET /api/stats
 GET  /api/users                      GET /api/users.csv     GET /api/users/:id
 GET  /api/users/:id/track            GET /api/snapshots     GET /api/snapshots.csv
+GET  /api/snapshots/:id              (one heartbeat document, redacted)
 GET  /api/logs                       GET /api/logs.csv      GET /api/logs/:id
 GET  /api/exit-windows               GET /api/exit-windows.csv
 GET  /api/exit-windows/:id           GET /api/sites         GET /api/sites.csv

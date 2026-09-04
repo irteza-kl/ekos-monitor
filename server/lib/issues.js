@@ -260,7 +260,13 @@ async function fromLatestSnapshots(q, nameHints) {
     });
   }
 
-  const staleClockedIn = rows.filter((r) => r.clockedIn && r.ageMinutes !== null && r.ageMinutes > STALE_MINUTES);
+  // Silence is measured from arrival, because that is what "no longer reporting"
+  // means. `ageMinutes` is now the age of the FIX, which for a device syncing a
+  // backlog is old while the device itself is perfectly alive - using it here
+  // would raise this critical alert against people who are reporting fine.
+  const staleClockedIn = rows.filter(
+    (r) => r.clockedIn && r.receivedAgeMinutes !== null && r.receivedAgeMinutes > STALE_MINUTES
+  );
   if (staleClockedIn.length) {
     add({
       id: 'stale-while-clocked-in',
@@ -272,7 +278,7 @@ async function fromLatestSnapshots(q, nameHints) {
         'On the clock, and silent for over ' +
         STALE_MINUTES +
         ' minutes. Nothing is known about where these people are now.',
-      who: staleClockedIn.map((r) => whoOf(r, 'quiet ' + Math.round(r.ageMinutes) + ' min')),
+      who: staleClockedIn.map((r) => whoOf(r, 'quiet ' + Math.round(r.receivedAgeMinutes) + ' min')),
       lastAt: newest(staleClockedIn, 'capturedAt'),
       href: '/heartbeats.html?clockedIn=true',
       evidence: 'ekosClientState: newest createdAt per user',

@@ -1,5 +1,6 @@
 'use strict';
 const express = require('express');
+const { ObjectId } = require('mongodb');
 const config = require('../config');
 const { collectionFor } = require('../db');
 const F = require('../lib/filters');
@@ -16,6 +17,7 @@ const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
 
 const SORTABLE = [
+  'capturedAt',
   'createdAt',
   'currentUser.data.fullName',
   'currentUserLocation.accuracy',
@@ -96,7 +98,11 @@ async function listUsers(q) {
   const match = F.and([base, F.snapshotMatch(q)]);
   const postMatch = F.snapshotPostMatch(q);
   const { limit, page, skip } = F.pagination(q, 50, 500);
-  const sort = F.sortSpec(q, SORTABLE, { createdAt: -1 });
+  // Same instant the rest of the console is ordered by. latestPerUser already
+  // computes it to pick the newest heartbeat per person, so ordering the table
+  // by anything else would rank people by when their phone last reached us
+  // rather than when they were last actually seen.
+  const sort = F.sortSpec(q, SORTABLE, { [P.HEARTBEAT_AT]: -1 });
 
   const result = await col
     .aggregate(P.latestPerUser({ match, postMatch, sort, skip, limit }), opts)
@@ -166,7 +172,9 @@ router.get('/users.csv', async (req, res, next) => {
       { key: 'location.lat', label: 'Latitude', get: (r) => (r.location ? r.location.lat : null) },
       { key: 'location.lng', label: 'Longitude', get: (r) => (r.location ? r.location.lng : null) },
       { key: 'timezone', label: 'Timezone' },
-      { key: 'capturedAt', label: 'Last Seen (UTC)' },
+      { key: 'capturedAt', label: 'Last Seen - Fix Time (UTC)' },
+      { key: 'receivedAt', label: 'Last Seen - Stored At (UTC)' },
+      { key: 'syncLagMinutes', label: 'Sync Lag (min)' },
       { key: 'ageMinutes', label: 'Age (min)' },
       { key: 'permissionsMissing', label: 'Missing Permissions' },
     ]);
@@ -183,14 +191,22 @@ router.get('/snapshots', async (req, res, next) => {
     const match = F.and([base, F.snapshotMatch(req.query)]);
     const postMatch = F.snapshotPostMatch(req.query);
     const { limit, page, skip } = F.pagination(req.query, 100, 2000);
-    const sort = F.sortSpec(req.query, SORTABLE, { createdAt: -1 });
+    // Ordered by when the heartbeat happened, which is the fix time where the
+    // device sent one. Not a stored field and not one type across documents, so
+    // it is computed into `_heartbeatAt` first - see pipelines.capturedAtExpr for
+    // why a plain sort on the raw field would group by BSON type instead of time.
+    const sort = F.sortSpec(req.query, SORTABLE, { [P.HEARTBEAT_AT]: -1 });
+    // Only when it is actually being sorted on. Sorting by `createdAt` (or by
+    // battery, or device) keeps $match+$sort at the front where the index can
+    // serve it, which is the difference between a keyed sort and an in-memory
+    // one over the whole matched set.
+    const byHeartbeatAt = Object.prototype.hasOwnProperty.call(sort, P.HEARTBEAT_AT);
 
-    // $match and $sort stay at the front so the createdAt index can serve the
-    // sort; the computed fields are added only to the page being returned.
     const result = await col
       .aggregate(
         [
           { $match: match },
+          ...(byHeartbeatAt ? [{ $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } }] : []),
           { $sort: sort },
           {
             $facet: {
@@ -221,16 +237,29 @@ router.get('/snapshots.csv', async (req, res, next) => {
     const { col, base } = await collectionFor('snapshots');
     const match = F.and([base, F.snapshotMatch(req.query)]);
     const limit = Math.min(Number(req.query.limit) || 2000, 5000);
+    // Same order as the table this is exported from. Sorting on `createdAt` here
+    // while the table sorts on the fix time meant the CSV rows came out in a
+    // different order from the rows on screen.
     const docs = await col
-      .find(match)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .maxTimeMS(config.queryTimeoutMs)
+      .aggregate(
+        [
+          { $match: match },
+          { $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } },
+          { $sort: { [P.HEARTBEAT_AT]: -1 } },
+          { $limit: limit },
+        ],
+        opts
+      )
+      // The row cap is the $limit stage and the time cap is in `opts`, so neither
+      // is repeated on the cursor.
       .toArray();
     const sites = await getSites();
     const rows = docs.map((d) => attachSite(normalize.snapshot(d), sites));
     const text = csv.toCsv(rows, [
-      { key: 'capturedAt', label: 'Captured At (UTC)' },
+      { key: 'capturedAt', label: 'Captured At - Fix Time (UTC)' },
+      { key: 'capturedAtSource', label: 'Time Source' },
+      { key: 'receivedAt', label: 'Stored At (UTC)' },
+      { key: 'syncLagMinutes', label: 'Sync Lag (min)' },
       { key: 'userId', label: 'User ID' },
       { key: 'name', label: 'Name' },
       { key: 'location.lat', label: 'Latitude', get: (x) => (x.location ? x.location.lat : null) },
@@ -261,6 +290,39 @@ router.get('/snapshots.csv', async (req, res, next) => {
       { key: 'id', label: 'Document ID' },
     ]);
     csv.send(res, 'phantom-heartbeats.csv', text);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * One heartbeat, as it is actually stored.
+ *
+ * The tables and the drawer carry the normalized row, which is a deliberate
+ * reading of the document: `capturedAt` is really `createdAt`, a location is
+ * lifted out of `currentUserLocation`, a verdict is recomputed rather than
+ * taken. When a number looks wrong the next question is always what the
+ * normalizer was working from - a field it does not surface, a shape that
+ * changed under it - and that can only be answered by the document.
+ *
+ * Fetched one at a time rather than embedded in /snapshots: these documents
+ * carry the whole employee record, so a hundred of them per page would be
+ * megabytes of something almost nobody opens.
+ */
+router.get('/snapshots/:id', async (req, res, next) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Not a document id' });
+    }
+    const { col, base } = await collectionFor('snapshots');
+    // `base` keeps the kinds apart: this collection also holds exit windows,
+    // and a heartbeat lookup must not hand one back.
+    const doc = await col.findOne(F.and([base, { _id: new ObjectId(req.params.id) }]), {
+      maxTimeMS: config.queryTimeoutMs,
+    });
+    if (!doc) return res.status(404).json({ error: 'No heartbeat with that document id' });
+    const sites = await getSites();
+    res.json({ id: String(doc._id), row: attachSite(normalize.snapshot(doc), sites), raw: redact(doc) });
   } catch (err) {
     next(err);
   }
@@ -300,6 +362,11 @@ router.get('/users/:userId', async (req, res, next) => {
           // whole because the sub-fields are all used.
           projection: {
             createdAt: 1,
+            // Read by heartbeatTime() as the middle fallback clock. Not projecting
+            // it silently skipped that step, so a heartbeat with no fix time but a
+            // good device clock got its ARRIVAL time on the trail while the table
+            // beside it showed the device clock. It is not returned, only used.
+            currentDateTime: 1,
             currentUserLocation: 1,
             isInsideGeofence: 1,
             clockedIn: 1,
@@ -314,12 +381,15 @@ router.get('/users/:userId', async (req, res, next) => {
         .aggregate(
           [
             { $match: match },
+            // First/last seen describe when the person was seen, so they run on
+            // the same instant the Users table now orders by.
+            { $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } },
             {
               $group: {
                 _id: null,
                 snapshots: { $sum: 1 },
-                firstSeenAt: { $min: '$createdAt' },
-                lastSeenAt: { $max: '$createdAt' },
+                firstSeenAt: { $min: '$' + P.HEARTBEAT_AT },
+                lastSeenAt: { $max: '$' + P.HEARTBEAT_AT },
                 avgAccuracy: { $avg: '$' + SNAP.accuracy },
                 worstAccuracy: { $max: '$' + SNAP.accuracy },
                 bestAccuracy: { $min: '$' + SNAP.accuracy },
@@ -377,7 +447,8 @@ router.get('/users/:userId', async (req, res, next) => {
           // now serves is megabytes. The band is derivable from `accuracy`
           // anyway, and the other two are on `current` and on the Heartbeats
           // rows, which is where they are actually used.
-          at: normalize.iso(d.createdAt),
+          // The fix time, not the arrival time (see normalize.heartbeatTime).
+          at: normalize.heartbeatTime(d).at,
           lat: normalize.num(loc.latitude),
           lng: normalize.num(loc.longitude),
           accuracy: normalize.num(loc.accuracy),
@@ -386,8 +457,20 @@ router.get('/users/:userId', async (req, res, next) => {
           battery: normalize.num(d.batteryPercentage),
         };
       });
-    const track = trackAll.filter((p) => p.lat !== null && p.lng !== null);
-    const trackNoFix = trackAll.length - track.length;
+    // Sorted by the fix time, not left in the order Mongo returned.
+    //
+    // The query sorts on `createdAt` because that is what is indexed, but the
+    // trail is now drawn on fix time - and for heartbeats that synced late the
+    // two orders differ. Left as-is the trail would zig-zag back and forth
+    // through time, and every gap and speed between consecutive points would
+    // be computed from the wrong pair.
+    const track = trackAll
+      .filter((p) => p.lat !== null && p.lng !== null && p.at)
+      .sort((x, y) => new Date(x.at).getTime() - new Date(y.at).getTime());
+    // Counted on its own terms: the filter above also drops the (vanishingly
+    // rare) heartbeat with no readable timestamp, and the note under the map
+    // attributes this number specifically to missing coordinates.
+    const trackNoFix = trackAll.filter((p) => p.lat === null || p.lng === null).length;
 
     // Distance actually travelled across the tracked window.
     let travelled = 0;
