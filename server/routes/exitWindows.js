@@ -4,95 +4,17 @@ const { ObjectId } = require('mongodb');
 const config = require('../config');
 const { collectionFor } = require('../db');
 const F = require('../lib/filters');
-const P = require('../lib/pipelines');
 const normalize = require('../lib/normalize');
 const csv = require('../lib/csv');
-const { getSites, attachWindowSite, FENCE_MATCH_METRES } = require('../lib/sites');
+const { attachWindowSite } = require('../lib/sites');
 const { redact } = require('../lib/redact');
-const geo = require('../lib/geo');
 const { attributeWindows } = require('../lib/attribution');
+// The list query is shared with the Exit windows tab on a user page, so it
+// lives in lib and neither caller owns it. See lib/exitWindows.js.
+const { listWindows } = require('../lib/exitWindows');
 
 const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
-
-const SORTABLE = ['openedAt', 'resolvedAt', 'pushedAt', 'userId', 'status', 'stats.sampleCount', 'stats.maxDistanceFromBoundary', 'stats.avgAccuracy', 'stats.durationMinutes'];
-
-async function listWindows(q) {
-  const { col, base } = await collectionFor('exitWindows');
-  // These documents carry fence coordinates but no site id, so a site filter
-  // becomes a bounding box around that site's recorded centre.
-  const siteIds = F.nums(q.jobSiteId);
-  let siteClause = null;
-  if (siteIds.length) {
-    const sites = await getSites();
-    const boxes = sites
-      .filter((s) => siteIds.includes(s.siteId) && s.lat != null && s.lng != null)
-      .map((s) => {
-        const dLat = FENCE_MATCH_METRES / 111320;
-        const dLng = FENCE_MATCH_METRES / (111320 * Math.cos((s.lat * Math.PI) / 180));
-        // Same rule as the label matcher: near the centre AND a compatible
-        // radius, so a 20 m fence never absorbs a 100 m one at the same spot.
-        const tolerance = s.radius == null ? null : Math.max(5, s.radius * 0.2);
-        const box = {
-          'fence.lat': { $gte: s.lat - dLat, $lte: s.lat + dLat },
-          'fence.lng': { $gte: s.lng - dLng, $lte: s.lng + dLng },
-        };
-        if (tolerance !== null) {
-          box.$or = [
-            { 'fence.radius': { $gte: s.radius - tolerance, $lte: s.radius + tolerance } },
-            { 'fence.radius': { $exists: false } },
-            { 'fence.radius': null },
-          ];
-        }
-        return { $or: [{ jobSiteId: s.siteId }, { 'fence.siteId': s.siteId }, box] };
-      });
-    // A site we know nothing about can match nothing.
-    siteClause = boxes.length ? { $or: boxes } : { _id: null };
-  }
-
-  // userId is applied after attribution (see below), not in Mongo.
-  const match = F.and([base, F.exitWindowMatch({ ...q, jobSiteId: undefined, userId: undefined }), siteClause]);
-  const postMatch = F.exitWindowPostMatch(q);
-  const { limit, page, skip } = F.pagination(q, 50, 500);
-  const sort = F.sortSpec(q, SORTABLE, { openedAt: -1 });
-
-  const result = await col
-    .aggregate(
-      [
-        { $match: match },
-        P.exitWindowStats(),
-        { $match: postMatch },
-        { $sort: sort },
-        {
-          $facet: {
-            rows: [{ $skip: skip }, { $limit: limit }],
-            total: [{ $count: 'value' }],
-          },
-        },
-      ],
-      opts
-    )
-    .next();
-
-  let rows = (result.rows || []).map(normalize.exitWindow);
-  const verdicts = F.list(q.verdict);
-  if (verdicts.length) {
-    rows = rows.filter((row) => row.samples.some((s) => verdicts.includes(s.verdict)));
-  }
-  rows = await Promise.all(rows.map(attachWindowSite));
-  // Join to a person: exact when the document names one, inferred from
-  // heartbeat presence at the fence otherwise.
-  await attributeWindows(rows);
-
-  // Filtering by user has to happen after attribution, since the documents
-  // themselves carry userId: null.
-  const wantedUsers = F.nums(q.userId);
-  if (wantedUsers.length) {
-    rows = rows.filter((r) => r.attribution && wantedUsers.includes(r.attribution.userId));
-  }
-  return { rows, total: (result.total[0] || {}).value || rows.length, page, limit };
-}
-
 
 router.get('/exit-windows', async (req, res, next) => {
   try {

@@ -9,9 +9,11 @@ const P = require('../lib/pipelines');
 const normalize = require('../lib/normalize');
 const geo = require('../lib/geo');
 const csv = require('../lib/csv');
-const { attachWindowSite, siteLookup, getSites } = require('../lib/sites');
+const { siteLookup, getSites } = require('../lib/sites');
 const { redact } = require('../lib/redact');
-const { windowsForUser } = require('../lib/attribution');
+// The Exit windows tab is the Exit Windows page filtered to one person, so it
+// runs that page's query rather than a private one. See lib/exitWindows.js.
+const { listWindows } = require('../lib/exitWindows');
 
 const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
@@ -348,6 +350,11 @@ router.get('/users/:userId', async (req, res, next) => {
     // choose. The projection is nine small fields, so the cost is transfer, not
     // the query - and the page reports when it hits the ceiling.
     const HISTORY_CEILING = 100000;
+    // Exit windows are attributed to a person AFTER they come out of Mongo, so
+    // the user filter cannot be part of the query and this limit is applied to
+    // windows from everybody. Asking for the pager's maximum keeps a person's
+    // windows from falling off the end of a page they never chose.
+    const EXIT_WINDOW_CANDIDATES = 500;
     const historyLimit = Math.max(1, Math.min(Number(req.query.historyLimit) || 500, HISTORY_CEILING));
 
     const [latestDoc, history, agg] = await Promise.all([
@@ -507,32 +514,48 @@ router.get('/users/:userId', async (req, res, next) => {
       if (err.code !== 'COLLECTION_MISSING') throw err;
     }
 
-    // Related exit windows. The documents carry userId: null, so candidates
-    // are pulled for the whole window of interest and then attributed to this
-    // user by heartbeat presence at the fence (lib/attribution).
+    // Related exit windows.
+    //
+    // This tab renders through the Exit Windows page's own table and drawer, so
+    // it is that page filtered to one person - and it now runs that page's query
+    // to prove it. It used to run a private one that read no filter at all: the
+    // only bound was a time range derived from this user's own heartbeat span,
+    // widened by an hour. So the date range on the bar did nothing here, neither
+    // did status, resolution, site, device, the sample thresholds or the where
+    // clause, and the tab answered a different question from the one the rest of
+    // the page was answering.
+    //
+    // The user filter is deliberately not part of the Mongo query: these
+    // documents carry userId: null, so a window is joined to a person by
+    // matching its GPS samples against heartbeats (lib/attribution). listWindows
+    // applies it in the right place, after that join.
     let exitWindows = [];
-    try {
-      const ew = await collectionFor('exitWindows');
-      const timeClause = {};
-      if (agg && agg.firstSeenAt) timeClause.$gte = new Date(agg.firstSeenAt).getTime();
-      if (agg && agg.lastSeenAt) timeClause.$lte = new Date(agg.lastSeenAt).getTime() + 60 * 60 * 1000;
-      const candidateFilter = [ew.base];
-      if (Object.keys(timeClause).length) {
-        candidateFilter.push({ $or: [{ openedAt: timeClause }, { userId }] });
+    let exitWindowsTruncated = false;
+    // `anonymous` is not a person, and attribution can only name people. This
+    // has always returned nothing; it now returns nothing without paying for a
+    // scan and an attribution pass to find that out.
+    if (userId !== null) {
+      try {
+        // The sort is pinned rather than passed through. `sortBy` on this page
+        // belongs to the Heartbeats table, and the candidate pool is cut to a
+        // fixed size before anyone is attributed to it - so which windows get
+        // considered at all depends on this order, and the truncation warning
+        // says "the most recent". Newest first is the only honest reading.
+        const found = await listWindows({
+          ...req.query,
+          userId,
+          page: 1,
+          limit: EXIT_WINDOW_CANDIDATES,
+          sortBy: undefined,
+          sortDir: undefined,
+        });
+        exitWindows = found.rows;
+        // Windows matching the filters, before attribution narrowed them to this
+        // person. More than one page of them means some were never considered.
+        exitWindowsTruncated = found.total > EXIT_WINDOW_CANDIDATES;
+      } catch (err) {
+        if (err.code !== 'COLLECTION_MISSING') throw err;
       }
-      const docs = await ew.col
-        .find(F.and(candidateFilter))
-        .sort({ openedAt: -1 })
-        .limit(200)
-        .maxTimeMS(config.queryTimeoutMs)
-        .toArray();
-      exitWindows = await windowsForUser(docs.map(normalize.exitWindow), userId);
-      // Same site match as the Exit Windows page - this tab renders through the
-      // same view, so a window must not read "unmapped" in one place and
-      // "Site 60" in the other.
-      exitWindows = await Promise.all(exitWindows.map((row) => attachWindowSite(row)));
-    } catch (err) {
-      if (err.code !== 'COLLECTION_MISSING') throw err;
     }
 
     res.json({
@@ -568,6 +591,7 @@ router.get('/users/:userId', async (req, res, next) => {
       trackTo: track.length ? track[track.length - 1].at : null,
       logs,
       exitWindows,
+      exitWindowsTruncated,
       // Only the sites this user actually touched. Null must never match: the
       // registry holds fences with no site id (from exit windows), and a user
       // with unmapped snapshots would otherwise drag them onto their map.

@@ -1063,6 +1063,20 @@ their candidate list. A weaker fence-presence fallback covers windows with no us
 samples, flagged as such - an exit window means a device *left*, so "who was at the fence"
 can pick up a colleague who stayed. The User filter and the per-user page use these matches.
 
+**One query, two pages.** The Exit windows tab on a user page renders through the Exit
+Windows page's own table and drawer, so it runs that page's query too (`lib/exitWindows.js`,
+shared by both routes). It used to run a private one bounded only by a time range derived
+from that user's own heartbeat span - so the date range on the filter bar, and every other
+control, did nothing on that tab, and its count disagreed with the Exit Windows page for the
+same filters. Sharing the query is what keeps the two answers the same.
+
+**Attribution runs after the query, which constrains paging.** Because the join to a person
+happens in Node and not in Mongo, the user filter cannot narrow the `$match` - a page of
+windows is fetched for *everybody* and then filtered down. The per-user tab therefore asks
+for the pager's maximum (500) so a person's windows cannot fall off the end of a page they
+never chose, and says so when more than that matched the filters. The same ordering is why
+the Exit Windows page's total counts windows before attribution, not after.
+
 **Fence-to-site matching.** These documents carry fence coordinates but no site id, so
 the Site column and the Site filter match a fence against the site registry by centre
 (within 30 m) *and* radius (within 20%). That is flagged in the UI with a `≈` badge and

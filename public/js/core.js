@@ -1781,6 +1781,24 @@ window.PM = (function () {
     location.href = href;
   }
 
+  /**
+   * The active time range, in words - "the last 3 hours", "all time".
+   * A panel showing nothing has to be able to say which window it looked in,
+   * or an empty panel reads as "this person has none" when it means "none
+   * here, in these three hours".
+   */
+  function rangeLabel() {
+    const key = state.filters.range || (state.filters.from ? 'custom' : DEFAULT_RANGE);
+    if (key === 'all') return 'all time';
+    if (key === 'custom') {
+      const from = state.filters.from ? fmt.dayTime(state.filters.from) : null;
+      const to = state.filters.to ? fmt.dayTime(state.filters.to) : 'now';
+      return from ? from + ' to ' + to : 'the selected range';
+    }
+    const hit = RANGE_PRESETS.find((p) => p.key === key);
+    return hit ? 'the ' + hit.label.toLowerCase() : 'the selected range';
+  }
+
   // ----------------------------------------------------- option list helpers
   function optionsFrom(list, valueKey, labelKey, countKey) {
     return (list || []).map((item) => ({
@@ -1818,6 +1836,7 @@ window.PM = (function () {
     meter,
     jsonHighlight,
     optionsFrom,
+    rangeLabel,
     padBuckets,
     showSkeleton,
     skeletonMarkup,

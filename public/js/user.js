@@ -1738,27 +1738,50 @@
   function renderExitWindowsTab(host) {
     const windows = detail.exitWindows || [];
     const anon = ((PM.state.meta || {}).exitWindows || {}).anonymousWindows || 0;
+    // This tab runs the Exit Windows query with the filter bar applied, so it
+    // has to say so: a tab that silently ignored the bar and one that honours it
+    // look identical until you notice the count disagreeing with the other page.
+    const scope = PM.rangeLabel();
 
     host.append(
       tabHeader(
-        windows.length + ' exit window(s) matched to this user · click one to replay its samples',
+        windows.length +
+          ' exit window(s) matched to this user in ' +
+          scope +
+          ' · every filter on the bar applies here · click one to replay its samples',
         el('a', { class: 'btn btn-sm', href: '/exit-windows.html', text: 'All exit windows' })
       )
     );
 
+    // More windows matched the filters than could be attributed in one pass, so
+    // this person may own one that was never looked at. Say it rather than let
+    // a short list pass for a complete one.
+    if (detail.exitWindowsTruncated) {
+      host.append(
+        el('div', {
+          class: 'notice',
+          style: 'margin-bottom:12px',
+          html:
+            '<span>⚠</span><span>More than 500 exit windows match these filters. Only the 500 most recent were ' +
+            'checked against this user, so this list may be incomplete - narrow the time range to be sure.</span>',
+        })
+      );
+    }
+
     const empty = el('div', { class: 'empty' }, [
-      el('div', { text: 'No exit windows matched this user.' }),
-      anon
-        ? el('div', { class: 'hint', style: 'margin-top:8px;max-width:600px;margin-left:auto;margin-right:auto' }, [
-            document.createTextNode(
-              'The ' +
-                anon +
-                ' exit windows in this database carry userId: null, so they are matched to people by comparing each ' +
-                'window’s GPS samples against the heartbeat stream. None of them matched this user in this time range. '
-            ),
-            el('a', { href: '/exit-windows.html', text: 'See all windows' }),
-          ])
-        : null,
+      el('div', { text: 'No exit windows matched this user in ' + scope + '.' }),
+      el('div', { class: 'hint', style: 'margin-top:8px;max-width:600px;margin-left:auto;margin-right:auto' }, [
+        document.createTextNode(
+          anon
+            ? 'The ' +
+              anon +
+              ' exit windows in this database carry userId: null, so they are matched to people by comparing each ' +
+              'window’s GPS samples against the heartbeat stream. None of them matched this user here. Widen the ' +
+              'time range, or clear the other filters, before concluding there are none. '
+            : 'Widen the time range, or clear the other filters, before concluding there are none. '
+        ),
+        el('a', { href: '/exit-windows.html', text: 'See all windows' }),
+      ]),
     ]);
 
     const body = el('div');
