@@ -15,6 +15,38 @@
   let rows = [];
   let total = 0;
   let lastGaps = [];
+  let track = null;
+
+  /* ---------------------------------------------------------------- window
+     A time window scoped tighter than the filter bar, owned by the page
+     because it scopes the page: the table, the tiles, the chart and the map
+     are all one question, and the map narrowing to fifteen minutes while the
+     table still answers for the day is two numbers that cannot both be right.
+
+     The bar itself is drawn by PMTrailMap, which is where the Fixes limit it
+     works with lives too. */
+  let mapWindow = null;
+
+  /**
+   * `range: 'custom'` matters: queryString() resolves a preset like "last 3h"
+   * into its own `from` and deletes `to`, so an explicit window has to say it
+   * is not a preset or it would be silently overwritten.
+   */
+  function scopedQuery(extra) {
+    const scope = mapWindow ? { range: 'custom', from: mapWindow.from, to: mapWindow.to } : null;
+    if (!scope && !extra) return queryString();
+    return queryString(Object.assign({}, scope, extra));
+  }
+
+  function setMapWindow(next) {
+    mapWindow = next;
+    // A narrower window is a different result set, so page 3 of the old one is
+    // not page 3 of this one. Cleared on the state directly rather than through
+    // setFilter, which emits pm:filters - and that handler drops the window
+    // that was just set.
+    delete PM.state.filters.page;
+    load();
+  }
 
   PM.boot('heartbeats.html', async ({ root, meta }) => {
     PM.buildFilterBar(() => [
@@ -53,6 +85,10 @@
           el('div', { html: PMChart.legend([{ color: C.series[0], label: 'Heartbeats stored' }]) }),
         ]),
       ]),
+      // The trail panel, mounted whole: the same toolbar, time window, Fixes
+      // limit, State filter, merging, replay and accounting note the user page
+      // has. PMTrailMap fills this card in - head included.
+      el('div', { class: 'card', id: 'hb-map-card' }),
       el('div', { class: 'card' }, [
         el('div', { class: 'card-head' }, [
           el('h2', { text: 'Every heartbeat' }),
@@ -70,7 +106,12 @@
     );
 
     await load();
-    window.addEventListener('pm:filters', load);
+    // The filter bar is the authority: changing it drops any narrower window
+    // the map had set, the same way the user page does.
+    window.addEventListener('pm:filters', () => {
+      mapWindow = null;
+      load();
+    });
     window.addEventListener('pm:refresh', load);
   });
 
@@ -80,17 +121,107 @@
       '#hb-timeline': 'chart',
       '#hb-table': 'table:12x10',
     });
-    const qs = queryString();
-    const [data, stats] = await Promise.all([api('/api/snapshots?' + qs), api('/api/stats?' + qs)]);
+    const qs = scopedQuery();
+    // The trail is its own request with its own limit, because the table wants
+    // a page of fat rows and the map wants every fix in range as seven small
+    // fields. One query cannot be both, and asking the table for 100,000 rows
+    // to draw a map was what kept this page mapless.
+    const [data, stats, trackData] = await Promise.all([
+      api('/api/snapshots?' + qs),
+      api('/api/stats?' + qs),
+      api('/api/track?' + scopedQuery({ limit: PMTrailMap.fixLimit() })).catch((err) => ({ error: err.message })),
+    ]);
     rows = data.rows || [];
     total = data.total || 0;
+    track = trackData;
 
     renderTiles(stats, data);
     renderTimeline(stats);
+    renderTrail();
     renderTable();
 
     PM.setSubtitle(fmt.int(total) + ' heartbeats match · newest first');
     PM.markLoaded();
+  }
+
+  /**
+   * Where these heartbeats went.
+   *
+   * Every other panel here is an aggregate - a count, a band, a bucket - and
+   * none of them answers "where". The table answers it as two decimal numbers
+   * per row, which is not an answer anyone can act on: nobody holds a
+   * coordinate pair in their head, and "43 m outside the boundary" means
+   * nothing without knowing whether that is across a car park or a motorway.
+   *
+   * This is the user page's map, not a smaller one built to look like it. The
+   * first version here drew the table's own page of rows - 100 fixes, no Fixes
+   * control, no window, no State filter, no merging, no replay - so the two
+   * pages had two maps of one collection obeying different rules. The panel is
+   * shared (js/trailmap.view.js) and its data comes from /api/track, which
+   * honours every filter on the bar and goes to 100,000 fixes.
+   *
+   * The one thing this page has to decide for itself is whether a path and a
+   * replay would be honest. Both say "this device went from here to there",
+   * and across two people that is a journey nobody took - so they are offered
+   * only when the loaded fixes are a single stream, and the reason is stated
+   * when they are not.
+   */
+  function renderTrail() {
+    const host = document.querySelector('#hb-map-card');
+    if (!host) return;
+    host.innerHTML = '';
+
+    if (!track || track.error) {
+      host.append(
+        el('div', { class: 'card-head' }, [el('h2', { text: 'Where these heartbeats went' })]),
+        el('div', {
+          class: 'empty',
+          text: track && track.error ? 'Could not load the trail: ' + track.error : 'The trail did not load.',
+        })
+      );
+      return;
+    }
+
+    // Names travel in a lookup rather than on every point, so they are put back
+    // on here. The trail popup shows one when it is there, which is what makes
+    // a fleet-wide map readable.
+    const names = new Map((track.users || []).map((u) => [u.userId, u.name]));
+    const points = (track.points || []).map((point) =>
+      Object.assign({}, point, { name: names.get(point.userId) || null })
+    );
+    const streams = track.streams || 0;
+    const single = streams <= 1;
+
+    PMTrailMap.render(host, {
+      title: 'Where these heartbeats went',
+      points,
+      sites: track.sites || [],
+      meta: {
+        // The count above the table, so the note under the map can be
+        // reconciled against it rather than read on its own.
+        inRange: total,
+        fetched: track.fetched,
+        noFix: track.noFix,
+        truncated: track.truncated,
+        limit: track.limit,
+        ceiling: track.ceiling,
+        from: track.from,
+        to: track.to,
+        // Null across several devices: the sum of unrelated journeys plus the
+        // gaps between them is not a number about anything.
+        travelledMetres: track.travelledMetres,
+      },
+      window: mapWindow,
+      onWindow: setMapWindow,
+      onReload: load,
+      path: single,
+      replay: single,
+      reason: single
+        ? null
+        : streams +
+          ' devices reported in this selection, so there is no single route to draw or play back. Pick one user in' +
+          ' the User filter above for the path, the reporting gaps and the replay.',
+    });
   }
 
   function renderTiles(stats, data) {

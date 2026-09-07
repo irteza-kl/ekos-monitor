@@ -222,10 +222,20 @@ const newest = (rows, field) =>
 
 /** The "right now" half: one row per user, newest heartbeat only. */
 async function fromLatestSnapshots(q, nameHints) {
-  const { col, base } = await collectionFor('snapshots');
+  const { col, base, name } = await collectionFor('snapshots');
   const match = F.and([base, F.snapshotMatch(q)]);
   const latest = await col
-    .aggregate(P.latestPerUser({ match, postMatch: F.snapshotPostMatch(q), sort: { createdAt: -1 }, skip: 0, limit: 500 }), opts)
+    .aggregate(
+      P.latestPerUser({
+        match,
+        postMatch: F.snapshotPostMatch(q),
+        sort: { createdAt: -1 },
+        skip: 0,
+        limit: 500,
+        collection: name,
+      }),
+      opts
+    )
     .next();
   const rows = (latest.rows || []).map((doc) => normalize.snapshot(doc));
   if (!rows.length) return [];

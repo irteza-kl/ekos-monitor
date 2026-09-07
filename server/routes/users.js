@@ -96,7 +96,7 @@ function attachSite(row, sites) {
 }
 
 async function listUsers(q) {
-  const { col, base } = await collectionFor('snapshots');
+  const { col, base, name } = await collectionFor('snapshots');
   const match = F.and([base, F.snapshotMatch(q)]);
   const postMatch = F.snapshotPostMatch(q);
   const { limit, page, skip } = F.pagination(q, 50, 500);
@@ -107,7 +107,7 @@ async function listUsers(q) {
   const sort = F.sortSpec(q, SORTABLE, { [P.HEARTBEAT_AT]: -1 });
 
   const result = await col
-    .aggregate(P.latestPerUser({ match, postMatch, sort, skip, limit }), opts)
+    .aggregate(P.latestPerUser({ match, postMatch, sort, skip, limit, collection: name }), opts)
     .next();
 
   const sites = await getSites();
@@ -186,6 +186,51 @@ router.get('/users.csv', async (req, res, next) => {
   }
 });
 
+/**
+ * The fields a sort and the computed columns need, and nothing else.
+ *
+ * A `$sort` over whole heartbeat documents is a blocking sort of hundreds of
+ * megabytes on a wide query, and **this deployment does not honour
+ * allowDiskUse** - the same wall `pipelines.latestPerUser` hit, which is what
+ * took `/api/stats` down with "Sort exceeded memory limit of 33554432 bytes".
+ * Ordering a projection of six small fields instead is the same order for a
+ * fraction of the memory, and the page of documents is fetched back by `_id`
+ * afterwards.
+ */
+function sortProjection(sort) {
+  const projection = {
+    _id: 1,
+    // What pipelines.computedFields reads: the accuracy band, and the fix
+    // time that ageMinutes is measured from.
+    createdAt: 1,
+    currentDateTime: 1,
+    'currentUserLocation.accuracy': 1,
+    'currentUserLocation.capturedAt': 1,
+  };
+  // Whatever is actually being ordered by. A computed key (ageMinutes,
+  // accuracyBand) is absent here and created by the $addFields that follows,
+  // which is also the stage order that makes sorting by them work at all -
+  // it used to run after the $sort.
+  for (const key of Object.keys(sort || {})) projection[key] = 1;
+  return projection;
+}
+
+/**
+ * The documents for one page of ids, in the order the ids came back.
+ *
+ * `$in` does not preserve order and neither does the storage engine, so the
+ * sort would be lost between the two queries if this did not put it back.
+ */
+async function documentsFor(col, ids) {
+  if (!ids.length) return [];
+  const docs = await col
+    .find({ _id: { $in: ids } })
+    .maxTimeMS(config.queryTimeoutMs)
+    .toArray();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+  return ids.map((id) => byId.get(String(id))).filter(Boolean);
+}
+
 /** Paged raw snapshot feed (the activity log view). */
 router.get('/snapshots', async (req, res, next) => {
   try {
@@ -209,10 +254,15 @@ router.get('/snapshots', async (req, res, next) => {
         [
           { $match: match },
           ...(byHeartbeatAt ? [{ $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } }] : []),
+          { $project: sortProjection(sort) },
+          { $addFields: P.computedFields },
+          // Ahead of the sort and the paging, so it narrows the set rather than
+          // the page - `total` used to count rows this had not been applied to.
+          { $match: postMatch },
           { $sort: sort },
           {
             $facet: {
-              rows: [{ $skip: skip }, { $limit: limit }, { $addFields: P.computedFields }, { $match: postMatch }],
+              rows: [{ $skip: skip }, { $limit: limit }, { $project: { _id: 1 } }],
               total: [{ $count: 'value' }],
             },
           },
@@ -221,9 +271,10 @@ router.get('/snapshots', async (req, res, next) => {
       )
       .next();
 
+    const docs = await documentsFor(col, (result.rows || []).map((r) => r._id));
     const sites = await getSites();
     res.json({
-      rows: (result.rows || []).map((d) => attachSite(normalize.snapshot(d), sites)),
+      rows: docs.map((d) => attachSite(normalize.snapshot(d), sites)),
       total: (result.total[0] || {}).value || 0,
       page,
       limit,
@@ -242,19 +293,29 @@ router.get('/snapshots.csv', async (req, res, next) => {
     // Same order as the table this is exported from. Sorting on `createdAt` here
     // while the table sorts on the fix time meant the CSV rows came out in a
     // different order from the rows on screen.
-    const docs = await col
+    const ordering = { [P.HEARTBEAT_AT]: -1 };
+    const ids = await col
       .aggregate(
         [
           { $match: match },
           { $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } },
-          { $sort: { [P.HEARTBEAT_AT]: -1 } },
+          // Same reason as the paged feed: the sort has to run on a projection,
+          // not on whole documents, or a wide export exceeds the 32 MB sort
+          // budget this cluster will not spill to disk.
+          { $project: sortProjection(ordering) },
+          { $sort: ordering },
           { $limit: limit },
+          { $project: { _id: 1 } },
         ],
         opts
       )
       // The row cap is the $limit stage and the time cap is in `opts`, so neither
       // is repeated on the cursor.
       .toArray();
+    const docs = await documentsFor(
+      col,
+      ids.map((r) => r._id)
+    );
     const sites = await getSites();
     const rows = docs.map((d) => attachSite(normalize.snapshot(d), sites));
     const text = csv.toCsv(rows, [
@@ -607,47 +668,160 @@ router.get('/users/:userId', async (req, res, next) => {
 });
 
 /** Just the breadcrumb trail, for the map. */
+/**
+ * The breadcrumb trail, for any filter the bar can express.
+ *
+ * The user page's map had this to itself as part of /users/:id, which is why
+ * the Heartbeats page's map could only draw one page of the table - 100 fat
+ * rows, no Fixes control, and no idea what it was short of. The trail panel is
+ * shared between the two pages now, so its data source is too.
+ *
+ * `noFix` is why this deliberately does NOT filter out heartbeats without
+ * coordinates in Mongo. A heartbeat that arrived with no fix is still a
+ * heartbeat, it is still in every count above the map, and "some of my
+ * heartbeats are missing" is answered by naming that number - which is
+ * impossible if the query silently dropped them.
+ */
+const TRACK_CEILING = 100000;
+const DEFAULT_TRACK_LIMIT = 5000;
+
+async function buildTrack(query, extraMatch) {
+  const { col, base } = await collectionFor('snapshots');
+  const match = F.and([base, extraMatch || null, F.snapshotMatch(query)]);
+  const limit = Math.max(1, Math.min(Number(query.limit) || DEFAULT_TRACK_LIMIT, TRACK_CEILING));
+
+  // Sorted and limited on `createdAt` because that is the indexed field, and
+  // this is "the newest N in range" - a question arrival order answers. The
+  // points are then reordered by fix time below, which is a different order for
+  // anything that synced late and the only one a path may be drawn in.
+  const docs = await col
+    .find(match, {
+      projection: {
+        createdAt: 1,
+        // Read by heartbeatTime() as the middle fallback clock. Omitting it
+        // silently skips that step and puts an arrival time on the trail.
+        currentDateTime: 1,
+        currentUserLocation: 1,
+        isInsideGeofence: 1,
+        clockedIn: 1,
+        batteryPercentage: 1,
+        'currentUser.data.id': 1,
+        'currentUser.data.fullName': 1,
+        // Which fences to send back. /api/meta lists sites but without
+        // coordinates, so a caller drawing a map cannot get them from there.
+        [SNAP.jobSiteId]: 1,
+        [SNAP.jobSiteIdAlt]: 1,
+      },
+    })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .maxTimeMS(config.queryTimeoutMs)
+    .toArray();
+
+  // Names are sent once in a lookup rather than on every point. At the top of
+  // this limit that is 100,000 repetitions of the same string saved.
+  const names = new Map();
+  const siteIds = new Set();
+  const all = docs.map((d) => {
+    const loc = d.currentUserLocation || {};
+    const user = (d.currentUser && d.currentUser.data) || {};
+    const userId = normalize.num(user.id);
+    if (userId !== null && !names.has(userId)) names.set(userId, user.fullName || null);
+    const jobSiteId =
+      normalize.num((d.clockedInJobDetail || {}).jobSiteId) !== null
+        ? normalize.num((d.clockedInJobDetail || {}).jobSiteId)
+        : normalize.num((d.clockedInJobSiteLocation || {}).jobSiteId);
+    if (jobSiteId !== null) siteIds.add(jobSiteId);
+    return {
+      // The fix time, not the arrival time (see normalize.heartbeatTime).
+      at: normalize.heartbeatTime(d).at,
+      lat: normalize.num(loc.latitude),
+      lng: normalize.num(loc.longitude),
+      accuracy: normalize.num(loc.accuracy),
+      insideGeofence: d.isInsideGeofence === undefined ? null : d.isInsideGeofence,
+      clockedIn: d.clockedIn === true,
+      battery: normalize.num(d.batteryPercentage),
+      userId,
+    };
+  });
+
+  const points = all
+    .filter((p) => p.lat !== null && p.lng !== null && p.at)
+    .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  // Counted on its own terms: the filter above also drops the (vanishingly
+  // rare) heartbeat with no readable timestamp, and the note under the map
+  // attributes this number specifically to missing coordinates.
+  const noFix = all.filter((p) => p.lat === null || p.lng === null).length;
+
+  const streams = new Set(points.map((p) => p.userId)).size;
+  // Distance travelled is a per-device measure. Summed across a fleet it is the
+  // total of several unrelated journeys plus the gaps between them, which is not
+  // a number about anything - so it is only offered for a single stream.
+  let travelledMetres = null;
+  if (streams <= 1) {
+    travelledMetres = 0;
+    for (let i = 1; i < points.length; i += 1) {
+      const d = geo.haversine(points[i - 1], points[i]);
+      if (d !== null) travelledMetres += d;
+    }
+    travelledMetres = geo.round(travelledMetres, 1);
+  }
+
+  // Only the fences these heartbeats actually touched. Null must never match:
+  // the registry holds fences with no site id (they come from exit windows),
+  // and sending those would drag unrelated circles onto the map.
+  let sites = [];
+  try {
+    sites = (await getSites()).filter(
+      (site) => site.plottable && site.siteId !== null && site.siteId !== undefined && siteIds.has(site.siteId)
+    );
+  } catch (err) {
+    /* a map without its fences is still a map; the registry is best-effort */
+  }
+
+  return {
+    points,
+    sites,
+    users: [...names.entries()].map(([userId, name]) => ({ userId, name })),
+    limit,
+    ceiling: TRACK_CEILING,
+    // Heartbeats read out of the store, before the ones with no coordinates
+    // were dropped: points.length + noFix === fetched, minus any with no clock.
+    fetched: all.length,
+    noFix,
+    truncated: all.length >= limit,
+    from: points.length ? points[0].at : null,
+    to: points.length ? points[points.length - 1].at : null,
+    streams,
+    travelledMetres,
+  };
+}
+
+router.get('/track', async (req, res, next) => {
+  try {
+    res.json(await buildTrack(req.query));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * One person, same builder.
+ *
+ * This had its own copy, which read `createdAt` as the heartbeat's time. For a
+ * device that synced a backlog late that is hours away from when the fix was
+ * taken, so the trail it returned zig-zagged back and forth through time and
+ * every gap along it was measured between the wrong pair of points. Sharing the
+ * builder fixes that here too - the Live Map trails are the caller.
+ */
 router.get('/users/:userId/track', async (req, res, next) => {
   try {
     const userId = req.params.userId === 'anonymous' ? null : Number(req.params.userId);
-    const { col, base } = await collectionFor('snapshots');
-    const match = F.and([
-      base,
-      userId === null ? { [SNAP.userId]: null } : { [SNAP.userId]: userId },
-      F.snapshotMatch({ ...req.query, userId: undefined }),
-      { [SNAP.lat]: { $ne: null } },
-    ]);
-    const limit = Math.min(Number(req.query.limit) || 1000, 10000);
-    const docs = await col
-      .find(match, {
-        projection: {
-          createdAt: 1,
-          'currentUserLocation.latitude': 1,
-          'currentUserLocation.longitude': 1,
-          'currentUserLocation.accuracy': 1,
-          isInsideGeofence: 1,
-          clockedIn: 1,
-        },
-      })
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .maxTimeMS(config.queryTimeoutMs)
-      .toArray();
-
-    res.json({
-      userId,
-      points: docs
-        .reverse()
-        .map((d) => ({
-          at: normalize.iso(d.createdAt),
-          lat: normalize.num(d.currentUserLocation && d.currentUserLocation.latitude),
-          lng: normalize.num(d.currentUserLocation && d.currentUserLocation.longitude),
-          accuracy: normalize.num(d.currentUserLocation && d.currentUserLocation.accuracy),
-          insideGeofence: d.isInsideGeofence === undefined ? null : d.isInsideGeofence,
-          clockedIn: d.clockedIn === true,
-        }))
-        .filter((p) => p.lat !== null),
-    });
+    const data = await buildTrack(
+      { ...req.query, userId: undefined },
+      userId === null ? { [SNAP.userId]: null } : { [SNAP.userId]: userId }
+    );
+    res.json({ userId, ...data });
   } catch (err) {
     next(err);
   }

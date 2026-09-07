@@ -148,8 +148,15 @@ function matchBySamples(row, stream) {
       const distance = geo.haversine(point, sample);
       if (distance === null || distance > SAMPLE_MATCH_METRES) continue;
       const current = bestPerUser.get(point.userId);
-      if (!current || distance < current.distance) {
-        bestPerUser.set(point.userId, { distance, dt: Math.abs(point.t - t) });
+      const dt = Math.abs(point.t - t);
+      // Distance first, then time. A stationary device reports the same
+      // coordinates for minutes on end - which is most of this data - so
+      // distance alone leaves every candidate tied at zero and the winner is
+      // whichever bucket happened to be scanned first. The reported median
+      // distance and median seconds apart are then read off an arbitrary
+      // heartbeat, which is evidence the reader cannot check.
+      if (!current || distance < current.distance || (distance === current.distance && dt < current.dt)) {
+        bestPerUser.set(point.userId, { distance, dt });
       }
     }
     for (const [userId, best] of bestPerUser) {
@@ -382,10 +389,24 @@ async function nameDirectMatches(rows) {
       .aggregate(
         [
           { $match: { ...base, [SNAP.userId]: { $in: ids } } },
-          { $sort: { createdAt: -1 } },
-          { $group: { _id: '$' + SNAP.userId, name: { $first: '$' + SNAP.fullName } } },
+          // No sort. This was `$sort: { createdAt: -1 }` over every heartbeat
+          // those users have ever sent, with whole documents in the sort - a
+          // blocking sort with no ceiling, and this deployment does not honour
+          // allowDiskUse (see lib/fence.js and pipelines.latestPerUser). It was
+          // one wide exit-window query away from the same 32 MB failure.
+          //
+          // `$max` over an object compares field by field in declaration order,
+          // so this is "the name on the newest heartbeat" in one streaming pass,
+          // with memory proportional to the number of people asked about.
+          {
+            $group: {
+              _id: '$' + SNAP.userId,
+              newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.fullName, null] } } },
+            },
+          },
+          { $project: { name: '$newest.name' } },
         ],
-        { maxTimeMS: config.queryTimeoutMs }
+        { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs }
       )
       .toArray();
     const names = new Map(found.map((f) => [f._id, f.name]));

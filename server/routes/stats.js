@@ -48,14 +48,14 @@ async function buildStats(q) {
 
   // ---------------------------------------------------------------- devices
   try {
-    const { col, base } = await collectionFor('snapshots');
+    const { col, base, name } = await collectionFor('snapshots');
     const match = F.and([base, F.snapshotMatch(q)]);
     const postMatch = F.snapshotPostMatch(q);
 
     // KPIs are computed on the newest snapshot per user (the "current" view).
     const latest = await col
       .aggregate(
-        P.latestPerUser({ match, postMatch, sort: { createdAt: -1 }, skip: 0, limit: 500 }),
+        P.latestPerUser({ match, postMatch, sort: { createdAt: -1 }, skip: 0, limit: 500, collection: name }),
         opts
       )
       .next();

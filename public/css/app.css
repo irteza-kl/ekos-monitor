@@ -367,6 +367,19 @@ textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
 }
 .chip button { all: unset; cursor: pointer; color: var(--ink-muted); font-size: 13px; line-height: 1; }
 .chip button:hover { color: var(--ink); }
+/* Clear all, when there is something to clear. The count is on the label,
+   so this only has to say "armed" - a full primary-button treatment would
+   compete with Apply for the eye. */
+.btn.is-on {
+  border-color: var(--info-line); color: var(--info-fg); background: var(--info-bg);
+}
+.btn.is-on:hover { background: var(--info-bg); border-color: var(--info-fg); }
+
+/* A chip that reports an active filter rather than a count. */
+.chips .chip.is-on {
+  background: var(--info-bg); border-color: var(--info-line);
+  color: var(--info-fg); font-weight: 550;
+}
 
 .adv { border-top: 1px solid var(--border); padding-top: 10px; display: none; }
 .adv.open { display: block; }
@@ -601,6 +614,11 @@ td .truncate { max-width: 260px; }
 /* On the Heartbeats tab the same bar sits inside a padded block rather than
    flush under a map, so it needs its own edges. */
 .tab-block .map-window {
+  border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px;
+}
+/* A tab-local filter row, stacked under that window. Same shape, so the two
+   read as a stack of controls rather than one bar with a stray edge. */
+.tab-block .map-toolbar.tab-filters {
   border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px;
 }
 .map-window input[type='datetime-local'] {

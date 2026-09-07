@@ -89,7 +89,7 @@
           el('h2', { text: 'Who is having the worst time' }),
           el('span', { class: 'sub', text: 'people ranked by the problems they are actually hitting' }),
           el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: '/users.html', text: 'All users ↗' }),
+          el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
         ]),
         el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'worst-users' })]),
       ]),
@@ -98,7 +98,7 @@
           el('h2', { text: 'Where everyone is right now' }),
           el('span', { class: 'sub', id: 'map-sub' }),
           el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: '/map.html', text: 'Full map ↗' }),
+          el('a', { class: 'btn btn-sm', href: PM.withWindow('/map.html'), text: 'Full map ↗' }),
         ]),
         el('div', { class: 'card-body tight' }, [el('div', { class: 'map', id: 'overview-map' })]),
         el('div', { html: PMMap.legend() }),
@@ -139,7 +139,7 @@
           el('div', { class: 'card-head' }, [
             el('h2', { text: 'Per-user activity' }),
             el('div', { class: 'spacer' }),
-            el('a', { class: 'btn btn-sm', href: '/users.html', text: 'All users ↗' }),
+            el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
           ]),
           el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'user-table' })]),
         ]),
@@ -149,7 +149,7 @@
           el('h2', { text: 'Geofence validation calls' }),
           el('span', { class: 'sub', text: 'What the clock-in checks decided, from validateClockInLogs' }),
           el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: '/checks.html', text: 'Inspect checks ↗' }),
+          el('a', { class: 'btn btn-sm', href: PM.withWindow('/checks.html'), text: 'Inspect checks ↗' }),
         ]),
         el('div', { class: 'card-body' }, [
           el('div', { class: 'tiles', id: 'check-tiles' }),
@@ -361,7 +361,7 @@
       }),
       tile('People affected', fmt.int((problems.byUser || []).length), {
         note: c.people + ' issue type(s) in the field',
-        href: '/users.html',
+        href: PM.withWindow('/users.html'),
       })
     );
 
@@ -606,18 +606,18 @@
       tile('Devices reporting', fmt.int(d.trackedUsers), {
         note: d.stale ? d.stale + ' stale (>15 min quiet)' : 'all reporting recently',
         tone: d.stale ? 'warning' : undefined,
-        href: '/users.html',
+        href: PM.withWindow('/users.html'),
       }),
-      tile('On the clock', fmt.int(d.clockedIn), { note: d.clockedOut + ' clocked out', href: '/users.html?clockedIn=true' }),
+      tile('On the clock', fmt.int(d.clockedIn), { note: d.clockedOut + ' clocked out', href: PM.withWindow('/users.html?clockedIn=true') }),
       tile('Inside a fence', fmt.int(d.insideGeofence), {
         tone: 'good',
         note: d.geofenceUnknown ? d.geofenceUnknown + ' with no fence flag' : 'device-reported',
-        href: '/users.html?insideGeofence=true',
+        href: PM.withWindow('/users.html?insideGeofence=true'),
       }),
       tile('Outside a fence', fmt.int(d.outsideGeofence), {
         tone: d.outsideGeofence ? 'critical' : undefined,
         note: d.outsideButClockedIn ? d.outsideButClockedIn + ' of them still clocked in' : 'none clocked in outside',
-        href: '/users.html?insideGeofence=false',
+        href: PM.withWindow('/users.html?insideGeofence=false'),
       }),
       tile('Median accuracy', fmt.accuracy(d.medianAccuracy), {
         note: 'avg ' + fmt.accuracy(d.avgAccuracy) + ' · worst ' + fmt.accuracy(d.worstAccuracy),
@@ -626,22 +626,22 @@
       tile('Poor fixes', fmt.int(d.poorAccuracy), {
         note: 'devices over ±50 m right now',
         tone: d.poorAccuracy ? 'serious' : undefined,
-        href: '/users.html?accuracyMin=50',
+        href: PM.withWindow('/users.html?accuracyMin=50'),
       }),
       tile('Low battery', fmt.int(d.lowBattery), {
         note: 'at or under 20%',
         tone: d.lowBattery ? 'warning' : undefined,
-        href: '/users.html?batteryMax=20',
+        href: PM.withWindow('/users.html?batteryMax=20'),
       }),
       tile('Offline devices', fmt.int(d.offline), {
         note: 'no connectivity on last ping',
         tone: d.offline ? 'critical' : undefined,
-        href: '/users.html?connected=false',
+        href: PM.withWindow('/users.html?connected=false'),
       }),
       tile('Permission gaps', fmt.int(d.permissionGaps), {
         note: d.locationBackgroundMissing + ' missing background location',
         tone: d.locationBackgroundMissing ? 'critical' : d.permissionGaps ? 'warning' : undefined,
-        href: '/users.html?permissionMissing=LOCATION_BACKGROUND',
+        href: PM.withWindow('/users.html?permissionMissing=LOCATION_BACKGROUND'),
       }),
       tile('Face checks pending', fmt.int(d.facialPending), { note: 'required but not completed' })
     );

@@ -37,6 +37,15 @@ window.PM = (function () {
     filterBuilder: null,
     hideChips: [],
     filters: {},
+    // Filters carried in from the last page that this page has not adopted
+    // yet - it cannot, until its own filter bar says which keys it knows.
+    // Whatever is still here after the bar is built is what this page cannot
+    // express, and it rides on to the next page unapplied.
+    // See adoptCarriedFilters.
+    carried: {},
+    // Adoption happens once. The bar is rebuilt when metadata lands, and a
+    // second adoption would put back a filter just removed by hand.
+    adopted: false,
     refreshMs: Number(localStorage.getItem('pm.refresh') || 0),
     refreshTimer: null,
     lastLoadedAt: null,
@@ -532,6 +541,200 @@ window.PM = (function () {
   // What every page opens on, and what Reset goes back to.
   const DEFAULT_RANGE = '3h';
 
+  /* ------------------------------------------------- filters that travel
+     Clicking Heartbeats after setting up a question on Users used to throw
+     the question away: the nav links are plain hrefs, and the filters live
+     in the query string, so they went with it. Two mechanisms carry them
+     now, and they are deliberately different.
+
+     The TIME WINDOW rides in the URL. Every page has a date-range control
+     and every server-side matcher applies it, so it means the same thing
+     everywhere; putting it in the link keeps it visible in the address bar,
+     shareable, and intact through a middle-click into a new tab.
+
+     EVERY OTHER FILTER rides a per-tab store, and a page adopts one only if
+     its own filter bar declares that key. Carrying them blindly would be
+     worse than dropping them: accuracyBand means nothing to the
+     geofence-check endpoint, so the chips would claim a filter the server
+     never applied and the reader would trust a narrowed number that was not
+     narrowed.
+
+     The URL always wins. A link someone sent you describes the filters it
+     carries, and nothing in this browser may quietly add to them.
+
+     sessionStorage, not localStorage: this is the thread of one sitting at
+     the console. Returning tomorrow to yesterday's filters silently applied
+     is a different and much worse surprise - saved views are the feature for
+     keeping a question on purpose. */
+  const CARRY_KEY = 'pm.filters';
+
+  /** Where a table is paged to, and a clause written against one
+      collection's field names. Neither survives a change of page. */
+  const NEVER_CARRIED = ['page', 'sortBy', 'sortDir', 'where'];
+
+  /**
+   * Marks a link as a change of subject rather than a drill-down.
+   *
+   * The sidebar is the one navigation in this app that means "different
+   * question": nothing about the row you were reading applies to the page
+   * you are going to. So those links start clean, and only the window
+   * follows. Every other link in the app - a crumb, a row, an Overview tile
+   * - is a drill-down into the same question and keeps the filters.
+   *
+   * The intent has to travel WITH the navigation, not sit in a flag in this
+   * tab, or a middle-click into a new tab would get the wrong one (and would
+   * leave the flag set for whatever the original tab did next). It is
+   * stripped from the address bar the moment it is read, so nothing copies
+   * a link with it in.
+   */
+  const FRESH_PARAM = 'fresh';
+
+  /** The time window, as the three keys that move together. */
+  const WINDOW_KEYS = ['range', 'from', 'to'];
+
+  const hasValue = (v) =>
+    !(v === null || v === undefined || v === '' || (Array.isArray(v) && !v.length));
+
+  function readCarried() {
+    try {
+      const raw = window.sessionStorage.getItem(CARRY_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (err) {
+      // A private window and blocked site data both throw on access rather
+      // than reading empty, and a filter bar is not worth a broken page.
+      return {};
+    }
+  }
+
+  /**
+   * Remembers the current filters for the next page.
+   *
+   * hideChips keys are skipped: a page declares those as its own identity
+   * rather than as a filter (userId on the user page), and carrying one
+   * would silently narrow the next page to the record just being read.
+   */
+  function saveCarried() {
+    // Starts from what this page could not express, so those keys travel
+    // THROUGH it. A page whose bar has no accuracy band must not be the
+    // place an accuracy band goes to die: Heartbeats -> Checks -> Heartbeats
+    // is one click each way and has to come back to the same question. They
+    // are carried but never applied here - no chip, no query parameter - so
+    // nothing on this page claims a filter it did not use.
+    const out = {};
+    for (const [k, v] of Object.entries(state.carried || {})) {
+      if (NEVER_CARRIED.indexOf(k) !== -1) continue;
+      if (hasValue(v)) out[k] = v;
+    }
+    // This page own filters win over anything passing through under the
+    // same name, because this is the page the reader is actually looking at.
+    for (const [k, v] of Object.entries(state.filters)) {
+      if (NEVER_CARRIED.indexOf(k) !== -1) continue;
+      if ((state.hideChips || []).indexOf(k) !== -1) continue;
+      if (!hasValue(v)) continue;
+      out[k] = v;
+    }
+    try {
+      window.sessionStorage.setItem(CARRY_KEY, JSON.stringify(out));
+    } catch (err) {
+      /* the filters still work here; only the carry to the next page is lost */
+    }
+  }
+
+  function clearCarried() {
+    try {
+      window.sessionStorage.removeItem(CARRY_KEY);
+    } catch (err) {
+      /* nothing stored is the state this wanted anyway */
+    }
+  }
+
+  /** The filter keys a bar spec understands, so nothing else is adopted. */
+  function declaredKeys(spec) {
+    const keys = [];
+    for (const item of spec || []) {
+      if (!item) continue;
+      if (item.kind === 'daterange') keys.push.apply(keys, WINDOW_KEYS);
+      else if (item.key) keys.push(item.key);
+    }
+    return keys;
+  }
+
+  /**
+   * Takes the carried filters this page can actually apply.
+   *
+   * Called from buildFilterBar, which every page runs before its first
+   * request - so an adopted filter is already in the query string that
+   * request is built from, and no page loads twice. Once only: after this
+   * the bar can be redrawn freely (metadata arriving redraws it) without
+   * resurrecting a filter the reader has since removed.
+   */
+  function adoptCarriedFilters() {
+    if (state.adopted) return false;
+    state.adopted = true;
+    const carried = state.carried || {};
+    const names = Object.keys(carried);
+    if (!names.length) return false;
+    const allowed = declaredKeys(state.filterSpec);
+    let took = 0;
+    for (const key of names) {
+      if (allowed.indexOf(key) === -1) continue;
+      state.filters[key] = carried[key];
+      // Adopted, so it is this page's own filter now and no longer just
+      // passing through. What is left in `carried` is what this page cannot
+      // express, and saveCarried hands that on untouched.
+      delete state.carried[key];
+      took += 1;
+    }
+    if (!took) return false;
+    // The address bar now describes what is applied, so a reload or a copied
+    // link reproduces this page and not a differently filtered one.
+    writeUrlState(true);
+    return true;
+  }
+
+  /**
+   * Works out what this page starts filtered by.
+   *
+   * Three sources, in order of authority: the URL, then a fresh-start
+   * marker that says to ignore the store, then the store itself. Called by
+   * boot - and by its tests, which is the point of it being a function: a
+   * harness replaying this by hand went green on the fresh-start marker
+   * before boot could run it.
+   */
+  function initFilterState() {
+    state.filters = readUrlState();
+    // A sidebar click asks for a clean page. The window it carries is in the
+    // URL already, so the store is simply dropped - and dropped for good, or
+    // the next drill-down would pick the old filters back up.
+    const fresh = state.filters[FRESH_PARAM] !== undefined;
+    delete state.filters[FRESH_PARAM];
+    if (fresh) clearCarried();
+    // What the last page was showing, minus anything this URL already says.
+    // Held rather than applied: which of these this page can express is not
+    // known until its filter bar is built. adoptCarriedFilters finishes it.
+    const carried = fresh ? {} : readCarried();
+    state.carried = {};
+    state.adopted = false;
+    for (const [key, value] of Object.entries(carried)) {
+      if (state.filters[key] === undefined) state.carried[key] = value;
+    }
+    // The window is the exception - it travels in the link, and it means the
+    // same thing on every page, so it is taken here and not gated on the bar.
+    // A reload of a bare URL then keeps the window too, which is the case the
+    // links alone cannot cover.
+    if (!state.filters.range && !state.filters.from) {
+      for (const key of WINDOW_KEYS) {
+        if (hasValue(state.carried[key])) state.filters[key] = state.carried[key];
+        delete state.carried[key];
+      }
+    }
+    if (!state.filters.range && !state.filters.from) state.filters.range = DEFAULT_RANGE;
+    // Out of the address bar before anything can copy it. replaceState, so
+    // the back button still goes where the reader came from.
+    if (fresh) writeUrlState(true);
+  }
+
   function readUrlState() {
     const params = new URLSearchParams(location.search);
     const out = {};
@@ -554,6 +757,55 @@ window.PM = (function () {
     const url = location.pathname + (params.toString() ? '?' + params.toString() : '');
     if (replace) history.replaceState(null, '', url);
     else history.pushState(null, '', url);
+    // One funnel for "the filters changed", so the carry cannot drift out
+    // of step with what the page is showing.
+    saveCarried();
+  }
+
+  /**
+   * The current window as query parameters, for a link to another page.
+   *
+   * Only the window - see the note on CARRY_KEY for why every other filter
+   * goes through the store instead of the link.
+   */
+  function windowParams() {
+    const params = new URLSearchParams();
+    for (const key of WINDOW_KEYS) {
+      const value = state.filters[key];
+      if (hasValue(value)) params.append(key, [].concat(value)[0]);
+    }
+    return params.toString();
+  }
+
+  /**
+   * Adds the current window to an in-app link, keeping the params it has.
+   *
+   * A link that already names a window keeps its own: the row it came from
+   * is more specific than the bar it was clicked under.
+   */
+  /**
+   * A link to a different section: the window, and a marker to drop the rest.
+   */
+  function withFreshStart(href) {
+    const target = withWindow(href);
+    return target + (target.indexOf('?') === -1 ? '?' : '&') + FRESH_PARAM + '=1';
+  }
+
+  function withWindow(href) {
+    const extra = windowParams();
+    if (!extra) return href;
+    const text = String(href);
+    const cut = text.indexOf('#');
+    const hash = cut === -1 ? '' : text.slice(cut);
+    const bare = cut === -1 ? text : text.slice(0, cut);
+    const split = bare.indexOf('?');
+    const pathPart = split === -1 ? bare : bare.slice(0, split);
+    const merged = new URLSearchParams(split === -1 ? '' : bare.slice(split + 1));
+    const carry = new URLSearchParams(extra);
+    for (const key of WINDOW_KEYS) if (merged.has(key)) carry.delete(key);
+    for (const [k, v] of carry.entries()) merged.append(k, v);
+    const qs = merged.toString();
+    return pathPart + (qs ? '?' + qs : '') + hash;
   }
 
   /** Query string for the API, resolving the range preset into from/to. */
@@ -624,6 +876,15 @@ window.PM = (function () {
       state.filterSpec = spec || [];
     }
     if (options || !state.hideChips) state.hideChips = (options && options.hideChips) || [];
+    // Before the host check: a page with no bar (the Query Explorer passes an
+      // empty spec) still has to drop what it cannot express, or the next page
+    // would inherit filters that skipped a page rather than dying on it.
+    adoptCarriedFilters();
+    // And then record what this page ended up with, whether or not anything
+    // was adopted. Without this a page reached through a link (filters in the
+    // URL, nothing clicked) would hand the page after it the filters of the
+    // page before it, having never written its own.
+    saveCarried();
     const host = document.querySelector('#filters');
     if (!host) return;
     host.innerHTML = '';
@@ -643,7 +904,16 @@ window.PM = (function () {
         onclick: () => document.querySelector('#advanced').classList.toggle('open'),
       }),
       el('button', { class: 'btn btn-sm', text: '⧉ Copy link', onclick: copyLink }),
-      el('button', { class: 'btn btn-sm', text: '⟲ Reset', onclick: resetFilters }),
+      // Named for what it does to every page, not just this one: the filters
+      // follow you around now, so the way out of them has to be one click and
+      // has to clear the carry as well. renderChips keeps the count on it.
+      el('button', {
+        class: 'btn btn-sm',
+        id: 'clear-filters',
+        text: '⟲ Clear all',
+        title: 'Clear every filter, including the time range, and stop carrying them to other pages',
+        onclick: resetFilters,
+      }),
     ]);
     row.append(actions);
     host.append(row);
@@ -1016,7 +1286,52 @@ window.PM = (function () {
     to: 'To',
   };
 
+  /**
+   * How many filters are applied, counting the time window as one thing.
+   *
+   * from+to+range is one decision about one window, so three chips for it
+   * would read as three filters. The default window is not a filter at all.
+   */
+  function activeFilterCount() {
+    const hidden = ['range', 'from', 'to', 'page', 'sortBy', 'sortDir'].concat(state.hideChips || []);
+    let n = 0;
+    for (const [key, value] of Object.entries(state.filters)) {
+      if (hidden.indexOf(key) !== -1) continue;
+      if (hasValue(value)) n += 1;
+    }
+    const window_ = state.filters.range || (state.filters.from ? 'custom' : DEFAULT_RANGE);
+    if (window_ !== DEFAULT_RANGE) n += 1;
+    return n;
+  }
+
+  /**
+   * Re-points the sidebar at the window that is selected now.
+   *
+   * Called from renderChips, which already runs on every filter change.
+   */
+  function refreshNavLinks() {
+    const links = document.querySelectorAll('[data-nav-to]');
+    for (const link of links) {
+      const to = link.getAttribute('data-nav-to');
+      if (to) link.setAttribute('href', withFreshStart(to));
+    }
+  }
+
+  function renderClearButton() {
+    const button = document.querySelector('#clear-filters');
+    if (!button) return;
+    const n = activeFilterCount();
+    button.textContent = n ? '⟲ Clear all (' + n + ')' : '⟲ Clear all';
+    // Disabled rather than hidden: a control that comes and goes is harder to
+    // find than one that greys out, and its absence would read as a missing
+    // feature instead of an empty filter bar.
+    button.disabled = !n;
+    button.classList.toggle('is-on', !!n);
+  }
+
   function renderChips() {
+    renderClearButton();
+    refreshNavLinks();
     const host = document.querySelector('#filter-chips');
     if (!host) return;
     host.innerHTML = '';
@@ -1058,8 +1373,19 @@ window.PM = (function () {
     buildFilterBar(state.filterBuilder || state.filterSpec);
   }
 
+  /**
+   * Back to a page nobody has filtered.
+   *
+   * This used to keep whatever time range was selected, which was defensible
+   * while a filter died with the page. Now that they follow you between
+   * pages, "clear all" has to be able to mean all of it - including the
+   * window, and including what is being carried, or the next click on the nav
+   * would bring everything back and the button would look broken.
+   */
   function resetFilters() {
-    state.filters = { range: state.filters.range || DEFAULT_RANGE };
+    state.filters = { range: DEFAULT_RANGE };
+    state.carried = {};
+    clearCarried();
     writeUrlState(true);
     rebuildFilterBar();
     emit('pm:filters');
@@ -1342,7 +1668,17 @@ window.PM = (function () {
       // The count is the only part of a nav row that needs /api/meta, so the row
       // goes up now and the number lands later.
       nav.append(
-        el('a', { href: '/' + p.file, class: state.activeFile === p.file ? 'active' : '' }, [
+        // The window travels in the href so it survives a middle-click into a
+        // new tab, which a store in this tab could not manage. `data-nav-to`
+        // is what refreshNavLinks rebuilds it from: this runs once at boot,
+        // and picking a different range afterwards has to move these links
+        // with it - otherwise the sidebar keeps handing on the window the
+        // page was opened with, which is how selecting 12h landed on 24h.
+        el('a', {
+          href: withFreshStart('/' + p.file),
+          'data-nav-to': '/' + p.file,
+          class: state.activeFile === p.file ? 'active' : '',
+        }, [
           el('span', { class: 'ico', text: p.icon }),
           el('span', { text: p.title }),
           p.countKey ? el('span', { class: 'count', 'data-count-key': p.countKey }) : null,
@@ -1579,8 +1915,7 @@ window.PM = (function () {
     const known = PAGES.find((p) => p.file === pageFile);
     state.page = known || { file: pageFile, title: opts.title || document.title };
     state.activeFile = opts.activeFile || pageFile;
-    state.filters = readUrlState();
-    if (!state.filters.range && !state.filters.from) state.filters.range = DEFAULT_RANGE;
+    initFilterState();
 
     // Frame first, then the requests. Waiting for /api/meta before drawing
     // anything left the window blank for as long as that query took.
@@ -1772,13 +2107,21 @@ window.PM = (function () {
    * row means; the modifier keys and the middle button keep their usual
    * meaning, so anyone who wants a second tab still gets one.
    */
+  /**
+   * Opens a row target, keeping the window the row was read under.
+   *
+   * Drilling from a table into one record and landing on a different time
+   * range means the detail page cannot be reconciled with the row that was
+   * clicked - the commonest way to be told a person "has no heartbeats".
+   */
   function openRow(href, event) {
+    const target = withWindow(href);
     const newTab = event && (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1);
     if (newTab) {
-      window.open(href, '_blank', 'noopener');
+      window.open(target, '_blank', 'noopener');
       return;
     }
-    location.href = href;
+    location.href = target;
   }
 
   /**
@@ -1825,6 +2168,9 @@ window.PM = (function () {
     setFilter,
     queryString,
     resetFilters,
+    withWindow,
+    withFreshStart,
+    initFilterState,
     openDrawer,
     pageTabs,
     closeDrawer,

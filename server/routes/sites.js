@@ -25,11 +25,18 @@ router.get('/sites', async (req, res, next) => {
 
     let occupancy = new Map();
     try {
-      const { col, base } = await collectionFor('snapshots');
+      const { col, base, name } = await collectionFor('snapshots');
       const match = F.and([base, F.snapshotMatch(req.query)]);
       const result = await col
         .aggregate(
-          P.latestPerUser({ match, postMatch: F.snapshotPostMatch(req.query), sort: { createdAt: -1 }, skip: 0, limit: 500 }),
+          P.latestPerUser({
+            match,
+            postMatch: F.snapshotPostMatch(req.query),
+            sort: { createdAt: -1 },
+            skip: 0,
+            limit: 500,
+            collection: name,
+          }),
           opts
         )
         .next();

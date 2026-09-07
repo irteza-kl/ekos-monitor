@@ -161,7 +161,8 @@ const computedFields = {
  * Documents with no user id are grouped under the "anonymous" bucket so the
  * dashboard still surfaces devices reporting without a session.
  */
-function latestPerUser({ match, postMatch, sort, skip, limit }) {
+function latestPerUser({ match, postMatch, sort, skip, limit, collection }) {
+  if (!collection) throw new Error('latestPerUser needs the collection name: it looks the winning document back up by _id');
   return [
     { $match: match || {} },
     // The instant each heartbeat happened, before anything is ordered by it.
@@ -169,31 +170,73 @@ function latestPerUser({ match, postMatch, sort, skip, limit }) {
     // syncing yesterday's backlog would otherwise present a stale fix as the
     // one describing where that person is right now.
     { $addFields: { [HEARTBEAT_AT]: heartbeatAtExpr() } },
-    { $sort: { [HEARTBEAT_AT]: -1 } },
+    // Down to the eight fields the grouping needs, and then no sort at all.
+    //
+    // This used to be `$sort: { _heartbeatAt: -1 }` over whole documents,
+    // followed by `$first: $$ROOT` to take each person's newest. That is a
+    // blocking sort over every heartbeat in range - hundreds of megabytes of
+    // full documents on an all-time query - and **this deployment does not
+    // honour allowDiskUse** (Atlas shared tiers ignore it; lib/fence.js
+    // records the same finding). So `/api/stats` with no filters died with
+    // "Sort exceeded memory limit of 33554432 bytes, but did not opt in to
+    // external sorting" while passing allowDiskUse: true.
+    //
+    // `$max` over an object compares field by field in declaration order, so
+    // `{ at, id }` maxed is the id of the newest heartbeat - the same answer
+    // the sort gave, computed in one streaming pass with memory proportional
+    // to the number of PEOPLE rather than the number of heartbeats. `at`
+    // decides; `id` only breaks a tie, and a heartbeat with no readable time
+    // loses to any that has one because null sorts below every date.
+    {
+      $project: {
+        _id: 1,
+        [HEARTBEAT_AT]: 1,
+        _u: { $ifNull: ['$' + SNAP.userId, 'anonymous'] },
+        _acc: '$' + SNAP.accuracy,
+        _in: '$isInsideGeofence',
+        _conn: '$isConnected',
+        _bat: '$batteryPercentage',
+        _site: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+      },
+    },
     {
       $group: {
-        _id: { $ifNull: ['$' + SNAP.userId, 'anonymous'] },
-        doc: { $first: '$$ROOT' },
+        _id: '$_u',
+        _newest: { $max: { at: '$' + HEARTBEAT_AT, id: '$_id' } },
         snapshotCount: { $sum: 1 },
         // First and last are about when the person was seen, so they run on the
         // same instant everything else is ordered by, not on arrival time.
         firstSeenAt: { $min: '$' + HEARTBEAT_AT },
         lastSeenAt: { $max: '$' + HEARTBEAT_AT },
-        avgAccuracy: { $avg: '$' + SNAP.accuracy },
-        worstAccuracy: { $max: '$' + SNAP.accuracy },
-        bestAccuracy: { $min: '$' + SNAP.accuracy },
-        insideCount: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
-        outsideCount: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },
-        offlineCount: { $sum: { $cond: [{ $eq: ['$isConnected', false] }, 1, 0] } },
-        minBattery: { $min: '$batteryPercentage' },
-        siteIds: { $addToSet: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] } },
+        avgAccuracy: { $avg: '$_acc' },
+        worstAccuracy: { $max: '$_acc' },
+        bestAccuracy: { $min: '$_acc' },
+        insideCount: { $sum: { $cond: [{ $eq: ['$_in', true] }, 1, 0] } },
+        outsideCount: { $sum: { $cond: [{ $eq: ['$_in', false] }, 1, 0] } },
+        offlineCount: { $sum: { $cond: [{ $eq: ['$_conn', false] }, 1, 0] } },
+        minBattery: { $min: '$_bat' },
+        siteIds: { $addToSet: '$_site' },
       },
     },
+    // The winning document itself, by _id: one indexed point lookup per person
+    // in place of ordering the whole collection to find it.
+    {
+      $lookup: {
+        from: collection,
+        localField: '_newest.id',
+        foreignField: '_id',
+        as: '_doc',
+      },
+    },
+    { $unwind: '$_doc' },
     {
       $replaceRoot: {
         newRoot: {
           $mergeObjects: [
-            '$doc',
+            '$_doc',
+            // Put back on the merged root: the sort below defaults to it, and
+            // it lives on the projection rather than on the stored document.
+            { [HEARTBEAT_AT]: '$_newest.at' },
             {
               _agg: {
                 snapshotCount: '$snapshotCount',

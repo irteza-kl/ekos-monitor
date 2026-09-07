@@ -196,7 +196,9 @@
           (row.clockedIn ? '<span class="badge badge-info">on clock</span>' : '') +
           '</div>' +
           (row.location ? '<div class="person-sub" style="margin-top:5px">' + fmt.coords(row.location) + ' · ' + fmt.ago(row.capturedAt) + '</div>' : '<div class="person-sub" style="margin-top:5px">no fix</div>') +
-          '<div style="margin-top:6px"><a href="/user.html?userId=' + (row.userId === null ? 'anonymous' : row.userId) + '" target="_blank" rel="noopener">Open user page ↗</a></div>' +
+          '<div style="margin-top:6px"><a href="' +
+          esc(PM.withWindow('/user.html?userId=' + (row.userId === null ? 'anonymous' : row.userId))) +
+          '" target="_blank" rel="noopener">Open user page ↗</a></div>' +
           (row.guide
             ? '<div class="person-sub" style="margin-top:4px;color:' +
               C.warning +

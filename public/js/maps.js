@@ -632,6 +632,10 @@ window.PMMap = (function () {
                 : 'Heartbeat ' + seq,
           sub: fmt.date(p.at),
           rows: [
+            // Only present when the trail holds more than one person, which is
+            // the case where an unnamed dot is useless - the Heartbeats page can
+            // be filtered to a whole fleet. popupCard drops a null row.
+            ['User', p.name || null],
             ['Position', fmt.coords(p)],
             ['Accuracy', fmt.accuracy(p.accuracy)],
             ['Fence', p.insideGeofence === true ? 'inside' : p.insideGeofence === false ? 'outside' : 'no flag'],

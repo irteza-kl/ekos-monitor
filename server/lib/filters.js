@@ -196,6 +196,22 @@ function snapshotMatch(q) {
   const reachable = bool(q.reachable);
   if (reachable !== null) clauses.push({ isReachable: reachable });
 
+  // "Offline" as the rows themselves report it, which is not either flag on
+  // its own: normalize.snapshot sets `offline` when EITHER isConnected or
+  // isReachable is false - no network at all, or a network the server cannot be
+  // reached through. Those are different failures with the same consequence,
+  // and the badge in the table is drawn from the pair. `connected` and
+  // `reachable` above stay field-level for asking about one of them; this one
+  // matches what the reader can see, so filtering to offline cannot return a
+  // row that is not badged offline, or hide one that is.
+  //
+  // A missing flag is not evidence of being offline - normalize reads it as
+  // false-y but not offline - so $ne: false, which matches missing, is the
+  // correct negation and not $eq: true.
+  const offline = bool(q.offline);
+  if (offline === true) clauses.push({ $or: [{ isConnected: false }, { isReachable: false }] });
+  if (offline === false) clauses.push({ isConnected: { $ne: false }, isReachable: { $ne: false } });
+
   const loggedIn = bool(q.loggedIn);
   if (loggedIn !== null) clauses.push({ isUserLoggedIn: loggedIn });
 

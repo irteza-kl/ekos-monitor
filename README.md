@@ -183,12 +183,91 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 | **Overview** | **What is wrong, first.** A severity strip opens the page - each tile carrying its change against the previous window of equal length - then the current-state tiles, then **time on site** measured per person, then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. The live map and the trend charts follow as context. |
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
-| **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. |
-| **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** (map, layer toolbar, its own time window, and a replay that walks the trail heartbeat by heartbeat), **history** charts, **heartbeats** (every stored document, paged, click a row for its fix on a map plus its full breakdown), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
+| **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. The **same trail map the user page has** sits above the table - the same Fixes limit, time window, State filter, merging, layer toolbar and replay - drawn from `/api/track` rather than from the table's own page of rows. |
+| **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** (map, layer toolbar, its own time window, and a replay that walks the trail heartbeat by heartbeat), **history** charts, **heartbeats** (every stored document, paged, click a row for its fix on a map plus its full breakdown, with its own time window and an **offline-only** toggle), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
 | **Geofence Sites** | The fence registry — centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
 | **Query Explorer** | Read-only `find`/`aggregate` console with the field inventory, canned recipes, explain plans, table/JSON views and JSON export. |
+
+### One trail map, two pages
+
+The trail panel is `public/js/trailmap.view.js`, and the user page and the
+Heartbeats page mount the same one. It carries the map, the layer toolbar, the
+Fixes limit, the time window, the State filter, Merge nearby, the replay, and the
+note that accounts for every heartbeat between the count above it and the marks
+on it.
+
+It lived inside `user.js`, so it belonged to one page and one person. The
+Heartbeats page first had no map at all, then a much thinner one - the table's
+own page of 100 rows, no Fixes control, no window, no State filter, no merging,
+no replay - which is two maps of one collection obeying different rules. Sharing
+it is the only thing that keeps them the same map.
+
+The split is: **the page owns fetching and the time window**, the panel owns
+everything else. The window has to stay with the page because it scopes the
+page's *other* queries too - the table, the tiles and the chart on the Heartbeats
+page, the Heartbeats tab on the user page - and a map narrowed to fifteen minutes
+beside a table still answering for the day is two numbers that cannot both be
+right.
+
+**`GET /api/track`** is the substrate. It honours every filter the bar can
+express, returns up to 100,000 lean points (seven small fields, names in a
+separate lookup rather than repeated per point), and reports what the note needs:
+`fetched`, `noFix`, `truncated`, `limit`, `ceiling`, the fix span, the fences
+those heartbeats touched, and how many distinct devices are in them. Two things
+about it are deliberate:
+
+- It **does not** filter out heartbeats with no coordinates in Mongo. One that
+  arrived without a fix is still a heartbeat and still in every count above the
+  map, and "some of my heartbeats are missing" can only be answered by naming
+  that number - impossible if the query silently dropped them.
+- It sorts and limits on `createdAt` because that is the indexed field and "the
+  newest N in range" is a question arrival order answers, then **reorders the
+  points by fix time**. For a device that synced a backlog those are different
+  orders, and a path drawn in arrival order runs backwards through time, which
+  makes every gap and every speed along it a measurement of the wrong pair.
+  `/api/users/:id/track` (the Live Map's short trails) now shares this builder
+  and is fixed by the same change - it had its own copy reading `createdAt` as
+  the heartbeat's time.
+
+**A path and a replay need one device's stream.** Both say "this device went from
+here to there", and across two people that is a journey nobody took. The caller
+decides: the user page always allows them, the Heartbeats page allows them only
+when the loaded fixes come from a single device (`streams <= 1`), and when it
+cannot, the panel drops the path, the Path chip and the replay and says why -
+in the replay bar and in the note. Chips for controls that could do nothing are
+dropped the same way: no Clock-ins chip on a page with no validation calls, no
+Geofences chip with no fences. A control that cannot do anything is worse than
+no control.
+
+Travelled distance is withheld across several devices. Summed over a fleet it is
+the total of unrelated journeys plus the gaps between them, which is not a number
+about anything, so `/api/track` returns `null` and the panel drops the clause
+rather than printing `travelled --`.
+
+### "Offline" is two flags, not one
+
+A heartbeat is badged offline when **either** `isConnected` or `isReachable` is
+false: no network at all, and a network the server cannot be reached through, are
+different failures with the same consequence. The offline-only toggle on the user
+page's Heartbeats tab matches exactly that (`offline=true`), so filtering to
+offline cannot return a row that is not badged offline, or hide one that is. A
+missing flag is not evidence of being offline, so the negation is `$ne: false` -
+which matches a missing field - and not `$eq: true`.
+
+The older `connected` and `reachable` filters are deliberately left alone: they ask
+about one field each, which is a different and still useful question. Worth knowing
+that the **Offline pings** tile on the Heartbeats page counts the narrow definition
+(`isConnected: false` only), so it can read lower than the number of rows the
+toggle returns.
+
+The toggle is scoped to the tab rather than added to the page filter bar. The bar
+re-scopes the whole page - the KPI tiles, the trail, the History charts - and "let
+me read the offline pings" is a question about one table, not a decision to view
+the person through an offline-only lens. The CSV button on that tab carries the
+toggle too; an export holding more rows than the table it came from is worse than
+no export.
 
 ### Map furniture
 
@@ -1016,6 +1095,82 @@ tri-state selects for clocked-in, inside-fence and connectivity; numeric thresho
 accuracy, battery and staleness; and free-text search. Picking several values inside a
 dropdown is debounced into a single request.
 
+### Filters follow you between pages
+
+Setting up a question on one page and clicking another used to throw the question away:
+the nav links are plain hrefs and the filters live in the query string, so they went with
+it. What travels now depends on **what kind of navigation it was**.
+
+| Navigation | What follows |
+| --- | --- |
+| **The sidebar** | the time window, and nothing else |
+| A crumb, a row click, an Overview tile | the window **and** the filters |
+
+The sidebar is the one navigation that means *a different question* - nothing about the
+row you were reading applies to the page you are going to - so those links start clean.
+Everything else in the app is a drill-down into the same question, and arriving with the
+filters dropped is what made drilling in useless.
+
+That intent has to travel **with** the navigation rather than sitting in a flag in this
+tab, or a middle-click into a new tab would get the wrong one and would leave the flag set
+for whatever the original tab did next. So a sidebar link carries `fresh=1`, and boot
+strips it from the address bar the moment it reads it - nothing can copy a link with it in.
+
+The **time window travels in the URL**. Every page has a date-range control and every
+server-side matcher applies it, so it means the same thing everywhere - which makes it
+safe to put in the link, where it stays visible in the address bar, copyable, and intact
+through a middle-click into a new tab. Every in-app link carries it. The Overview tiles
+are the case that matters - "12 devices offline" is a count *within a window*, and landing
+on a page answering for a different window gives a list that cannot be reconciled with the
+number just clicked.
+
+Those hrefs are **rebuilt whenever the window changes** (`refreshNavLinks`, from
+`renderChips`). They were built once in `renderShell`, so they kept handing on the window
+the page was *opened* with: select 12h, click Heartbeats, land on 24h.
+
+**Every other filter travels in a per-tab store**, and a page adopts one only if its own
+filter bar declares that key. Carrying them blindly would be worse than dropping them:
+`accuracyBand` means nothing to the geofence-check endpoint, so the chips would claim a
+filter the server never applied, and a narrowed number would be trusted that was not
+narrowed.
+
+Boot reads all of this in one place - `initFilterState`, called by boot and by its tests.
+It is a function rather than a block inside boot because the test harness was replaying it
+by hand, and a hand-written mirror of it went green on the fresh-start marker before boot
+had ever applied one.
+
+A filter a page cannot express is **passed through it, not dropped**. Heartbeats ->
+Geofence Checks -> Heartbeats is one click each way and has to arrive back at the same
+question, so the middle page carries the accuracy band without applying it, showing it, or
+counting it. This was a real bug on the way in - the first version rewrote the store from
+the current page only, so any page that could not express a filter silently destroyed it.
+
+**The URL always wins.** A link someone sent you describes the filters it carries, and
+nothing in this browser may quietly add to them. And a page identity is not a filter: the
+keys a page passes as `hideChips` (`userId` on the user page) are never stored, or every
+page opened afterwards would be silently narrowed to the record just being read.
+
+`sessionStorage`, not `localStorage`: this is the thread of one sitting at the console.
+Coming back tomorrow to yesterday's filters silently applied is a different and much
+worse surprise - **saved views** are the feature for keeping a question on purpose.
+
+### Clear all
+
+One button, in the filter bar, carrying the count of what is applied - **⟲ Clear all (3)**
+- and disabled when there is nothing to clear. It resets every control, returns the time
+range to the default, **and empties the carry**, including whatever was only passing
+through. All three matter: clearing the visible filters while the store still held them
+would put them back on the next click of the nav, and the button would look broken.
+
+It replaces **⟲ Reset**, which kept the selected time range. That was defensible while a
+filter died with its page; now that filters follow you around, the way out of them has to
+be able to mean all of them. The window counts as one filter however it is expressed, so a
+custom `from`+`to`+`range` reads as one, and paging and sorting are not counted at all.
+
+A non-default window is counted, so a sidebar click with 12h selected still reads
+**Clear all (1)**. That is honest rather than noisy: the window is the one filter that
+followed the click, and the button is what resets it.
+
 The accuracy-band dropdown now offers **Unknown (no accuracy)** alongside the five metre
 bands. `filters.js` has always matched that band and every row can already be labelled with
 it - a fix that arrived with no accuracy at all - but it was never listed, so the one band
@@ -1085,6 +1240,65 @@ one fence sits exactly on site 12's recorded centre with the same 20 m radius (1
 windows), while four others sit ~29 m away with a 100 m radius and are correctly left
 as an unmapped fence rather than folded into site 12.
 
+## This cluster does not honour `allowDiskUse`
+
+`GET /api/stats` with no filters returned a 500:
+
+```
+Sort exceeded memory limit of 33554432 bytes, but did not opt in to external sorting.
+code: 292, codeName: QueryExceededMemoryLimitNoDiskUseAllowed
+```
+
+**The pipeline was passing `allowDiskUse: true`.** That is what makes this a finding
+rather than an oversight: the server ignores it (Atlas shared tiers do), so every
+blocking sort has a hard 32 MB ceiling and no amount of opting in will move it.
+`lib/fence.js` had already recorded the same thing in a comment and worked around it;
+nothing else had.
+
+So the fix is never "add `allowDiskUse`" - it is **do not sort whole documents**.
+
+**`pipelines.latestPerUser`** was the one that failed. It sorted every heartbeat in
+range, whole documents, purely so `$first: '$$ROOT'` could take each person's newest -
+hundreds of megabytes on an all-time query. It now groups without sorting at all:
+
+```js
+_newest: { $max: { at: '$_heartbeatAt', id: '$_id' } }
+```
+
+`$max` over an object compares field by field in declaration order, so `at` decides and
+`id` only breaks a tie. That is the same instant the sort chose, in one streaming pass,
+with memory proportional to the number of **people** rather than the number of
+heartbeats - and it is deterministic on ties, which `$first` over equal keys never was.
+The winning document is then fetched back with a `$lookup` on `_id`: one indexed point
+lookup per person. Callers pass the collection name for that lookup, and
+`latestPerUser` throws without it rather than building a `$lookup` with `from:
+undefined` that would silently return nothing.
+
+**The two heartbeat feeds** (`/api/snapshots` and `/api/snapshots.csv`) had the identical
+defect - `$addFields` then `$sort` over whole documents - and were one click away from
+it, since the Heartbeats page offers "All time". They now order a projection of six
+small fields and fetch the page back by `_id`. Two things fell out of that:
+
+- **`total` is now honest.** The post-match sat *inside* the `$facet` after
+  `$skip`/`$limit`, so it filtered the page while `total` counted rows it had never been
+  applied to. It runs before the sort now.
+- **Sorting by a computed column works at all.** `computedFields` (`ageMinutes`,
+  `accuracyBand`) was added inside the facet, *after* the `$sort`, so ordering by either
+  ordered by a field that did not exist yet.
+
+Reordering after the second query matters and is tested with a stub that deliberately
+hands the documents back reversed: `$in` does not preserve order and neither does the
+storage engine, so the sort would be quietly lost between the two queries.
+
+**`attribution.nameDirectMatches`** had the same unbounded sort - every heartbeat those
+users had ever sent, ordered to read one name off the newest - and was one wide
+exit-window query from the same failure. Same `$max`-over-an-object treatment.
+
+**Deliberately left alone:** the exit-windows list sorts its documents after
+`$addFields`, which is the same shape. There are 35 exit windows in this store and they
+accrue one per fence departure, not one per heartbeat every few seconds, so the ceiling
+is nowhere in sight. It is the same pattern, not the same risk.
+
 ## Indexes
 
 **These are now created on the staging cluster.** All twelve were missing except
@@ -1114,6 +1328,7 @@ GET  /api/health                     GET /api/meta          GET /api/stats
 GET  /api/users                      GET /api/users.csv     GET /api/users/:id
 GET  /api/users/:id/track            GET /api/snapshots     GET /api/snapshots.csv
 GET  /api/snapshots/:id              (one heartbeat document, redacted)
+GET  /api/track                      (the trail, any filter, up to 100k lean points)
 GET  /api/logs                       GET /api/logs.csv      GET /api/logs/:id
 GET  /api/exit-windows               GET /api/exit-windows.csv
 GET  /api/exit-windows/:id           GET /api/sites         GET /api/sites.csv
