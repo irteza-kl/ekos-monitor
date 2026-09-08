@@ -33,6 +33,25 @@ window.PMHeartbeats = (function () {
    * silence. These are the conditions that legitimately stop an app reporting;
    * anything else is called unexplained rather than guessed at.
    */
+  /**
+   * Which fence the verdict above is about.
+   *
+   * By name when the heartbeat carried the site record, by id when it came
+   * from a build that does not send one yet, and "unmapped" when the device
+   * was not clocked into anything - which is a different thing from being
+   * outside a fence, and the column has to be able to say so.
+   */
+  function siteSub(row) {
+    const site = row.site;
+    const name = site && (site.name || site.label);
+    if (name) {
+      const title = PM.siteTitle(site, row.jobSiteId);
+      return '<div class="person-sub" title="' + esc(title) + '">' + esc(name) + '</div>';
+    }
+    if (row.jobSiteId != null) return '<div class="person-sub">site ' + row.jobSiteId + '</div>';
+    return '<div class="person-sub hint">not clocked into a site</div>';
+  }
+
   function gapCause(before) {
     if (!before) return { label: '? unexplained', tone: 'warning' };
     if (before.isUserLoggedIn === false) return { label: 'logged out', tone: 'neutral' };
@@ -193,8 +212,14 @@ window.PMHeartbeats = (function () {
             : '<span class="badge badge-warning" title="user logged out">✕ out</span>') +
           '</td>',
         '<td>' + (row.clockedIn ? '<span class="badge badge-info">IN</span>' : '<span class="badge badge-neutral">—</span>') + '</td>',
+        // The fence verdict, and which fence it is a verdict about. "Inside"
+        // on its own is unreadable when a person can be inside any of four
+        // sites, and the answer was two columns away under the coordinates -
+        // where a heartbeat that arrived without a fix could not show it at
+        // all, even though it still knows its site.
         '<td>' + PM.geofenceBadge(row.isInsideGeofence, row.computedVerdict, row.verdictReason) +
           (row.verdictDisagrees ? ' <span class="badge badge-critical" title="app flag and geometry disagree">⚑</span>' : '') +
+          siteSub(row) +
           '</td>'
       );
       if (options.silence) {
@@ -211,7 +236,7 @@ window.PMHeartbeats = (function () {
         '<td class="num">' + PM.batteryBadge(row.battery) + '</td>',
         '<td class="mono">' +
           (row.location
-            ? fmt.coords(row.location) + (row.jobSiteId != null ? '<div class="person-sub">site ' + row.jobSiteId + '</div>' : '')
+            ? fmt.coords(row.location)
             : '<span class="badge badge-neutral">no fix</span>') +
           '</td>',
         '<td class="num">' + PM.accuracyBadge(row.accuracyBand, row.accuracy) + '</td>'
@@ -353,6 +378,9 @@ window.PMHeartbeats = (function () {
     panel.append(
       el('div', { class: 'section-title', text: 'Against the fence' }),
       PM.kv([
+        // The site leads: the numbers below are all relative to it, and a
+        // reader who does not know which place this is cannot use any of them.
+        ['Site', siteLine(row)],
         ['Verdict', PM.geofenceBadge(row.isInsideGeofence, row.computedVerdict, row.verdictReason)],
         ['Accuracy', PM.accuracyBadge(row.accuracyBand, row.accuracy)],
         [
@@ -449,6 +477,46 @@ window.PMHeartbeats = (function () {
     // dropped by whichever comes first.
     drawerTeardown.push(() => window.removeEventListener('pm:drawer-tab', onTab));
   }
+  /**
+   * The site this heartbeat was clocked into, spelled out for a drawer.
+   *
+   * Says where the answer came from. `siteDetails` on the heartbeat is the
+   * record the app handed the device at that moment, so it is the site as it
+   * was then; anything else is the registry`s current view, looked up by id.
+   * When the fence has changed since, that is stated rather than smoothed
+   * over - this heartbeat was judged against the older boundary.
+   */
+  function siteLine(row) {
+    const site = row.site;
+    if (!site && row.jobSiteId == null) return '<span class="hint">not clocked into a site</span>';
+    if (!site) return 'Site ' + row.jobSiteId + ' <span class="hint">- nothing on record about it</span>';
+    const name = site.name || site.label;
+    const parts = [];
+    parts.push(
+      name
+        ? '<b>' + esc(name) + '</b> <span class="hint">site #' + site.siteId + '</span>'
+        : 'Site ' + site.siteId
+    );
+    if (site.source === 'heartbeat' || site.source === 'heartbeat+registry') {
+      parts.push('<span class="hint">as the device had it at the time</span>');
+    } else {
+      parts.push('<span class="hint">from the site registry - this heartbeat carried only the id</span>');
+    }
+    if (site.radiusChanged) {
+      parts.push(
+        '<span class="badge badge-warning" title="the fence has been edited since this heartbeat">judged against a ' +
+          fmt.metres(site.radiusChanged.then) +
+          ' fence; it is ' +
+          fmt.metres(site.radiusChanged.now) +
+          ' now</span>'
+      );
+    }
+    if (site.deletedAt) {
+      parts.push('<span class="badge badge-serious" title="the site record is soft-deleted">site deleted</span>');
+    }
+    return parts.join(' ');
+  }
+
   /** Everything one heartbeat document knows, in a drawer. */
   function drawer(row) {
     releaseDrawer();
@@ -500,7 +568,8 @@ window.PMHeartbeats = (function () {
                         ' · ' + fmt.metres(rel.distanceFromCenter) + ' from the centre · bearing ' + rel.bearing + '° ' + rel.compass,
                     ]
                   : undefined,
-                ['Site', row.jobSiteId != null ? 'Site ' + row.jobSiteId + (row.site && row.site.address ? ' · ' + esc(row.site.address) : '') : 'unmapped'],
+                ['Site', siteLine(row)],
+                ['Site address', (row.site && row.site.address) || undefined],
                 ['Geofence entered', fmt.dateIn(row.geofenceIn, row.timezone)],
                 ['Geofence left', fmt.dateIn(row.geofenceOut, row.timezone)],
               ]),

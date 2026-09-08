@@ -11,7 +11,7 @@
   PM.boot('sites.html', async ({ root, meta }) => {
     PM.buildFilterBar(() => [
       { kind: 'daterange' },
-      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'id', 'snapshots') },
+      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'label', 'snapshots') },
       { kind: 'multi', key: 'tenantId', label: 'Tenant', options: PM.optionsFrom(meta.tenants || [], 'id', 'name', 'snapshots') },
       { kind: 'tri', key: 'clockedIn', label: 'Occupants clocked in', yes: 'On the clock', no: 'Off the clock' },
     ]);
@@ -155,9 +155,15 @@
           class: 'clickable',
           onclick: () => openSite(site),
           html:
-            '<td><b>' + (site.siteId != null ? 'Site ' + site.siteId : 'Fence') + '</b>' +
-            '<div class="person-sub" title="' + esc(site.address || '') + '">' +
-            esc(site.address || 'no address on record') + '</div></td>' +
+            // The name the site actually has. It used to print "Site 12", or
+            // the bare word "Fence" for a fence with no id - neither of which
+            // names anything a person would recognise. The id rides along as a
+            // chip because the filters and the CSVs all key on it.
+            '<td><b>' + esc(site.displayName || 'Unmapped fence') + '</b>' +
+            (site.siteId != null ? ' <span class="chip" style="padding:1px 5px;font-size:11px">#' + site.siteId + '</span>' : '') +
+            (site.deleted ? ' <span class="badge badge-serious" title="the site record is soft-deleted, but devices are still reporting into it">deleted</span>' : '') +
+            '<div class="person-sub" title="' + esc(addressTitle(site)) + '">' +
+            addressLine(site) + '</div></td>' +
             '<td class="mono">' + (site.plottable ? fmt.coords(site) : '--') +
             '<div class="person-sub">' + centreNote(site) + '</div></td>' +
             '<td class="num">' + radiusCell(site) + '</td>' +
@@ -178,6 +184,35 @@
   /* Where the plotted centre came from. An estimate says so, with the
      evidence behind it, because a coordinate that looks recorded and is not
      is worse than no coordinate at all. */
+  /**
+   * The address line under the name, and what it is.
+   *
+   * `nameSource` matters here: when the name IS the address there is no point
+   * printing it twice, and when there is no name at all the reader has to know
+   * that the line above is a fallback rather than what the site is called.
+   */
+  const NAME_SOURCE = {
+    record: 'the site\u2019s own name, from its record',
+    address: 'no name on the record - the address identifies it',
+    place: 'no name or address on the record - this is the city and country',
+    id: 'nothing on the record but an id',
+    none: 'a fence with no site id at all',
+  };
+
+  function addressLine(site) {
+    if (site.nameSource === 'address') return '<span class="hint">' + esc(NAME_SOURCE.address) + '</span>';
+    if (site.address) return esc(site.address);
+    const place = [site.city, site.state, site.country].filter(Boolean).join(', ');
+    if (place) return esc(place);
+    return '<span class="hint">' + esc(NAME_SOURCE[site.nameSource] || 'no address on record') + '</span>';
+  }
+
+  function addressTitle(site) {
+    const parts = [site.address, NAME_SOURCE[site.nameSource]].filter(Boolean);
+    if (site.recordUpdatedAt) parts.push('record updated ' + fmt.date(site.recordUpdatedAt));
+    return parts.join(' - ');
+  }
+
   function centreNote(site) {
     const e = site.centreEstimate;
     if (site.centreSource === 'geofence-log') return 'from geofence log';
@@ -240,9 +275,29 @@
     return parts.join(' ');
   }
 
+
+  /**
+   * Leaflet holds window listeners and tile caches until `remove()` is
+   * called; openDrawer only wipes the body, which detaches the container and
+   * leaves the map alive. Five row clicks left five maps running - measured
+   * in a browser, not inferred. `pm:drawer-close` already exists for exactly
+   * this (heartbeats.view.js has used it since the drawer map was added).
+   */
+  let drawerMap = null;
+  function releaseDrawerMap() {
+    if (!drawerMap) return;
+    try {
+      drawerMap.remove();
+    } catch (err) {
+      /* the container went with the drawer body */
+    }
+    drawerMap = null;
+  }
+  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+
   function openSite(site) {
     PM.openDrawer({
-      title: site.siteId != null ? 'Site ' + site.siteId : 'Unmapped fence',
+      title: PM.siteName(site, site.siteId),
       subtitle: site.address || 'no address on record',
       tabs: [
         {
@@ -251,7 +306,9 @@
           render: (host) => {
             const mapHost = el('div', { class: 'map mini', style: 'height:320px' });
             host.append(mapHost, el('div', { html: PMMap.legend() }));
+            releaseDrawerMap();
             const m = PMMap.create(mapHost);
+            drawerMap = m;
             setTimeout(() => m.invalidateSize(), 60);
             const points = [];
             if (site.plottable) {

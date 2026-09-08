@@ -23,7 +23,7 @@
         label: 'Device',
         options: PM.optionsFrom(meta.deviceTypes || [], 'key', 'key', 'count'),
       },
-      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'id', 'snapshots') },
+      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'label', 'snapshots') },
       {
         kind: 'multi',
         key: 'accuracyBand',
@@ -41,6 +41,17 @@
       el('div', { class: 'tiles', id: 'issue-summary' }),
       el('div', { class: 'section-title', text: 'Current state' }),
       el('div', { class: 'tiles', id: 'tiles' }),
+      el('div', { class: 'section-title', text: 'On the clock' }),
+      el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          el('h2', { text: 'Who is working, and whether their device agrees' }),
+          el('span', { class: 'sub', id: 'now-sub' }),
+          el('div', { class: 'spacer' }),
+          el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
+        ]),
+        el('div', { class: 'card-body' }, [el('div', { class: 'tiles tiles-4', id: 'now-tiles' })]),
+        el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'now-table' })]),
+      ]),
       el('div', { class: 'section-title', text: 'Time on site' }),
       el('div', { class: 'card' }, [
         el('div', { class: 'card-head' }, [
@@ -138,6 +149,10 @@
         el('div', { class: 'card' }, [
           el('div', { class: 'card-head' }, [
             el('h2', { text: 'Per-user activity' }),
+            // Spelled out because there are now two tables of people on this
+            // page and they answer different questions: this one totals the
+            // whole window, the roster above is each person's newest heartbeat.
+            el('span', { class: 'sub', text: 'totals across the selected range, not the current state' }),
             el('div', { class: 'spacer' }),
             el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
           ]),
@@ -199,6 +214,8 @@
       '#chart-device': 'chart',
       '#chart-sites': 'chart',
       '#chart-checks': 'chart',
+      '#now-tiles': 'tiles:4',
+      '#now-table': 'table:6x7',
       '#user-table': 'table:8x7',
       '#check-tiles': 'tiles:5',
     });
@@ -243,8 +260,11 @@
     }
     if (users) {
       renderMap(users.rows);
+      // Same rows the map is drawn from - the newest heartbeat per person - so
+      // the roster and the dots on the map can never disagree.
+      renderNow(users.rows);
     } else {
-      panelFailed('#overview-map');
+      panelFailed('#overview-map', '#now-tiles', '#now-table');
     }
     if (problems) renderWorstUsers(problems);
     const c = (problems || {}).counts || {};
@@ -730,13 +750,210 @@
 
     const sites = (stats.topSites || []).filter((s) => s.siteId !== null);
     PMChart.groupedBars(document.querySelector('#chart-sites'), {
-      labels: sites.map((s) => 'Site ' + s.siteId),
+      // Places, not numbers. A bar chart of "Site 12, Site 28, Site 63" is a
+      // chart nobody can read without a second window open.
+      labels: sites.map((s) => PM.siteName(s, s.siteId)),
       horizontal: true,
       datasets: [
         { label: 'Inside fence', data: sites.map((s) => s.inside), color: C.in },
         { label: 'Outside fence', data: sites.map((s) => s.outside), color: C.out },
       ],
     });
+  }
+
+  /* ------------------------------------------------------ on the clock
+     The tiles above count how many people are clocked in. This says WHO,
+     and - the part that matters - whether the claim is still true.
+
+     "Clocked in" is a flag on a heartbeat, not a live fact. A device that
+     dies mid-shift, or an app that never sends the clock-out, leaves a
+     person flagged on the clock indefinitely. This store has one right now:
+     clocked in yesterday afternoon, last heartbeat 21 hours ago, still
+     counted in the total. Counting it is not wrong, but presenting it
+     without the silence is, so the roster grades every row by how recently
+     the device actually reported.
+
+     Everything here comes from the newest heartbeat per person that
+     /api/users already returns - the same rows the map is drawn from - so
+     the section costs no extra request. It is therefore scoped to the
+     page`s time range like everything else, which the subtitle says out
+     loud: narrow the range and people who have not reported inside it drop
+     out of the roster entirely. */
+
+  /** Minutes since the last heartbeat, and what that means. */
+  const REPORTING = [
+    { key: 'live', upTo: 5, label: 'reporting', tone: 'good' },
+    { key: 'quiet', upTo: 60, label: 'quiet', tone: 'info' },
+    { key: 'silent', upTo: Infinity, label: 'silent', tone: 'serious' },
+  ];
+
+  function reportingState(row) {
+    const age = row.ageMinutes;
+    if (age === null || age === undefined) return { key: 'unknown', label: 'no readable clock', tone: 'warning' };
+    return REPORTING.find((r) => age < r.upTo);
+  }
+
+  function renderNow(users) {
+    const host = document.querySelector('#now-table');
+    const tiles = document.querySelector('#now-tiles');
+    const sub = document.querySelector('#now-sub');
+    if (!host || !tiles) return;
+    host.innerHTML = '';
+    tiles.innerHTML = '';
+
+    const rows = (users || []).slice();
+    if (!rows.length) {
+      host.append(el('div', { class: 'empty', text: 'No device reported in this range.' }));
+      if (sub) sub.textContent = '';
+      return;
+    }
+
+    const onClock = rows.filter((r) => r.clockedIn);
+    const live = rows.filter((r) => reportingState(r).key === 'live');
+    const silentOnClock = onClock.filter((r) => reportingState(r).key === 'silent');
+    const outside = onClock.filter((r) => r.isInsideGeofence === false || r.computedVerdict === 'out');
+    const offClockButLive = live.filter((r) => !r.clockedIn);
+
+    tiles.append(
+      tile('On the clock', fmt.int(onClock.length), {
+        note: onClock.length ? insideNote(onClock) : 'nobody is clocked in',
+      }),
+      tile('Reporting now', fmt.int(live.length), {
+        note: 'a heartbeat in the last 5 minutes',
+        tone: live.length ? undefined : 'warning',
+      }),
+      tile('On the clock but silent', fmt.int(silentOnClock.length), {
+        note: silentOnClock.length ? 'flagged working, no heartbeat for over an hour' : 'every working device is reporting',
+        tone: silentOnClock.length ? 'serious' : undefined,
+      }),
+      tile('Outside their fence', fmt.int(outside.length), {
+        note: offClockButLive.length ? fmt.int(offClockButLive.length) + ' more reporting off the clock' : 'of the people on the clock',
+        tone: outside.length ? 'warning' : undefined,
+      })
+    );
+
+    if (sub) {
+      // "in the last 3 hours" / "in all time" / "in 08 Sep 09:00 to now" -
+      // rangeLabel returns the phrase without a preposition.
+      sub.textContent =
+        'newest heartbeat per person in ' + PM.rangeLabel() + ' · ' + fmt.int(rows.length) + ' device(s)';
+    }
+
+    // On the clock first, then the quietest - a working device that has gone
+    // silent is the row somebody needs to see, so it sorts to the top of its
+    // group rather than being buried by whoever reported most recently.
+    rows.sort((a, b) => {
+      if (!!b.clockedIn !== !!a.clockedIn) return b.clockedIn ? 1 : -1;
+      return (b.ageMinutes || 0) - (a.ageMinutes || 0);
+    });
+
+    const table = el('table');
+    table.innerHTML =
+      '<thead><tr><th>Person</th><th>Clock</th><th>Site</th><th>Fence</th><th>Last heartbeat</th>' +
+      '<th class="num">Battery</th><th class="num">Accuracy</th></tr></thead>';
+    const body = el('tbody');
+    for (const r of rows) {
+      const state = reportingState(r);
+      body.append(
+        el('tr', {
+          class: 'clickable',
+          title: 'Open this user',
+          onclick: (event) =>
+            PM.openRow('/user.html?userId=' + (r.userId === null ? 'anonymous' : r.userId), event),
+          html:
+            personCell(r) +
+            '<td>' + clockCell(r) + '</td>' +
+            '<td>' + siteCell(r) + '</td>' +
+            '<td>' + fenceCell(r) + '</td>' +
+            '<td><span class="badge badge-' + state.tone + '">' + esc(state.label) + '</span>' +
+            '<div class="person-sub">' + esc(fmt.ago(r.capturedAt)) + '</div></td>' +
+            '<td class="num">' + PM.batteryBadge(r.battery) + '</td>' +
+            '<td class="num">' + PM.accuracyBadge(r.accuracyBand, r.accuracy) + '</td>',
+        })
+      );
+    }
+    table.append(body);
+    host.append(table);
+  }
+
+  /** "3 of 5 inside their fence" - the shape of the shift in one line. */
+  function insideNote(onClock) {
+    const inside = onClock.filter((r) => r.isInsideGeofence === true).length;
+    return inside + ' of ' + onClock.length + ' inside their fence';
+  }
+
+  function personCell(r) {
+    return (
+      '<td><div class="person"><div class="avatar">' +
+      esc(fmt.initials(r.name)) +
+      '</div><div class="person-main"><div class="person-name">' +
+      esc(r.name || 'Unidentified device') +
+      '</div><div class="person-sub">' +
+      esc(r.employeeRef || r.tenantName || (r.userId === null ? 'no session' : 'id ' + r.userId)) +
+      (r.offline ? ' · <span class="hint">offline</span>' : '') +
+      '</div></div></div></td>'
+    );
+  }
+
+  /**
+   * On the clock, and for how long.
+   *
+   * The duration is measured from the clock-in on the time entry, not from
+   * the heartbeat, so it keeps counting while a device is silent - which is
+   * precisely the case worth seeing: "on the clock 22 h" beside "silent"
+   * says the shift was never closed.
+   */
+  function clockCell(r) {
+    if (!r.clockedIn) return '<span class="badge badge-neutral">off</span>';
+    const since = r.timeEntry && r.timeEntry.clockIn;
+    const minutes = since ? (Date.now() - new Date(since).getTime()) / 60000 : null;
+    return (
+      '<span class="badge badge-info">on</span>' +
+      (minutes !== null && Number.isFinite(minutes)
+        ? '<div class="person-sub" title="clocked in ' + esc(fmt.date(since)) + '">' +
+          esc(fmt.duration(minutes)) + '</div>'
+        : '')
+    );
+  }
+
+  function siteCell(r) {
+    const site = r.site;
+    const name = site && (site.name || site.label);
+    if (!name && r.jobSiteId == null) return '<span class="hint">not clocked into a site</span>';
+    if (!name) return 'Site ' + r.jobSiteId;
+    return (
+      '<span title="' +
+      esc([name, site.address].filter(Boolean).join(' - ')) +
+      '">' +
+      esc(name) +
+      '</span>'
+    );
+  }
+
+  /**
+   * The verdict, and how far outside when it is outside.
+   *
+   * Nothing at all when there is no site to be inside or outside OF. The device
+   * keeps its last geofence flag after a clock-out, so a row could otherwise
+   * read "not clocked into a site" and "inside" side by side - a verdict about
+   * a fence the row has just said it does not have.
+   */
+  function fenceCell(r) {
+    const hasSite = !!(r.site || r.jobSiteId != null);
+    if (!hasSite && !r.computedVerdict) {
+      return '<span class="hint" title="the device still carries its last geofence flag, but it is not clocked into a site for that flag to be about">no fence to judge</span>';
+    }
+    const badge = PM.geofenceBadge(r.isInsideGeofence, r.computedVerdict, r.verdictReason);
+    if (!r.relation) return badge;
+    const d = r.relation.distanceFromBoundary;
+    if (d === null || d === undefined) return badge;
+    return (
+      badge +
+      '<div class="person-sub">' +
+      esc(fmt.metres(Math.abs(d))) +
+      (r.relation.inside ? ' inside the boundary' : ' outside · ' + esc(r.relation.compass || '')) +
+      '</div>'
+    );
   }
 
   function renderUserTable(perUser) {

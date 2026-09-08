@@ -144,6 +144,12 @@ const SNAP = {
   build: 'buildVersion.buildVersion',
   jobSiteId: 'clockedInJobDetail.jobSiteId',
   jobSiteIdAlt: 'clockedInJobSiteLocation.jobSiteId',
+  // The site's own record, embedded on the heartbeat: name, address, centre
+  // and radius. This is the only authoritative site data in the store -
+  // validateClockInLogs, which used to be, holds nothing.
+  site: 'siteDetails',
+  siteRecordId: 'siteDetails.id',
+  siteName: 'siteDetails.name',
 };
 
 /**

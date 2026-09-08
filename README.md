@@ -187,7 +187,7 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 | **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** (map, layer toolbar, its own time window, and a replay that walks the trail heartbeat by heartbeat), **history** charts, **heartbeats** (every stored document, paged, click a row for its fix on a map plus its full breakdown, with its own time window and an **offline-only** toggle), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
-| **Geofence Sites** | The fence registry — centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
+| **Geofence Sites** | The fence registry — **name**, centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
 | **Query Explorer** | Read-only `find`/`aggregate` console with the field inventory, canned recipes, explain plans, table/JSON views and JSON export. |
 
 ### One trail map, two pages
@@ -256,11 +256,17 @@ offline cannot return a row that is not badged offline, or hide one that is. A
 missing flag is not evidence of being offline, so the negation is `$ne: false` -
 which matches a missing field - and not `$eq: true`.
 
-The older `connected` and `reachable` filters are deliberately left alone: they ask
-about one field each, which is a different and still useful question. Worth knowing
-that the **Offline pings** tile on the Heartbeats page counts the narrow definition
-(`isConnected: false` only), so it can read lower than the number of rows the
-toggle returns.
+The **Connectivity** control and the **Offline pings** tile now use that same rule.
+They used to count `isConnected` alone, and in this store `isReachable` is the
+dominant signal: **512 heartbeats are badged offline, 164 have `isConnected: false`**.
+So the filter returned a third of the matching rows and the tile under-reported 3x -
+a monitoring console disagreeing with its own badges. Measured before and after in a
+browser: the filter now returns 512, the tile reads 512, and every row it returns
+carries the badge.
+
+`connected` and `reachable` remain as URL and query-console parameters, because asking
+about one flag is a real question - it is just not the one a control labelled
+"Connectivity" is asking.
 
 The toggle is scoped to the tab rather than added to the page filter bar. The bar
 re-scopes the whole page - the KPI tiles, the trail, the History charts - and "let
@@ -677,6 +683,49 @@ distance to the boundary, site, lat/lng, accuracy band, battery, network and dev
 time. Wide rows scroll sideways inside the table rather than wrapping, and `↓ CSV`
 (`/api/snapshots.csv`) exports the same columns.
 
+### On the clock: who is working, and whether their device agrees
+
+The Current-state tiles could count clocked-in devices. They could not say **who**, and
+they could not say whether the claim is still true.
+
+"Clocked in" is a flag on a heartbeat, not a live fact. A device that dies mid-shift, or
+an app that never sends the clock-out, leaves somebody flagged on the clock indefinitely -
+and the tile keeps counting them. This store has one right now: clocked in yesterday
+afternoon, **22 hours on the clock, last heartbeat 22 hours ago**. Counting that is not
+wrong; presenting it without the silence is.
+
+So every row is graded by how recently the device actually reported:
+
+| | |
+| --- | --- |
+| **reporting** | a heartbeat in the last 5 minutes |
+| **quiet** | 5 to 60 minutes |
+| **silent** | over an hour - and if they are still flagged on the clock, that is the finding |
+
+The roster sorts on the clock first and, within that, **quietest at the top**, so the
+shift nobody closed is the first row rather than the last. Four tiles above it: on the
+clock (with how many are inside their fence), reporting now, on the clock but silent, and
+outside their fence - with off-clock devices that are still reporting mentioned rather
+than folded into the count, since they are a different question.
+
+Each row carries the site **by name**, the fence verdict with the margin ("11 m inside the
+boundary", "43 m outside · NNW"), how long the shift has been running measured from the
+clock-in rather than the heartbeat - so it keeps counting while a device is silent, which
+is the case worth seeing - and battery, accuracy and connectivity.
+
+A row with no site shows **"no fence to judge"** rather than a verdict. The device keeps
+its last geofence flag after clocking out, so the cell would otherwise read "not clocked
+into a site" and "inside" side by side - a verdict about a fence the row has just said it
+does not have.
+
+It costs no extra request: these are the same `/api/users` rows the map is drawn from -
+the newest heartbeat per person - so the roster and the dots can never disagree. That
+also means it is scoped to the page’s time range like everything else, which the subtitle
+states outright: narrow the range and people who did not report inside it leave the
+roster. **Per-user activity**, further down, is the other half - totals across the whole
+window rather than the current state - and now says so in its subtitle, because two
+tables of people on one page that answer different questions have to be told apart.
+
 ### The Overview leads with problems
 
 Counts are not findings. "9 devices reporting, median accuracy 14 m" says nothing
@@ -931,6 +980,90 @@ One trap worth recording: `toLocaleString` throws if `dateStyle`/`timeStyle` are
 combined with `timeZoneName`, and the throw landed in a fallback that quietly
 rendered the viewer’s time from the function whose entire purpose is not to. The
 options are spelt out component by component for that reason.
+
+### The site record, and what it unlocked
+
+The heartbeats now carry **`siteDetails`** - the site row itself, embedded whole: `id`,
+`name`, `address`, `latitude`, `longitude`, `radiusMeters`, `siteAreaId` and the record’s
+own `createdAt`/`updatedAt`. That is the first authoritative site data this store has ever
+held. `validateClockInLogs`, which used to be the only source of names, addresses and
+fences, holds **0 documents** - which is why every site read as "Site 12" with "no address
+on record" and every exit window read "unmapped fence". Nothing was broken; the data was
+absent.
+
+Two shape details matter and both bite:
+
+- `createdAt` and `updatedAt` inside the record are **strings**, not BSON dates, so they
+  are parsed rather than compared as dates.
+- `city`, `state`, `zipCode` and `formattedAddress` are **null**; only `address` and
+  `country` are populated. A name built from the city would be empty.
+
+It arrives gradually - at the time of writing 12 of 34,700 heartbeats carry it, all for
+one site - so **every reader has to work three ways**: a row with the record, a row with
+only a `jobSiteId`, and a row with neither. That is what the tests are mostly about.
+
+The geometry is good. Fixes sit a median **8.9 m** from the recorded centre against a 20 m
+radius, and the device’s own inside/outside flag agrees with the recorded circle on
+**100%** of them - so this is a boundary worth drawing and judging against.
+
+#### What it links
+
+| Where | Before | Now |
+| --- | --- | --- |
+| **Geofence Sites** | "Site 12", no address, no circle | **KL Building A**, its address, a real 20 m fence |
+| **Users & Devices** | "site 12" under the verdict | the site by name, under the fence verdict |
+| **Heartbeats** (page and user tab) | "site 12" under the coordinates | the name, moved **next to the Geofence verdict** |
+| **A heartbeat's drawer** | "Site 12 · address" in one line | the site leads *Against the fence*, with its address and provenance in *Details* |
+| **Exit Windows** | "unmapped fence" on all of them | 7 of 29 named from their own fence, 9 more shown as near misses |
+| **Site filter** | a list of numbers | `KL Building A · #12` |
+
+The id stays visible next to every name, because the filters, the CSVs and the
+cross-page links all key on the id - a row picked by name still has to be findable by
+number.
+
+The site sits **beside the fence verdict**, not beside the coordinates. "Inside" is
+unreadable when a person could be inside any of four sites, and under the coordinates it
+could not be shown at all for a heartbeat that arrived without a fix - even though such a
+heartbeat still knows which site it was clocked into. For the same reason a device that
+is not clocked in anywhere reads **"not clocked into a site"** rather than "unmapped":
+that is a different fact from being outside a fence, which the badge above it already
+states.
+
+#### Two sources per row, and neither replaces the other
+
+A row carries the record **the device had at the time** (`normalize.snapshot` reads
+`siteDetails` into `row.site`), and the registry carries the site **as it stands now**.
+`attachSite` merges them: the name and address come from the heartbeat, the geometry
+provenance from the registry.
+
+That is not redundancy. A site renamed or a fence moved since must not rewrite what an old
+row meant, and where the two disagree the row says so - `radiusChanged: { then: 100, now:
+20 }` means **this heartbeat was called inside against a boundary the site no longer has**.
+The store already shows this: exit windows carry a 100 m fence on site 12’s exact centre
+while the record says 20 m, so the fence was tightened and the older windows were judged
+against the wider one.
+
+#### Naming an exit window’s site
+
+These documents carry a fence but no site id, so the link is always made rather than read,
+and the column says which way:
+
+| Route | Evidence |
+| --- | --- |
+| `fence` | the window’s own fence sits on a fence the site has on record. No inference about people at all. |
+| `heartbeats` | the person this window was matched to was clocked into that site while it was open, per their own heartbeats. |
+| near miss | neither answered, but a recorded site is close - the distance is the finding. |
+
+The near miss is the case that earns its keep. Nine windows sit **31.4 m** from site 12’s
+centre with exactly its 20 m radius - almost certainly the same site after its centre was
+corrected. `FENCE_MATCH_METRES` is 30 m, so they do not match, and **widening it to make
+them fit would move a site on the map**. They are reported as "nearest is KL Building A,
+31 m away, with the same radius" instead, which says what is known without adopting it as
+the row’s identity.
+
+The nearest-site note is capped at 2 km. Unclamped, the nearest recorded site to a fence in
+Houston was one in Karachi **14,686 km** away, and printing that as "nearest" invites the
+reader to see a relationship that is not there.
 
 ### Where fence geometry comes from
 
@@ -1239,6 +1372,59 @@ the match distance - never presented as if the document named the site. It matte
 one fence sits exactly on site 12's recorded centre with the same 20 m radius (19
 windows), while four others sit ~29 m away with a 100 m radius and are correctly left
 as an unmapped fence rather than folded into site 12.
+
+### The same wall, a second time: `$facet` unbounds a sort
+
+`/api/snapshots` started returning the 32 MB sort error once the store passed ~30,000
+heartbeats. **My own regression, from the fix below.** That fix sorted a projection instead
+of whole documents, which was right, and then put the `$sort` immediately before a
+`$facet` that did the `$skip`/`$limit` - which is wrong, and only survived because the
+collection was small at the time.
+
+A `$sort` is only bounded when its `$limit` is **adjacent**: the planner then keeps just
+the top *k* rows. A `$facet` in between blocks that, so the sort materialises the entire
+matched set. Measured, the shapes are:
+
+```
+sort -> facet(skip, limit)      FAILS   the sort holds all 34,795 documents
+sort -> limit                   ok      bounded to 100
+facet(sort, skip, limit)        ok      bounded inside the branch
+```
+
+So the sort moved **inside** the `rows` branch, next to its `$limit`, and the `total`
+branch keeps no sort at all because counting is order-independent.
+
+That alone was not enough. The top-k bound is `skip + limit`, so a deep page degenerates
+to a full sort again - and **the last page of the unfiltered table was already deep enough
+to fail**, which makes this reachable rather than theoretical. The second half of the fix
+is `sortKeysOnly`: once `$addFields` has produced the computed sort keys, the raw fields
+they were derived from are dead weight, and they were riding through the sort at 258 bytes
+a document instead of about 40. With only the id and the sort key in flight, every skip
+works - including one past the end of the collection.
+
+`test-nosort` and `test-snapsort` now pin the stage order, so the next person to move that
+`$sort` back out has to argue with a test.
+
+## What a failure is allowed to say
+
+A 4xx carries its own message to the reader: those are written by `filters.badRequest`
+for exactly that purpose ("Operator $where is not allowed"), and hiding them would make
+the query console unusable.
+
+A 500 does not. It is whatever the driver threw, and those messages carry cluster
+hostnames, replica-set topology and sometimes the connection string - this project
+scrubs `mongodb://` out of its own diagnostic scripts for the same reason, then handed
+the raw message to the browser. Now the full error goes to the server log with a short
+reference, and the response carries only that reference:
+
+```json
+{ "error": "The server could not complete that request. Reference 696w26pz2v is in the server log.",
+  "ref": "696w26pz2v", "code": 2 }
+```
+
+The reference matters. "Unexpected error" with nothing else is impossible to chase
+through a log; a token that appears in both ends is one grep. Off production the
+message is still included as `detail`, because that is where you want it.
 
 ## This cluster does not honour `allowDiskUse`
 

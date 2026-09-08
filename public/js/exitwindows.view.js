@@ -40,6 +40,105 @@ window.PMExitWindows = (function () {
     return words.charAt(0).toUpperCase() + words.slice(1);
   }
 
+  /**
+   * Which site this window belongs to, and how that was established.
+   *
+   * These documents carry a fence but no site id, so the link is always made
+   * rather than read - and the cell has to say which way, because the two are
+   * different kinds of evidence and a reader chasing a wrong site needs to
+   * know which one to go and check:
+   *
+   *   fence       the window`s own fence sits on a fence the site has on
+   *               record. That is not an inference about people at all.
+   *   heartbeats  the person this window was matched to was clocked into that
+   *               site while it was open, per their own heartbeats.
+   *
+   * And when neither answers, the distance to the nearest recorded site is
+   * the finding. A bare "unmapped fence" says the same thing about a fence
+   * 31 m from a known site - a centre corrected since - as about one nobody
+   * has ever recorded, and those call for opposite actions.
+   */
+  function siteCell(row) {
+    const site = row.site;
+    if (site && site.siteId != null) {
+      const name = site.displayName || site.name || site.label || 'Site ' + site.siteId;
+      const badge =
+        site.method === 'heartbeats'
+          ? '<span class="badge badge-good" title="' + esc(site.note || '') + '">from heartbeats</span>'
+          : '<span class="badge badge-info" title="this window\u2019s own fence sits on the fence this site' +
+            ' has on record, so the link needs no inference about people">on its own fence</span>';
+      return (
+        '<b>' + esc(name) + '</b> <span class="hint">#' + site.siteId + '</span> ' + badge +
+        (site.nearestSiteId != null && site.nearestSiteId !== site.siteId
+          ? '<div class="person-sub">\u2691 the geometry points at ' + esc(site.nearestSiteName || ('site ' + site.nearestSiteId)) + ' instead</div>'
+          : '')
+      );
+    }
+    if (site && site.nearestSiteId != null) {
+      return (
+        '<span class="badge badge-warning" title="no site has this fence on record, and no heartbeat named one">unmapped fence</span>' +
+        '<div class="person-sub">nearest is <b>' +
+        esc(site.nearestSiteName || ('site ' + site.nearestSiteId)) +
+        '</b>, ' + fmt.metres(site.nearestMetres) + ' away' +
+        (site.nearestRadiusAgrees ? ' with the same radius' : '') +
+        '</div>'
+      );
+    }
+    return '<span class="badge badge-neutral" title="no site has this fence on record, no heartbeat named one, and nothing recorded is nearby">unmapped fence</span>';
+  }
+
+  /**
+   * The same finding as siteCell, spelled out for the drawer.
+   *
+   * The drawer is where somebody goes when the column looked wrong, so this
+   * states the route, the evidence behind it, and - when the two routes point
+   * different ways - both answers rather than the winner alone.
+   */
+  function siteEvidence(row) {
+    const site = row.site;
+    if (site && site.siteId != null) {
+      const name = site.displayName || site.name || site.label || 'Site ' + site.siteId;
+      const lines = ['<b>' + esc(name) + '</b> <span class="hint">site #' + site.siteId + '</span>'];
+      if (site.method === 'heartbeats') {
+        lines.push(esc(site.note || 'named from the heartbeats of the person this window was matched to') + '.');
+        lines.push(
+          'That is the app’s own record of where they were clocked in, so it does not depend on ' +
+            'the fence geometry agreeing.'
+        );
+      } else {
+        lines.push(
+          'This window’s fence sits on the fence this site has on record' +
+            (site.matchDistance != null ? ' (±' + site.matchDistance + ' m)' : '') +
+            (site.radiusAgrees ? ', with the same radius' : ', though the radius differs') +
+            '. The document itself carries no site id.'
+        );
+      }
+      if (site.nearestSiteId != null && site.nearestSiteId !== site.siteId) {
+        lines.push(
+          '⚑ The geometry points at <b>' +
+            esc(site.nearestSiteName || 'site ' + site.nearestSiteId) +
+            '</b> instead, ' +
+            fmt.metres(site.nearestMetres) +
+            ' away. The fence on this window is not the one the registry holds for the site the ' +
+            'person was clocked into.'
+        );
+      }
+      return lines.join('<div style="height:4px"></div>');
+    }
+    if (site && site.nearestSiteId != null) {
+      return (
+        'No site has this fence on record and no heartbeat named one. The nearest recorded site is <b>' +
+        esc(site.nearestSiteName || 'site ' + site.nearestSiteId) +
+        '</b>, ' +
+        fmt.metres(site.nearestMetres) +
+        ' away' +
+        (site.nearestRadiusAgrees ? ' with the same radius, which suggests a centre corrected since' : '') +
+        '.'
+      );
+    }
+    return 'No site has this fence on record, no heartbeat named one, and nothing recorded is nearby. Shown against its raw fence.';
+  }
+
   function statusBadge(row) {
     if (row.status === 'open') return '<span class="badge badge-warning">◐ Open</span>';
     if (row.status === 'expired') return '<span class="badge badge-serious">⧗ Expired</span>';
@@ -131,11 +230,7 @@ window.PMExitWindows = (function () {
           html:
             '<td class="mono">' + esc(row.id) + '<div class="person-sub">seq ' + row.seq + ' · rev ' + row.rev + '</div></td>' +
             '<td>' + attributionCell(row) + '</td>' +
-            '<td>' +
-            (row.site
-              ? 'Site ' + row.site.siteId +
-                ' <span class="badge badge-info" title="matched by fence centre, ±' + row.site.matchDistance + ' m - the document has no site id">≈</span>'
-              : '<span class="badge badge-neutral" title="no known site has this fence centre and radius">unmapped fence</span>') +
+            '<td>' + siteCell(row) +
             '<div class="person-sub" title="' + esc(row.siteAddress || '') + '">' +
             esc(row.siteAddress || (row.fence ? fmt.coords(row.fence) + ' · r ' + fmt.metres(row.fence.radius) : '')) +
             '</div></td>' +
@@ -159,13 +254,33 @@ window.PMExitWindows = (function () {
   }
 
   // ----------------------------------------------------------------- drawer --
+
+  /**
+   * Leaflet holds window listeners and tile caches until `remove()` is
+   * called; openDrawer only wipes the body, which detaches the container and
+   * leaves the map alive. Five row clicks left five maps running - measured
+   * in a browser, not inferred. `pm:drawer-close` already exists for exactly
+   * this (heartbeats.view.js has used it since the drawer map was added).
+   */
+  let drawerMap = null;
+  function releaseDrawerMap() {
+    if (!drawerMap) return;
+    try {
+      drawerMap.remove();
+    } catch (err) {
+      /* the container went with the drawer body */
+    }
+    drawerMap = null;
+  }
+  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+
   function openDetail(row) {
     PM.openDrawer({
       title: 'Exit window ' + row.id,
       subtitle:
         (row.employeeRef ? row.employeeRef + ' · ' : '') +
         (row.userId === null ? 'no session (userId null)' : 'user ' + row.userId) +
-        ' · ' + (row.jobSiteId != null ? 'site ' + row.jobSiteId : 'unmapped') +
+        ' · ' + (row.jobSiteId != null || row.site ? PM.siteName(row.site, row.jobSiteId) : 'unmapped') +
         ' · opened ' + fmt.date(row.openedAt),
       tabs: [
         { id: 'replay', label: 'Replay', render: (host) => renderReplay(host, row) },
@@ -183,7 +298,9 @@ window.PMExitWindows = (function () {
       mapHost,
       el('div', { html: PMMap.legend() })
     );
+    releaseDrawerMap();
     const map = PMMap.create(mapHost);
+    drawerMap = map;
     setTimeout(() => map.invalidateSize(), 60);
 
     const points = [];
@@ -206,7 +323,7 @@ window.PMExitWindows = (function () {
         radius: row.fence.radius,
         siteId,
         address: row.siteAddress || (row.site ? row.site.address : null),
-        label: siteId != null ? 'Site ' + siteId : 'Unmapped fence',
+        label: PM.siteName(row.site, siteId),
         radiusIsAuthoritative: onRecord,
         hasFence: onRecord,
         fenceOnRecord: onRecord,
@@ -310,11 +427,9 @@ window.PMExitWindows = (function () {
         ['Fence', row.fence ? fmt.coords(row.fence) + ' · radius ' + fmt.metres(row.fence.radius) : '--'],
         [
           'Site',
-          row.site
-            ? 'Site ' + row.site.siteId + ' - matched by fence centre (±' + row.site.matchDistance + ' m). The document itself carries no site id.'
-            : 'No known site has this fence centre and radius, so this window is shown against its raw fence.',
+          siteEvidence(row),
         ],
-        ['Site address', row.siteAddress || '--'],
+        ['Site address', row.siteAddress || (row.site && row.site.address) || '--'],
       ]),
       el('div', { class: 'section-title', text: 'Device diagnostics' }),
       PM.kv([

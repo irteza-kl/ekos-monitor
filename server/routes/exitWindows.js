@@ -69,6 +69,8 @@ router.get('/exit-windows.csv', async (req, res, next) => {
       { key: 'stats.maxDistanceFromBoundary', label: 'Max Distance Outside (m)', get: (r) => r.stats.maxDistanceFromBoundary },
       { key: 'stats.driftMetres', label: 'Total Drift (m)', get: (r) => r.stats.driftMetres },
       { key: 'site', label: 'Site (matched by fence centre)', get: (r) => (r.site ? r.site.siteId : null) },
+      { key: 'site.name', label: 'Site Name', get: (r) => (r.site ? r.site.displayName || r.site.name : null) },
+      { key: 'site.method', label: 'Site Matched By', get: (r) => (r.site ? r.site.method : null) },
       { key: 'siteAddress', label: 'Site Address' },
       { key: 'fence.lat', label: 'Fence Lat', get: (r) => (r.fence ? r.fence.lat : null) },
       { key: 'fence.lng', label: 'Fence Lng', get: (r) => (r.fence ? r.fence.lng : null) },

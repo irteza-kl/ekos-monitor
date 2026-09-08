@@ -55,7 +55,7 @@
       { kind: 'multi', key: 'userId', label: 'User', options: PM.optionsFrom(meta.users || [], 'id', 'name', 'snapshots') },
       { kind: 'multi', key: 'deviceType', label: 'Device', options: PM.optionsFrom(meta.deviceTypes || [], 'key', 'key', 'count') },
       { kind: 'multi', key: 'appVersion', label: 'App version', options: PM.optionsFrom(meta.appVersions || [], 'key', 'key', 'count') },
-      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'id', 'snapshots') },
+      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'label', 'snapshots') },
       { kind: 'multi', key: 'accuracyBand', label: 'Accuracy band', options: PM.optionsFrom(meta.accuracyBands || [], 'key', 'label') },
       {
         kind: 'multi',
@@ -65,7 +65,11 @@
       },
       { kind: 'tri', key: 'clockedIn', label: 'Clocked in', yes: 'On the clock', no: 'Off the clock' },
       { kind: 'tri', key: 'insideGeofence', label: 'Inside fence', yes: 'Inside', no: 'Outside', nullable: true },
-      { kind: 'tri', key: 'connected', label: 'Connectivity', yes: 'Online', no: 'Offline' },
+      // Keyed on `offline`, not `connected`. The control is labelled with what
+      // the row badge says, so it has to filter by the same rule - either flag
+      // false. `connected` and `reachable` remain as field-level parameters for
+      // the URL and the query console, where asking about one flag is the point.
+      { kind: 'tri', key: 'offline', label: 'Connectivity', yes: 'Offline', no: 'Online' },
       { kind: 'tri', key: 'hasLocation', label: 'Coordinates', yes: 'With a fix', no: 'Without a fix' },
       { kind: 'number', key: 'accuracyMax', label: 'Accuracy <= m', placeholder: 'e.g. 25' },
       { kind: 'number', key: 'accuracyMin', label: 'Accuracy >= m', placeholder: 'e.g. 50' },

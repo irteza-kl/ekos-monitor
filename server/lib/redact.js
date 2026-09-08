@@ -42,9 +42,19 @@ const PERSONAL_CONTEXT = /^(tenantAccount|accountDetails|currentUser|user|employ
 const IN_PERSON = [/^address$/i, /^addressLine/i, /^postCode$|^postalCode$|^zip$/i];
 
 function redactValue(value, parents, depth) {
-  if (depth > 12 || value === null || typeof value !== 'object') return value;
+  // The depth guard fails CLOSED. Returning the subtree untouched would
+  // hand back exactly the fields this exists to remove; a document that
+  // nests deeper than the redactor looks is not a document it can clear.
+  if (depth > 12) return REDACTED;
+  if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((v) => redactValue(v, parents, depth + 1));
   if (value instanceof Date) return value;
+  // A BSON wrapper is a scalar wearing an object costume. Recursing into
+  // one takes it apart: every Raw document tab was rendering `_id` as
+  // {"buffer":{"0":106,"1":160,...}} instead of the id, which is exactly
+  // the value somebody opens that tab to copy. lib/filters.assertReadOnly
+  // has had this guard all along; this is the same rule.
+  if (value._bsontype) return value;
 
   const inPerson = parents.some((p) => PERSONAL_CONTEXT.test(p));
   const out = {};

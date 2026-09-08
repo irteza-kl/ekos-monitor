@@ -47,6 +47,7 @@ const CACHE_TTL_MS = 60 * 1000;
 const MAX_SPAN_MS = 36 * 60 * 60 * 1000;
 const MAX_POINTS = 40000;
 
+const CACHE_MAX_KEYS = 8;
 const cache = new Map();
 
 /**
@@ -107,6 +108,12 @@ async function positionStream(fromMs, toMs, tenantIds) {
   }
 
   const value = { buckets, users, truncated };
+  // Bounded, and oldest out first. The TTL above only stops a stale entry
+  // being USED - it never deleted one, and the key includes the window`s
+  // minute, so every refresh on a new minute added another stream of up to
+  // MAX_POINTS positions that was never freed. On a long-running server
+  // that grows without limit.
+  if (cache.size >= CACHE_MAX_KEYS) cache.delete(cache.keys().next().value);
   cache.set(key, { at: Date.now(), value });
   return value;
 }

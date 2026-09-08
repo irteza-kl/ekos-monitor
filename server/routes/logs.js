@@ -54,6 +54,7 @@ router.get('/logs.csv', async (req, res, next) => {
       { key: 'deviceTimestamp', label: 'Device Timestamp' },
       { key: 'userId', label: 'User ID' },
       { key: 'siteId', label: 'Site ID' },
+      { key: 'siteName', label: 'Site Name' },
       { key: 'siteAddress', label: 'Site Address' },
       { key: 'location.lat', label: 'Latitude', get: (r) => (r.location ? r.location.lat : null) },
       { key: 'location.lng', label: 'Longitude', get: (r) => (r.location ? r.location.lng : null) },

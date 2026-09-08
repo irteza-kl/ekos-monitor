@@ -43,7 +43,12 @@
         label: 'Site',
         options: (meta.sites || [])
           .filter((site) => site.siteId !== null && site.siteId !== undefined)
-          .map((site) => ({ value: site.siteId, label: 'Site ' + site.siteId + (site.address ? ' - ' + site.address.slice(0, 24) : '') })),
+          .map((site) => ({
+            value: site.siteId,
+            // The name leads; the id rides along because the filter, the CSV
+            // and every cross-page link key on it.
+            label: PM.siteName(site, site.siteId) + ' · #' + site.siteId,
+          })),
       },
       {
         kind: 'multi',

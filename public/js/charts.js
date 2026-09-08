@@ -49,7 +49,13 @@ window.PMChart = (function () {
   /** One chart per canvas: replacing re-uses the slot instead of leaking. */
   function mount(canvas, config) {
     if (!canvas) return null;
-    const key = canvas;
+    // Keyed by the canvas ID where there is one, not by the element.
+    // A drawer builds a fresh canvas every time it opens, so an
+    // element-keyed registry never matched, never destroyed the previous
+    // chart, and held both it and its detached canvas forever. The ids
+    // are stable (#ew-dist, #ew-acc), so keying on them replaces the
+    // chart the way a page-level chart has always been replaced.
+    const key = canvas.id || canvas;
     if (registry.has(key)) {
       registry.get(key).destroy();
       registry.delete(key);

@@ -14,7 +14,7 @@ const { collectionFor } = require('../db');
 const F = require('./filters');
 const P = require('./pipelines');
 const normalize = require('./normalize');
-const { getSites, attachWindowSite, FENCE_MATCH_METRES } = require('./sites');
+const { getSites, attachWindowSite, nameWindowSitesFromHeartbeats, FENCE_MATCH_METRES } = require('./sites');
 const { attributeWindows } = require('./attribution');
 
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
@@ -83,10 +83,15 @@ async function listWindows(q) {
   if (verdicts.length) {
     rows = rows.filter((row) => row.samples.some((s) => verdicts.includes(s.verdict)));
   }
+  // Geometry first: a fence that sits on a recorded fence IS that site, and
+  // that needs no inference about people at all.
   rows = await Promise.all(rows.map(attachWindowSite));
   // Join to a person: exact when the document names one, inferred from
   // heartbeat presence at the fence otherwise.
   await attributeWindows(rows);
+  // Then the windows geometry could not place. Runs last because it reads
+  // row.attribution - the person is what makes the heartbeat route possible.
+  await nameWindowSitesFromHeartbeats(rows);
 
   // Filtering by user has to happen after attribution, since the documents
   // themselves carry userId: null.

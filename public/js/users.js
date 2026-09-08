@@ -29,7 +29,7 @@
       { kind: 'multi', key: 'userId', label: 'User', options: PM.optionsFrom(meta.users || [], 'id', 'name', 'snapshots') },
       { kind: 'multi', key: 'deviceType', label: 'Device', options: PM.optionsFrom(meta.deviceTypes || [], 'key', 'key', 'count') },
       { kind: 'multi', key: 'appVersion', label: 'App version', options: PM.optionsFrom(meta.appVersions || [], 'key', 'key', 'count') },
-      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'id', 'snapshots') },
+      { kind: 'multi', key: 'jobSiteId', label: 'Site', options: PM.optionsFrom(meta.jobSiteIds || [], 'id', 'label', 'snapshots') },
       { kind: 'multi', key: 'accuracyBand', label: 'Accuracy band', options: PM.optionsFrom(meta.accuracyBands || [], 'key', 'label') },
       {
         kind: 'multi',
@@ -39,7 +39,11 @@
       },
       { kind: 'tri', key: 'clockedIn', label: 'Clocked in', yes: 'On the clock', no: 'Off the clock' },
       { kind: 'tri', key: 'insideGeofence', label: 'Inside fence', yes: 'Inside', no: 'Outside', nullable: true },
-      { kind: 'tri', key: 'connected', label: 'Connectivity', yes: 'Online', no: 'Offline' },
+      // Keyed on `offline`, not `connected`. The control is labelled with what
+      // the row badge says, so it has to filter by the same rule - either flag
+      // false. `connected` and `reachable` remain as field-level parameters for
+      // the URL and the query console, where asking about one flag is the point.
+      { kind: 'tri', key: 'offline', label: 'Connectivity', yes: 'Offline', no: 'Online' },
       { kind: 'number', key: 'accuracyMax', label: 'Accuracy <= m', placeholder: 'e.g. 25' },
       { kind: 'number', key: 'accuracyMin', label: 'Accuracy >= m', placeholder: 'e.g. 50' },
       { kind: 'number', key: 'batteryMax', label: 'Battery <= %', placeholder: 'e.g. 20' },
@@ -104,6 +108,26 @@
       tile('Uncertain fixes', fmt.int(uncertain.length), 'accuracy overlaps the boundary', uncertain.length ? 'warning' : undefined),
       tile('Permission gaps', fmt.int(gaps.length), 'at least one permission denied', gaps.length ? 'warning' : undefined)
     );
+  }
+
+  /**
+   * Which site this device is in, said as a place rather than a number.
+   *
+   * The name comes off the heartbeat itself (siteDetails), so it is the name
+   * the app had at that moment. A heartbeat carrying only an id still gets the
+   * registry name through /api/users, and one with neither says unmapped.
+   */
+  function siteSub(row) {
+    const site = row.site;
+    // Same words the Heartbeats table uses: "unmapped" reads as a fault in the
+    // data, when the fact is that the device is not clocked into anywhere - and
+    // that is a different thing from being outside a fence, which the badge
+    // above already says.
+    if (!site && row.jobSiteId == null) return '<div class="person-sub hint">not clocked into a site</div>';
+    const name = site && (site.name || site.label);
+    if (!name) return '<div class="person-sub">site ' + row.jobSiteId + '</div>';
+    const title = PM.siteTitle(site, row.jobSiteId);
+    return '<div class="person-sub" title="' + esc(title) + '">' + esc(name) + '</div>';
   }
 
   function renderTable() {
@@ -175,7 +199,9 @@
           '</td>' +
           '<td>' +
           PM.geofenceBadge(row.isInsideGeofence, row.computedVerdict, row.verdictReason) +
-          (row.jobSiteId != null ? '<div class="person-sub">site ' + row.jobSiteId + '</div>' : '<div class="person-sub">unmapped</div>') +
+          // The site by name when the heartbeat carried its record, by id when
+          // it came from a build that does not send one yet.
+          siteSub(row) +
           '</td>' +
           '<td class="num">' +
           distance +

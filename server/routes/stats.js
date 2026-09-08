@@ -128,7 +128,19 @@ async function buildStats(q) {
                   $group: {
                     _id: null,
                     online: { $sum: { $cond: [{ $eq: ['$isConnected', true] }, 1, 0] } },
-                    offline: { $sum: { $cond: [{ $eq: ['$isConnected', false] }, 1, 0] } },
+                    // Offline as the row badge means it: EITHER flag false.
+                    // Counting only isConnected reported 164 where 512 rows
+                    // are badged offline - isReachable is the dominant signal
+                    // in this store, and the tile was under-reporting 3x.
+                    offline: {
+                      $sum: {
+                        $cond: [
+                          { $or: [{ $eq: ['$isConnected', false] }, { $eq: ['$isReachable', false] }] },
+                          1,
+                          0,
+                        ],
+                      },
+                    },
                     unreachable: { $sum: { $cond: [{ $eq: ['$isReachable', false] }, 1, 0] } },
                   },
                 },
@@ -136,8 +148,17 @@ async function buildStats(q) {
               topSites: [
                 {
                   $group: {
-                    _id: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+                    _id: {
+                      $ifNull: [
+                        '$' + SNAP.siteRecordId,
+                        { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+                      ],
+                    },
                     n: { $sum: 1 },
+                    // The name off the newest heartbeat that carried one, so the
+                    // chart can be labelled with places instead of numbers.
+                    // $max over an object, not a sort - see pipelines for why.
+                    newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.siteName, null] } } },
                     inside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
                     outside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },
                     avgAccuracy: { $avg: '$' + SNAP.accuracy },
@@ -154,7 +175,19 @@ async function buildStats(q) {
                     n: { $sum: 1 },
                     inside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
                     outside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },
-                    offline: { $sum: { $cond: [{ $eq: ['$isConnected', false] }, 1, 0] } },
+                    // Offline as the row badge means it: EITHER flag false.
+                    // Counting only isConnected reported 164 where 512 rows
+                    // are badged offline - isReachable is the dominant signal
+                    // in this store, and the tile was under-reporting 3x.
+                    offline: {
+                      $sum: {
+                        $cond: [
+                          { $or: [{ $eq: ['$isConnected', false] }, { $eq: ['$isReachable', false] }] },
+                          1,
+                          0,
+                        ],
+                      },
+                    },
                     avgAccuracy: { $avg: '$' + SNAP.accuracy },
                     worstAccuracy: { $max: '$' + SNAP.accuracy },
                     minBattery: { $min: '$batteryPercentage' },
@@ -177,7 +210,19 @@ async function buildStats(q) {
                     outside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },
                     unknown: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', null] }, 1, 0] } },
                     clockedIn: { $sum: { $cond: [{ $eq: ['$clockedIn', true] }, 1, 0] } },
-                    offline: { $sum: { $cond: [{ $eq: ['$isConnected', false] }, 1, 0] } },
+                    // Offline as the row badge means it: EITHER flag false.
+                    // Counting only isConnected reported 164 where 512 rows
+                    // are badged offline - isReachable is the dominant signal
+                    // in this store, and the tile was under-reporting 3x.
+                    offline: {
+                      $sum: {
+                        $cond: [
+                          { $or: [{ $eq: ['$isConnected', false] }, { $eq: ['$isReachable', false] }] },
+                          1,
+                          0,
+                        ],
+                      },
+                    },
                     avgAccuracy: { $avg: '$' + SNAP.accuracy },
                     worstAccuracy: { $max: '$' + SNAP.accuracy },
                     users: { $addToSet: '$' + SNAP.userId },
@@ -211,6 +256,7 @@ async function buildStats(q) {
     };
     out.topSites = facet.topSites.map((s) => ({
       siteId: s._id,
+      name: (s.newest && s.newest.name) || null,
       snapshots: s.n,
       inside: s.inside,
       outside: s.outside,

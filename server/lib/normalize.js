@@ -110,6 +110,7 @@ function snapshot(doc) {
   const loc = doc.currentUserLocation || {};
   const jobDetail = doc.clockedInJobDetail || {};
   const jobSiteLoc = doc.clockedInJobSiteLocation || {};
+  const siteRecord = doc.siteDetails || {};
 
   const lat = n(loc.latitude);
   const lng = n(loc.longitude);
@@ -183,7 +184,53 @@ function snapshot(doc) {
     accuracy,
     accuracyBand: geo.accuracyBand(accuracy),
 
-    jobSiteId: n(jobDetail.jobSiteId) != null ? n(jobDetail.jobSiteId) : n(jobSiteLoc.jobSiteId),
+    // Three paths carry the id. siteDetails.id is the newest and the one that
+    // comes with the site itself, so it leads.
+    jobSiteId:
+      n(siteRecord.id) != null
+        ? n(siteRecord.id)
+        : n(jobDetail.jobSiteId) != null
+          ? n(jobDetail.jobSiteId)
+          : n(jobSiteLoc.jobSiteId),
+    /**
+     * The site as the device had it at that moment.
+     *
+     * Not a registry lookup: this is the record the app handed the handset
+     * with that heartbeat, so it is contemporaneous. A site renamed or a
+     * fence moved since does not rewrite what this row means - which is
+     * exactly the property a monitoring console needs, and the reason this
+     * is kept beside the registry rather than replaced by it.
+     *
+     * Null on every heartbeat from a build that does not send it yet, so
+     * every reader has to fall back to the registry by id.
+     */
+    site:
+      n(siteRecord.id) === null
+        ? null
+        : {
+            siteId: n(siteRecord.id),
+            name: siteRecord.name || null,
+            address: siteRecord.address || siteRecord.formattedAddress || null,
+            city: siteRecord.city || null,
+            state: siteRecord.state || null,
+            country: siteRecord.country || null,
+            zipCode: siteRecord.zipCode || null,
+            siteAreaId: n(siteRecord.siteAreaId),
+            // A fence on record, so it can be drawn as one.
+            fence:
+              n(siteRecord.latitude) === null || n(siteRecord.longitude) === null
+                ? null
+                : {
+                    lat: n(siteRecord.latitude),
+                    lng: n(siteRecord.longitude),
+                    radius: n(siteRecord.radiusMeters),
+                  },
+            // Strings in the store, not dates.
+            recordUpdatedAt: iso(siteRecord.updatedAt),
+            recordCreatedAt: iso(siteRecord.createdAt),
+            deletedAt: iso(siteRecord.deletedAt),
+            source: 'heartbeat',
+          },
     jobSiteLocation:
       n(jobSiteLoc.latitude) === null || n(jobSiteLoc.longitude) === null
         ? null
@@ -250,12 +297,15 @@ function clockInLog(doc, siteLookup) {
   const accuracy = n(body.accuracy);
   const unmapped = doc.unmappedClockInData || null;
 
+  // What the registry knows about this site: its name always, its geometry
+  // only when a fence is genuinely on record.
+  const known = (siteLookup && siteArea.id != null && siteLookup[siteArea.id]) || null;
+
   let fence = null;
   if (n(siteLoc.latitude) !== null && n(siteLoc.longitude) !== null) {
     fence = { lat: n(siteLoc.latitude), lng: n(siteLoc.longitude), radius: n(siteLoc.radiusMeters) };
-  } else if (siteLookup && siteArea.id != null && siteLookup[siteArea.id]) {
-    const s = siteLookup[siteArea.id];
-    fence = { lat: s.lat, lng: s.lng, radius: s.radius };
+  } else if (known && known.lat != null) {
+    fence = { lat: known.lat, lng: known.lng, radius: known.radius };
   }
 
   const point = lat === null || lng === null ? null : { lat, lng };
@@ -275,9 +325,13 @@ function clockInLog(doc, siteLookup) {
     accuracyBand: geo.accuracyBand(accuracy),
 
     siteId: n(siteArea.id),
+    // These calls carry no site name of their own, so it comes from the
+    // registry - which learns names from the heartbeats' siteDetails. Null when
+    // no heartbeat has ever named this site.
+    siteName: (known && (known.name || known.displayName)) || null,
     timeEntryId: n(doc.siteAreaData && doc.siteAreaData.id),
     fence,
-    siteAddress: siteLoc.address || null,
+    siteAddress: siteLoc.address || (known && known.address) || null,
     siteCity: siteLoc.city || null,
     siteCountry: siteLoc.country || null,
 

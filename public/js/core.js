@@ -161,6 +161,38 @@ window.PM = (function () {
     return node;
   };
 
+  /**
+   * What to call a site on screen.
+   *
+   * One definition, because a dozen call sites had their own and they
+   * disagreed: some printed "Site 12", some the address, some the name. A
+   * reader comparing a map popup with a table row could not tell they were
+   * looking at the same place.
+   *
+   * Takes whatever shape the caller has - a registry row, the `site` on a
+   * heartbeat, or nothing but an id - and falls back in the same order every
+   * time: the name, then the address, then the id, then "unmapped". The id is
+   * never dropped by callers that show it as a chip; this is just the label.
+   */
+  function siteName(site, fallbackId) {
+    const id = site && site.siteId != null ? site.siteId : fallbackId;
+    if (site) {
+      if (site.displayName) return site.displayName;
+      if (site.name) return site.name;
+      if (site.label) return site.label;
+      if (site.address) return site.address;
+    }
+    return id === null || id === undefined ? 'Unmapped' : 'Site ' + id;
+  }
+
+  /** The site, plus its address, for a tooltip. */
+  function siteTitle(site, fallbackId) {
+    const id = site && site.siteId != null ? site.siteId : fallbackId;
+    return [siteName(site, fallbackId), site && site.address, id != null ? 'site #' + id : null]
+      .filter(Boolean)
+      .join(' - ');
+  }
+
   const esc = (s) =>
     String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
@@ -1255,6 +1287,7 @@ window.PM = (function () {
     insideGeofence: 'Inside fence',
     connected: 'Connected',
     reachable: 'Reachable',
+    offline: 'Connectivity',
     loggedIn: 'Logged in',
     accuracyMin: 'Accuracy >=',
     accuracyMax: 'Accuracy <=',
@@ -1338,7 +1371,19 @@ window.PM = (function () {
     const hidden = ['range', 'page', 'sortBy', 'sortDir'].concat(state.hideChips || []);
     const entries = Object.entries(state.filters).filter(([k]) => !hidden.includes(k));
     if (!entries.length) {
-      host.append(el('span', { class: 'hint', text: 'No filters applied - showing the selected time range.' }));
+      // The window counts as a filter on the Clear all button, so saying
+      // "no filters applied" directly under a button reading "Clear all (1)"
+      // is a contradiction the reader has to resolve. Name the one thing
+      // that IS set instead.
+      const windowSet = (state.filters.range || DEFAULT_RANGE) !== DEFAULT_RANGE || !!state.filters.from;
+      host.append(
+        el('span', {
+          class: 'hint',
+          text: windowSet
+            ? 'No filters beyond the time range - showing ' + rangeLabel() + '.'
+            : 'No filters applied - showing ' + rangeLabel() + '.',
+        })
+      );
       return;
     }
     for (const [key, value] of entries) {
@@ -1346,6 +1391,15 @@ window.PM = (function () {
       let shown = [].concat(value).join(', ');
       if (key === 'where') shown = shown.length > 46 ? shown.slice(0, 46) + '...' : shown;
       if (key === 'from' || key === 'to') shown = fmt.dayTime(shown);
+      // A tri-state chip read "Connectivity: true", which says nothing about
+      // which state that is. The control already has words for its own values,
+      // so the chip borrows them: "Connectivity: Offline".
+      const tri = (state.filterSpec || []).find((i) => i && i.kind === 'tri' && i.key === key);
+      if (tri) {
+        if (shown === 'true') shown = tri.yes || 'Yes';
+        else if (shown === 'false') shown = tri.no || 'No';
+        else if (shown === 'null') shown = tri.nullLabel || 'Unknown';
+      }
       const chip = el('span', { class: 'chip' }, [
         el('span', { text: label + ': ' + shown }),
         el('button', {
@@ -2182,6 +2236,8 @@ window.PM = (function () {
     meter,
     jsonHighlight,
     optionsFrom,
+    siteName,
+    siteTitle,
     rangeLabel,
     padBuckets,
     showSkeleton,

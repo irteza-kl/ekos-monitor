@@ -177,13 +177,30 @@ app.use(
 );
 
 // ------------------------------------------------------------- error handler
+/**
+ * What a failure is allowed to say out loud.
+ *
+ * A 4xx is ours - `filters.badRequest` writes those messages for the reader,
+ * and they are the whole point of the response. A 500 is not: it is whatever
+ * the driver threw, and those carry cluster hostnames, replica-set topology
+ * and sometimes the connection string. The full error still goes to the
+ * server log, where it belongs; the browser gets a reference to find it by.
+ */
 app.use((err, req, res, next) => {
   const status = err.status || 500;
-  if (status >= 500) console.error('[phantom-monitor]', err);
+  if (status < 500) {
+    return res.status(status).json({ error: err.message, code: err.code || undefined });
+  }
+  // Something to match the response against a log line, because "unexpected
+  // error" with nothing else is impossible to chase.
+  const ref = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);
+  console.error('[phantom-monitor] ' + ref + ' ' + req.method + ' ' + req.originalUrl, err);
   res.status(status).json({
-    error: err.message || 'Unexpected error',
+    error: 'The server could not complete that request. Reference ' + ref + ' is in the server log.',
+    ref,
     code: err.code || undefined,
-    ...(status >= 500 && process.env.NODE_ENV !== 'production' ? { stack: err.stack } : {}),
+    // The detail is developer-only, and only off production.
+    ...(process.env.NODE_ENV !== 'production' ? { detail: String(err.message || '').slice(0, 300) } : {}),
   });
 });
 

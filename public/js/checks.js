@@ -9,9 +9,15 @@
   let total = 0;
 
   PM.boot('checks.html', async ({ root, meta }) => {
+    // These logs count validations per site id and carry no name, so the
+    // name comes from the registry - which learns them from the heartbeats.
+    const byId = new Map((meta.sites || []).map((s) => [String(s.siteId), s]));
     const siteOptions = PM.optionsFrom(meta.logSites || [], 'id', 'id', 'validations').map((o) => ({
       ...o,
-      label: o.value === 'null' ? 'unmapped' : 'Site ' + o.label,
+      label:
+        o.value === 'null'
+          ? 'unmapped'
+          : PM.siteName(byId.get(String(o.value)) || null, o.label) + ' · #' + o.label,
     }));
 
     PM.buildFilterBar(() => [
@@ -145,7 +151,11 @@
       (groups[row.verdict] || groups.unknown).push({
         x: row.relation.distanceFromBoundary,
         y: row.accuracy,
-        label: (row.siteId != null ? 'Site ' + row.siteId : 'unmapped') + ' · user ' + row.userId + ' · ' + fmt.dayTime(row.capturedAt),
+        label:
+          (row.siteId != null || row.siteName
+            ? PM.siteName({ name: row.siteName }, row.siteId)
+            : 'unmapped') +
+          ' · user ' + row.userId + ' · ' + fmt.dayTime(row.capturedAt),
       });
     }
     PMChart.scatter(document.querySelector('#chart-scatter'), {
@@ -194,8 +204,10 @@
             '<td>' + fmt.dayTime(row.capturedAt) + '<div class="person-sub">' + fmt.ago(row.capturedAt) + '</div></td>' +
             '<td>' + (row.userId === null ? '--' : row.userId) + '</td>' +
             '<td>' +
-            (row.siteId != null
-              ? 'Site ' + row.siteId + '<div class="person-sub" title="' + esc(row.siteAddress || '') + '">' + esc(row.siteAddress || '') + '</div>'
+            (row.siteId != null || row.siteName
+              ? '<b>' + esc(PM.siteName({ name: row.siteName }, row.siteId)) + '</b>' +
+                (row.siteId != null ? ' <span class="hint">#' + row.siteId + '</span>' : '') +
+                '<div class="person-sub" title="' + esc(row.siteAddress || '') + '">' + esc(row.siteAddress || '') + '</div>'
               : '<span class="badge badge-neutral">unmapped</span>') +
             '</td>' +
             '<td class="num">' + PM.accuracyBadge(row.accuracyBand, row.accuracy) + '</td>' +
@@ -225,9 +237,31 @@
     document.querySelector('#table-sub').textContent = 'click a row to see the fix on a map with the fence';
   }
 
+
+  /**
+   * Leaflet holds window listeners and tile caches until `remove()` is
+   * called; openDrawer only wipes the body, which detaches the container and
+   * leaves the map alive. Five row clicks left five maps running - measured
+   * in a browser, not inferred. `pm:drawer-close` already exists for exactly
+   * this (heartbeats.view.js has used it since the drawer map was added).
+   */
+  let drawerMap = null;
+  function releaseDrawerMap() {
+    if (!drawerMap) return;
+    try {
+      drawerMap.remove();
+    } catch (err) {
+      /* the container went with the drawer body */
+    }
+    drawerMap = null;
+  }
+  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+
   function openDetail(row) {
     PM.openDrawer({
-      title: (row.siteId != null ? 'Site ' + row.siteId : 'Unmapped') + ' check · user ' + row.userId,
+      title:
+        (row.siteId != null || row.siteName ? PM.siteName({ name: row.siteName }, row.siteId) : 'Unmapped') +
+        ' check · user ' + row.userId,
       subtitle: fmt.date(row.capturedAt) + ' · ' + (row.siteAddress || 'no address on record'),
       tabs: [
         {
@@ -236,7 +270,9 @@
           render: (host) => {
             const mapHost = el('div', { class: 'map mini', style: 'height:320px' });
             host.append(mapHost, el('div', { html: PMMap.legend() }));
+            releaseDrawerMap();
             const map = PMMap.create(mapHost);
+            drawerMap = map;
             setTimeout(() => map.invalidateSize(), 60);
             // Same fence-provenance trap as the exit-window replay: this fence
             // came out of the geofence log itself (siteArea.locations), which is

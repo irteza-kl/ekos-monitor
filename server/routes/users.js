@@ -32,26 +32,74 @@ const SORTABLE = [
 ];
 
 /** Enriches a normalized row with the site it is clocked into. */
+/**
+ * Puts the site on a row, from both of the things that know about it.
+ *
+ * The heartbeat carries the site record the device had at the time
+ * (normalize.snapshot reads siteDetails into row.site). The registry carries
+ * the current view of that site, with the provenance of its geometry. Both
+ * matter and neither replaces the other:
+ *
+ *  - The NAME and ADDRESS come from the heartbeat when it has them. It is
+ *    the answer the app itself gave for that moment, so a site renamed since
+ *    does not rewrite what an old row meant.
+ *  - The GEOMETRY PROVENANCE comes from the registry, which is the only
+ *    thing that knows whether a centre was recorded or estimated.
+ *  - A heartbeat from a build that does not send siteDetails yet has only
+ *    the id, so it falls back to the registry entirely. Most of this store
+ *    is still that, which is why this cannot simply read the row.
+ *
+ * Where the heartbeat`s fence and the registry`s current fence disagree, the
+ * row says so. That is not a bug to smooth over: it means this heartbeat was
+ * judged inside-or-outside against a boundary the site no longer has.
+ */
 function attachSite(row, sites) {
   if (!row) return row;
+  const own = row.site || null;
   const site = row.jobSiteId != null ? sites.find((s) => s.siteId === row.jobSiteId) : null;
-  row.site = site
-    ? {
-        siteId: site.siteId,
-        label: site.label,
-        address: site.address,
-        lat: site.lat,
-        lng: site.lng,
-        radius: site.radius,
-        source: site.source,
-        hasFence: site.hasFence,
-        centreSource: site.centreSource,
-        radiusSource: site.radiusSource,
-        radiusIsAuthoritative: site.radiusIsAuthoritative,
-        centreIsEstimate: site.centreIsEstimate,
-        centreConfidence: site.centreConfidence,
-      }
-    : null;
+  if (!own && !site) {
+    row.site = null;
+    return row;
+  }
+
+  const ownFence = own && own.fence ? own.fence : null;
+  const nowFence = site && site.lat != null ? { lat: site.lat, lng: site.lng, radius: site.radius } : null;
+  // Only claim a move when both are known and both are real records.
+  const movedMetres =
+    ownFence && nowFence && site && site.hasFence ? geo.round(geo.haversine(ownFence, nowFence), 1) : null;
+  const radiusThen = ownFence ? ownFence.radius : null;
+  const radiusNow = nowFence ? nowFence.radius : null;
+
+  row.site = {
+    siteId: row.jobSiteId,
+    // The heartbeat first, the registry second, the id last.
+    name: (own && own.name) || (site && site.name) || null,
+    label: (own && own.name) || (site && site.label) || 'Site ' + row.jobSiteId,
+    address: (own && own.address) || (site && site.address) || null,
+    city: (own && own.city) || (site && site.city) || null,
+    state: (own && own.state) || (site && site.state) || null,
+    country: (own && own.country) || (site && site.country) || null,
+    siteAreaId: own && own.siteAreaId != null ? own.siteAreaId : null,
+    // The fence this heartbeat was actually judged against, when it said.
+    fenceAtHeartbeat: ownFence,
+    recordUpdatedAt: (own && own.recordUpdatedAt) || null,
+    deletedAt: (own && own.deletedAt) || null,
+    // ...and the site as it stands now.
+    lat: site ? site.lat : ownFence ? ownFence.lat : null,
+    lng: site ? site.lng : ownFence ? ownFence.lng : null,
+    radius: site ? site.radius : ownFence ? ownFence.radius : null,
+    hasFence: site ? site.hasFence : !!(ownFence && ownFence.radius != null),
+    centreSource: site ? site.centreSource : ownFence ? 'site-record' : null,
+    radiusSource: site ? site.radiusSource : ownFence && ownFence.radius != null ? 'site-record' : null,
+    radiusIsAuthoritative: site ? site.radiusIsAuthoritative : !!(ownFence && ownFence.radius != null),
+    centreIsEstimate: site ? site.centreIsEstimate : false,
+    centreConfidence: site ? site.centreConfidence : ownFence ? 'recorded' : null,
+    // Where the two disagree. Null when there is nothing to compare.
+    fenceMovedSinceMetres: movedMetres,
+    radiusChanged: radiusThen != null && radiusNow != null && radiusThen !== radiusNow ? { then: radiusThen, now: radiusNow } : null,
+    // Which of the two actually answered.
+    source: own && site ? 'heartbeat+registry' : own ? 'heartbeat' : 'registry',
+  };
 
   // A verdict needs a fence that was actually on record. An estimated centre, or
   // a radius borrowed from a nearby fence record, would produce a confident
@@ -163,6 +211,7 @@ router.get('/users.csv', async (req, res, next) => {
       { key: 'computedVerdict', label: 'Verdict (recomputed)' },
       { key: 'verdictDisagrees', label: 'Verdict Mismatch' },
       { key: 'jobSiteId', label: 'Site ID' },
+      { key: 'site.name', label: 'Site Name', get: (r) => (r.site ? r.site.name || r.site.label : null) },
       { key: 'site.address', label: 'Site Address', get: (r) => (r.site ? r.site.address : null) },
       {
         key: 'relation.distanceFromBoundary',
@@ -221,6 +270,27 @@ function sortProjection(sort) {
  * `$in` does not preserve order and neither does the storage engine, so the
  * sort would be lost between the two queries if this did not put it back.
  */
+/**
+ * Down to the id and the keys being ordered by, immediately before the sort.
+ *
+ * sortProjection has to keep the raw fields the computed sort keys are
+ * derived FROM (createdAt and capturedAt for the fix time, accuracy for the
+ * band). Once $addFields has produced the keys themselves those sources are
+ * dead weight, and they were being carried through the sort - 258 bytes a
+ * document instead of about 40.
+ *
+ * That is what took `/api/snapshots` down once the collection passed ~30,000
+ * heartbeats: "Sort exceeded memory limit of 33554432 bytes". Same wall as
+ * `/api/stats` hit, and the same reason - this deployment does not honour
+ * allowDiskUse, so a blocking sort has a hard ceiling and the only fix is to
+ * sort less.
+ */
+function sortKeysOnly(sort) {
+  const projection = { _id: 1 };
+  for (const key of Object.keys(sort || {})) projection[key] = 1;
+  return projection;
+}
+
 async function documentsFor(col, ids) {
   if (!ids.length) return [];
   const docs = await col
@@ -259,10 +329,18 @@ router.get('/snapshots', async (req, res, next) => {
           // Ahead of the sort and the paging, so it narrows the set rather than
           // the page - `total` used to count rows this had not been applied to.
           { $match: postMatch },
-          { $sort: sort },
+          // Nothing but the id and the sort keys from here on.
+          { $project: sortKeysOnly(sort) },
           {
             $facet: {
-              rows: [{ $skip: skip }, { $limit: limit }, { $project: { _id: 1 } }],
+              // The $sort lives INSIDE the branch, next to its $limit. A $facet
+              // between the two stops the planner bounding the sort to the page
+              // it needs (top-k), so it materialised all 34,000 documents and
+              // blew the 32 MB ceiling. Adjacent, the bound is skip+limit, and
+              // a skip past the end of the collection costs nothing.
+              rows: [{ $sort: sort }, { $skip: skip }, { $limit: limit }, { $project: { _id: 1 } }],
+              // No sort here: counting is order-independent, and adding one
+              // would reintroduce exactly the unbounded sort this removes.
               total: [{ $count: 'value' }],
             },
           },
@@ -301,8 +379,11 @@ router.get('/snapshots.csv', async (req, res, next) => {
           { $addFields: { [P.HEARTBEAT_AT]: P.heartbeatAtExpr() } },
           // Same reason as the paged feed: the sort has to run on a projection,
           // not on whole documents, or a wide export exceeds the 32 MB sort
-          // budget this cluster will not spill to disk.
-          { $project: sortProjection(ordering) },
+          // budget this cluster will not spill to disk. The sort key is already
+          // on the document by here, so nothing else needs to travel with it.
+          { $project: sortKeysOnly(ordering) },
+          // Adjacent to its $limit, which is what lets the planner bound the
+          // sort to `limit` documents instead of the whole matched set.
           { $sort: ordering },
           { $limit: limit },
           { $project: { _id: 1 } },
@@ -338,6 +419,8 @@ router.get('/snapshots.csv', async (req, res, next) => {
         get: (x) => (x.relation ? x.relation.distanceFromBoundary : null),
       },
       { key: 'jobSiteId', label: 'Site ID' },
+      { key: 'site.name', label: 'Site Name', get: (r) => (r.site ? r.site.name || r.site.label : null) },
+      { key: 'site.address', label: 'Site Address', get: (r) => (r.site ? r.site.address : null) },
       { key: 'clockedIn', label: 'Clocked In' },
       { key: 'battery', label: 'Battery %' },
       { key: 'isConnected', label: 'Connected' },

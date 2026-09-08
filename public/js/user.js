@@ -168,7 +168,12 @@
         el('div', {
           class: 'hero-sub',
           text:
-            [row.employeeRef, row.tenantName, row.role, row.jobSiteId != null ? 'site ' + row.jobSiteId : 'unmapped site']
+            [
+              row.employeeRef,
+              row.tenantName,
+              row.role,
+              row.jobSiteId != null || row.site ? PM.siteName(row.site, row.jobSiteId) : 'no site',
+            ]
               .filter(Boolean)
               .join(' · ') || 'no session data',
         }),
@@ -379,8 +384,9 @@
         ],
         [
           'Site',
-          row.jobSiteId != null
-            ? 'Site ' + row.jobSiteId + (row.site && row.site.address ? ' · ' + esc(row.site.address) : '')
+          row.jobSiteId != null || row.site
+            ? esc(PM.siteName(row.site, row.jobSiteId)) +
+              (row.site && row.site.address ? ' <span class="hint">' + esc(row.site.address) + '</span>' : '')
             : 'unmapped',
         ],
         ['Fix', fmt.coords(row.location) + ' · ' + PM.accuracyBadge(row.accuracyBand, row.accuracy)],
@@ -878,7 +884,9 @@
           html:
             '<td>' + fmt.dayTime(log.capturedAt) + '<div class="person-sub">' + fmt.ago(log.capturedAt) + '</div></td>' +
             '<td>' +
-            (log.siteId != null ? 'Site ' + log.siteId : '<span class="badge badge-neutral">unmapped</span>') +
+            (log.siteId != null || log.siteName
+              ? esc(PM.siteName({ name: log.siteName, address: log.siteAddress }, log.siteId))
+              : '<span class="badge badge-neutral">unmapped</span>') +
             '<div class="person-sub" title="' + esc(log.siteAddress || '') + '">' + esc(log.siteAddress || '') + '</div></td>' +
             '<td class="num">' + PM.accuracyBadge(log.accuracyBand, log.accuracy) + '</td>' +
             '<td class="num">' +

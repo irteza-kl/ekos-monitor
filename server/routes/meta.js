@@ -92,7 +92,22 @@ router.get('/meta', async (req, res, next) => {
                 ],
                 timezones: [{ $group: { _id: '$timezone', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
                 jobSites: [
-                  { $group: { _id: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] }, n: { $sum: 1 } } },
+                  {
+                    $group: {
+                      _id: {
+                        $ifNull: [
+                          '$' + SNAP.siteRecordId,
+                          { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+                        ],
+                      },
+                      n: { $sum: 1 },
+                      // The name, so the Site dropdown can list places rather
+                      // than ids. $max over an object takes the newest record
+                      // field by field, with no sort - see pipelines for why
+                      // this deployment cannot afford one.
+                      newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.siteName, null] } } },
+                    },
+                  },
                   { $sort: { n: -1 } },
                 ],
               },
@@ -121,7 +136,17 @@ router.get('/meta', async (req, res, next) => {
         .map((v) => ({ key: v._id, builds: (v.builds || []).filter(Boolean), count: v.n }))
         .filter((v) => v.key);
       data.timezones = facet.timezones.map((t) => ({ key: t._id, count: t.n })).filter((t) => t.key);
-      data.jobSiteIds = facet.jobSites.map((s) => ({ id: s._id, snapshots: s.n })).filter((s) => s.id !== null);
+      data.jobSiteIds = facet.jobSites
+        .map((s) => ({
+          id: s._id,
+          snapshots: s.n,
+          name: (s.newest && s.newest.name) || null,
+          // What the dropdown shows. The id stays in it because every filter,
+          // CSV and cross-page link keys on the id, so a row picked by name
+          // still has to be findable by number.
+          label: (s.newest && s.newest.name ? s.newest.name + ' · #' : 'Site ') + s._id,
+        }))
+        .filter((s) => s.id !== null);
     } catch (err) {
       if (err.code !== 'COLLECTION_MISSING') throw err;
       data.snapshotsUnavailable = err.message;
@@ -205,6 +230,8 @@ router.get('/meta', async (req, res, next) => {
       data.sites = sites.map((s) => ({
         siteId: s.siteId,
         label: s.label,
+        name: s.name || null,
+        displayName: s.displayName || null,
         hasFence: s.hasFence,
         radius: s.radius,
         centreSource: s.centreSource,

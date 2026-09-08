@@ -9,6 +9,9 @@ window.PMMap = (function () {
   const C = window.PM.colors;
   const fmt = window.PM.fmt;
   const esc = window.PM.esc;
+  // One definition of what a site is called, shared with every table and
+  // drawer, so a popup and a row can never name the same place differently.
+  const siteName = window.PM.siteName;
 
   // Every mark sits directly on the pale canvas, so its ring is white in both
   // themes - a dark ring from the app surface would vanish into the roads.
@@ -216,8 +219,9 @@ window.PMMap = (function () {
         ['Boundary', rel ? fmt.metres(rel.distanceFromBoundary) + (rel.inside ? ' inside' : ' outside') + ' · ' + rel.compass : null],
         [
           'Site',
-          row.jobSiteId != null
-            ? row.jobSiteId + (row.site && row.site.address ? '<span class="mp-note">' + esc(row.site.address) + '</span>' : '')
+          row.jobSiteId != null || row.site
+            ? esc(siteName(row.site, row.jobSiteId)) +
+              (row.site && row.site.address ? '<span class="mp-note">' + esc(row.site.address) + '</span>' : '')
             : 'unmapped',
         ],
         ['Device', esc(row.deviceType || '?') + ' · battery ' + (row.battery === null ? '?' : row.battery + '%') + (row.offline ? ' · offline' : '')],
@@ -275,7 +279,7 @@ window.PMMap = (function () {
     );
 
     if (options.label !== false) {
-      const name = site.siteId != null ? 'Site ' + site.siteId : 'Fence';
+      const name = siteName(site, site.siteId);
       layers[1].bindTooltip(fence ? name : name + ' (est.)', {
         permanent: true,
         direction: 'top',
@@ -721,7 +725,7 @@ window.PMMap = (function () {
           rows: [
             ['Position', fmt.coords(log.location)],
             ['Accuracy', fmt.accuracy(log.accuracy)],
-            ['Site', log.siteId != null ? 'Site ' + log.siteId : 'unmapped'],
+            ['Site', log.siteId != null || log.siteName ? esc(siteName({ name: log.siteName, address: log.siteAddress }, log.siteId)) : 'unmapped'],
             ['Reported', log.isWithinRadius ? 'within the radius' : 'outside the radius'],
             ['Geometry', log.actualIsWithinRadius ? 'within the radius' : 'outside the radius'],
             ['Buffer', log.graceApplied ? 'passed only on the accuracy buffer (+' + fmt.metres(log.radiusPadding) + ')' : null],

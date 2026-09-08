@@ -99,6 +99,11 @@ router.get('/sites', async (req, res, next) => {
       estimated: filtered.filter((r) => r.centreIsEstimate).length,
       plottable: filtered.filter((r) => r.plottable).length,
       relocated: filtered.filter((r) => r.relocated).length,
+      // How many sites have a name of their own. Zero would mean no build has
+      // reported a site record yet, and the page should say that rather than
+      // look like it lost the names.
+      named: filtered.filter((r) => r.nameSource === 'record').length,
+      deleted: filtered.filter((r) => r.deleted).length,
     });
   } catch (err) {
     next(err);
@@ -110,8 +115,12 @@ router.get('/sites.csv', async (req, res, next) => {
     const sites = await getSites();
     const text = csv.toCsv(sites, [
       { key: 'siteId', label: 'Site ID' },
-      { key: 'label', label: 'Label' },
+      { key: 'name', label: 'Name' },
+      { key: 'displayName', label: 'Display Name' },
+      { key: 'nameSource', label: 'Name Source' },
       { key: 'address', label: 'Address' },
+      { key: 'addressSource', label: 'Address Source' },
+      { key: 'siteAreaId', label: 'Site Area ID' },
       { key: 'city', label: 'City' },
       { key: 'country', label: 'Country' },
       { key: 'lat', label: 'Latitude' },
@@ -123,6 +132,9 @@ router.get('/sites.csv', async (req, res, next) => {
       { key: 'centreConfidence', label: 'Centre Confidence' },
       { key: 'fenceOnRecord', label: 'Fence On Record' },
       { key: 'fenceMovedMetres', label: 'Fence Moved (m)' },
+      { key: 'radiusChangedFrom', label: 'Previous Radius (m)' },
+      { key: 'recordUpdatedAt', label: 'Site Record Updated (UTC)' },
+      { key: 'deleted', label: 'Record Soft-Deleted' },
       { key: 'validations', label: 'Geofence Checks' },
       { key: 'outsideEvents', label: 'Outside Events' },
       { key: 'graceEvents', label: 'Accuracy-Grace Events' },
