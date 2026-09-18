@@ -49,6 +49,7 @@ See [The password](#the-password).
 | `COLLECTION_SNAPSHOTS` | `ekosClientState` | device/user heartbeats |
 | `COLLECTION_CLOCKIN_LOGS` | `validateClockInLogs` | geofence validation calls |
 | `COLLECTION_EXIT_WINDOWS` | *(empty)* | leave empty: auto-detected |
+| `COLLECTION_SHIFT_TRAILS` | *(empty)* | leave empty: auto-detected |
 | `APP_USERNAME` | *(empty)* | set both to switch the password gate on |
 | `APP_PASSWORD` | *(empty)* | leave either empty and the console is open |
 | `PORT` | `4310` | local only |
@@ -185,6 +186,7 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
 | **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. The **same trail map the user page has** sits above the table - the same Fixes limit, time window, State filter, merging, layer toolbar and replay - drawn from `/api/track` rather than from the table's own page of rows. |
 | **User page** (`user.html?userId=…`) | One user end to end, opened from the table with a link back to it. Above: hero header with live badges, eight KPI tiles, and the person / device / right-now / shift detail cards. Below, in tabs: **location & trail** (map, layer toolbar, its own time window, and a replay that walks the trail heartbeat by heartbeat), **history** charts, **heartbeats** (every stored document, paged, click a row for its fix on a map plus its full breakdown, with its own time window and an **offline-only** toggle), **geofence validation calls**, **exit windows** (the Exit Windows table and its replay drawer, filtered to this person - one shared view, not a thinner copy), **raw document**. Tab counts show how much is in each, the active tab lives in the URL hash (`#heartbeats`) so it can be linked, and panels render lazily — a chart or map sized inside a hidden panel comes out 0x0. |
+| **Shift Trails** | The app's own state, written as a trail of entries rather than as heartbeats: when, which app process (`runId`), which person, which site, which handset, battery, and the **live** location permission and precision. No coordinates, so no map and no fence verdict. What it answers that nothing else can: the app process was **recreated** (an OS kill or a crash, seen as a changed `runId`), the location permission **right now** rather than as cached on a heartbeat, and that a person **exists at all** before they have ever sent a heartbeat. |
 | **Geofence Checks** | Every `validateClockInLogs` call with the geometry recomputed beside the API's verdict: distance from centre and boundary, whether the accuracy padding (`effectiveRadius`) is the only reason a check passed, auto clock-outs, unmapped clock-ins. Scatter of accuracy against distance from the boundary. |
 | **Exit Windows** | The grace period that opens when a device leaves a fence: outcome, duration, sample verdicts, furthest distance outside, and a replay map of the sample path with guidance back to the site. Read live from the `exit_window` documents mixed into `ekosClientState`. |
 | **Geofence Sites** | The fence registry — **name**, centre, radius, address, live occupancy, boundary failures, accuracy-grace events, auto clock-outs. Every geometry number carries its provenance, and a site with no fence on record is shown as an estimate rather than a fence. |
@@ -1323,6 +1325,81 @@ rejected server-side. Filter sets can be saved as named views (stored in the bro
 
 Tables export to CSV with the recomputed geometry included.
 
+## Shift trails
+
+A third payload, and eventually the replacement for the heartbeat snapshot. Eight
+fields:
+
+```json
+{ "recordedAt": "2026-09-18T10:31:07.412Z", "runId": "…", "userId": 4821,
+  "siteId": 133, "deviceType": "android", "batteryPercentage": 68,
+  "locationPermission": "always", "locationPrecision": "fine" }
+```
+
+**A name worth being careful about.** "Trail" everywhere else in this console means
+a path on a map — `trailmap.view.js`, the trail panel the user page and Heartbeats
+share. A shift trail is not that. **None of these eight fields is a coordinate**, so
+this page has no map, no path and no replay, and does not pretend otherwise: for
+where somebody was, the heartbeats are still the only source. What a shift trail
+traces is a shift's *device state* over time, not its geography. What it has instead
+is three things the rest of the console cannot see:
+
+- **`runId` is the only restart detector in the store.** It changes when the JS
+  runtime is recreated, which from the outside is an OS kill, a crash or a
+  force-quit — and on Android, an OEM battery killer stopping the app is one of the
+  likelier explanations for the heartbeat gaps the Heartbeats page already measures.
+  A *run* is one `(userId, runId)` pair; two runs for one person inside the window
+  means the process died between them, and the first entry of the second run is where.
+- **`locationPermission` is read live**, where a heartbeat carries a cached
+  `permissionsEnabled` array plus a separate "allow all the time" flag. One enum
+  instead of two fields to reconcile.
+- **An entry names its user outright.** An exit window carries `userId: null` and has
+  to be matched to a person by GPS fingerprint; an entry does not. So a person who has
+  only ever produced trail entries is visible here — and the page counts them, because that
+  is the case this payload was added for.
+
+**Three limits, stated on the page rather than papered over.** A gap between entries
+is *not* presented as a fault, because the payload does not yet say whether it writes
+on a timer or on events, and only the first of those makes silence mean anything —
+the volume chart is there so the cadence can be read off it directly. A restart is
+only counted when both runs sit inside the selected range, so each person's earliest
+run is never counted as one. And with no `deviceId`, one person on two handsets is
+indistinguishable from one handset restarting; `runId` cannot stand in for a device
+id precisely because it changes on restart.
+
+**`locationPrecision` is null on iOS, and that is an answer, not a gap.** It renders
+as "not reported" and never as `fine`, and it is selectable in its own dropdown.
+`coarse` on Android is the explanation behind fixes that land 1–3 km out, which
+nothing else in this store can account for.
+
+**A third kind broke an assumption in the isolation filter.** Heartbeats were
+isolated from exit windows with `{ type: { $ne: 'exit_window' } }` — a *negation*,
+written when exit windows were the only other thing in `ekosClientState`. A device
+trail entry is not an exit window either, so every one of them landing in that collection
+would have been counted as a heartbeat in the sidebar, in `/api/stats` and in the
+Heartbeats table, and `normalize.snapshot` would have rendered it as a row of nulls
+rather than failing. `db.baseFilterFor()` now names every kind present instead: the
+two recognisable kinds are selected positively by their own shape, and the two with
+no marker of their own are what is left. A negation is only as correct as the list it
+was written against.
+
+**Timestamps are matched as a date *or* an ISO string.** The payload shows a quoted
+timestamp, and whether that reaches Mongo as a BSON date or as a string depends on
+how the writer builds the document — but Mongo compares by BSON type before value, so
+a date-typed range silently matches none of the string-typed documents. Getting no
+rows for a range that plainly contains data is the least debuggable failure there is,
+so both are asked for. (The payload review asks the writer to settle on one type;
+this is what keeps the page correct until it does.)
+
+**Still to come from the writer**, and why each matters, is in the payload review:
+a `type` discriminator, `schemaVersion`, a server-stamped arrival time next to
+`recordedAt`, `deviceId`, `runStartedAt`, `trigger`, and `locationServicesEnabled`.
+The parity set needed before this can actually replace the heartbeat — coordinates,
+the embedded site record, connectivity, clock-in state, tenant, name, app build — is
+larger, and the largest single item is that the fence registry currently learns every
+site name and every fence circle from the heartbeat's `siteDetails` and from nowhere
+else.
+
 ## Exit windows, and mixed document kinds
 
 **One collection holds more than one kind of document.** `ekosClientState` carries the
@@ -1518,6 +1595,9 @@ GET  /api/track                      (the trail, any filter, up to 100k lean poi
 GET  /api/logs                       GET /api/logs.csv      GET /api/logs/:id
 GET  /api/exit-windows               GET /api/exit-windows.csv
 GET  /api/exit-windows/:id           GET /api/sites         GET /api/sites.csv
+GET  /api/shift-trails               GET /api/shift-trails.csv
+GET  /api/shift-trails/summary       GET /api/shift-trails/meta
+GET  /api/shift-trails/:id           (one entry, its run, and the raw document)
 GET  /api/issues                     GET /api/issues.csv    (compare=1 adds the previous window)
 GET  /api/fence-time                 GET /api/fence-time.csv (visits=1 returns every visit)
 POST /api/query                      GET /api/query/fields  GET /api/refresh-schema

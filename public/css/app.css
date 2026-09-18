@@ -408,6 +408,9 @@ textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
 .tile.is-warning .tile-value { color: var(--warning-fg); }
 .tile.is-critical .tile-value { color: var(--critical-fg); }
 .tile.is-serious .tile-value { color: var(--serious-fg); }
+/* Not a severity: a count that is notable rather than wrong - people the
+   shift trails know about that the heartbeats have never seen. */
+.tile.is-info .tile-value { color: var(--info-fg); }
 .tile.clickable { cursor: pointer; }
 .tile.clickable:hover { border-color: var(--border-strong); background: var(--surface-2); }
 
@@ -1125,6 +1128,12 @@ select[multiple] { appearance: auto; background-image: none; padding-right: 4px;
 }
 .hb-gap:hover > td { background: var(--warning-bg); }
 .hb-gap.is-critical:hover > td { background: var(--critical-bg); }
+
+/* A row where something happened, rather than a row that reports a state:
+   on Shift Trails this is the line a new run begins on, which is the app
+   process having been recreated. Marked on the leading edge only - the row
+   still has to read as one of the table's rows, not as a callout. */
+tr.is-flagged > td:first-child { box-shadow: inset 3px 0 0 var(--critical-fg); }
 
 .hb-gap-label {
   font-weight: 650; font-size: 12px; color: var(--warning-fg); margin-right: 10px;

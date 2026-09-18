@@ -36,10 +36,31 @@ const EXIT_WINDOW_FILTER = {
 };
 
 /**
+ * Documents of this shape are shift trails, wherever they live.
+ *
+ * `runId` is the discriminator because it is the one field no other kind in
+ * this store has, and it is not optional on a line: the whole point of the
+ * payload is that a changed runId means the app process was recreated. The
+ * writer may add a `type` later - that is asked for in the payload review -
+ * and this accepts it either way rather than waiting for it.
+ *
+ * Shape, not name: the same rule the other two kinds are found by, so the
+ * lines are picked up whether they land in their own collection or get mixed
+ * into ekosClientState the way the exit windows are.
+ */
+const SHIFT_TRAIL_FILTER = {
+  $or: [{ type: 'device_state' }, { runId: { $exists: true, $ne: null } }],
+};
+
+/** Every kind this app reads, in the order a shared collection is split by. */
+const KINDS = ['snapshots', 'clockInLogs', 'exitWindows', 'shiftTrails'];
+
+/**
  * Figures out which collection holds what.
  *  - snapshots   : ekosClientState-style device/user heartbeat documents
  *  - clockInLogs : validateClockInLogs-style geofence validation calls
  *  - exitWindows : { type: 'exit_window' } documents
+ *  - shiftTrails : runId-carrying device state lines
  *
  * Document kinds are MIXED inside a collection here - the app writes exit
  * windows into ekosClientState alongside the heartbeats - so each collection is
@@ -57,6 +78,7 @@ async function resolveCollections({ force = false } = {}) {
     snapshots: config.collections.snapshots || null,
     clockInLogs: config.collections.clockInLogs || null,
     exitWindows: config.collections.exitWindows || null,
+    shiftTrails: config.collections.shiftTrails || null,
     counts: {},
     detected: {},
   };
@@ -69,8 +91,9 @@ async function resolveCollections({ force = false } = {}) {
     let exitHit = null;
     let snapshotHit = null;
     let logHit = null;
+    let lineHit = null;
     try {
-      [exitHit, snapshotHit, logHit] = await Promise.all([
+      [exitHit, snapshotHit, logHit, lineHit] = await Promise.all([
         col.findOne(EXIT_WINDOW_FILTER, { projection: { _id: 1 }, maxTimeMS: 8000 }),
         col.findOne(
           { $or: [{ currentUser: { $exists: true } }, { currentUserLocation: { $exists: true } }] },
@@ -80,6 +103,7 @@ async function resolveCollections({ force = false } = {}) {
           { requestBody: { $exists: true }, response: { $exists: true } },
           { projection: { _id: 1 }, maxTimeMS: 8000 }
         ),
+        col.findOne(SHIFT_TRAIL_FILTER, { projection: { _id: 1 }, maxTimeMS: 8000 }),
       ]);
     } catch (err) {
       continue; // unreadable collection
@@ -88,9 +112,10 @@ async function resolveCollections({ force = false } = {}) {
     if (exitHit && !out.detected.exitWindows) out.detected.exitWindows = name;
     if (snapshotHit && !out.detected.snapshots) out.detected.snapshots = name;
     if (logHit && !out.detected.clockInLogs) out.detected.clockInLogs = name;
+    if (lineHit && !out.detected.shiftTrails) out.detected.shiftTrails = name;
   }
 
-  for (const key of ['snapshots', 'clockInLogs', 'exitWindows']) {
+  for (const key of KINDS) {
     if (!out[key] || !names.includes(out[key])) out[key] = out.detected[key] || null;
   }
   // The env var can name a collection that does not hold that kind at all (the
@@ -100,24 +125,22 @@ async function resolveCollections({ force = false } = {}) {
     out.exitWindows = out.detected.exitWindows;
   }
 
-  // A single collection may hold exit windows mixed in with another kind.
-  out.exitWindowsSharesCollection =
-    !!out.exitWindows && (out.exitWindows === out.snapshots || out.exitWindows === out.clockInLogs);
+  // A single collection may hold more than one kind mixed together.
+  const sharesWith = (kind) => KINDS.filter((k) => k !== kind && out[k] && out[k] === out[kind]);
+  out.exitWindowsSharesCollection = !!out.exitWindows && sharesWith('exitWindows').length > 0;
+  out.shiftTrailsSharesCollection = !!out.shiftTrails && sharesWith('shiftTrails').length > 0;
 
-  for (const key of ['snapshots', 'clockInLogs', 'exitWindows']) {
+  for (const key of KINDS) {
     if (!out[key]) continue;
     try {
       const col = db.collection(out[key]);
-      if (out.exitWindowsSharesCollection && out.exitWindows === out[key]) {
-        // Shared collection: count each kind separately so the sidebar totals
-        // and the empty-state checks stay honest.
-        out.counts[key] =
-          key === 'exitWindows'
-            ? await col.countDocuments(EXIT_WINDOW_FILTER, { maxTimeMS: 15000 })
-            : await col.countDocuments({ type: { $ne: 'exit_window' } }, { maxTimeMS: 15000 });
-      } else {
-        out.counts[key] = await col.estimatedDocumentCount();
-      }
+      const base = baseFilterFor(key, out);
+      // Shared collection: count each kind separately so the sidebar totals
+      // and the empty-state checks stay honest. Alone in its collection, the
+      // cheap estimate is enough.
+      out.counts[key] = Object.keys(base).length
+        ? await col.countDocuments(base, { maxTimeMS: 15000 })
+        : await col.estimatedDocumentCount();
     } catch (err) {
       out.counts[key] = null;
     }
@@ -125,6 +148,38 @@ async function resolveCollections({ force = false } = {}) {
 
   store.resolved = out;
   return out;
+}
+
+/**
+ * The filter that isolates one kind inside whatever collection holds it.
+ *
+ * Empty when the kind has its collection to itself. Otherwise the two
+ * recognisable kinds are selected *positively* by their own shape, and the two
+ * that have no marker of their own - heartbeats and clock-in logs - are what is
+ * left once the others are excluded.
+ *
+ * That exclusion has to name every other kind present, which is the whole
+ * reason this function exists. It used to be the bare negation
+ * `{ type: { $ne: 'exit_window' } }`, written when exit windows were the only
+ * other thing in ekosClientState. A third kind landing in that collection is
+ * not an exit window either, so every shift trail would have been counted as a
+ * heartbeat - in the sidebar, in /api/stats and in the Heartbeats table - and
+ * normalize.snapshot would have rendered it as a row of nulls rather than
+ * failing loudly. A negation is only ever as correct as the list of things it
+ * was written against.
+ */
+function baseFilterFor(kind, map) {
+  const name = map[kind];
+  const shares = KINDS.filter((k) => k !== kind && map[k] && map[k] === name);
+  if (!shares.length) return {};
+  if (kind === 'exitWindows') return EXIT_WINDOW_FILTER;
+  if (kind === 'shiftTrails') return SHIFT_TRAIL_FILTER;
+
+  const clauses = [];
+  if (shares.includes('exitWindows')) clauses.push({ type: { $ne: 'exit_window' } });
+  if (shares.includes('shiftTrails')) clauses.push({ runId: { $exists: false } });
+  if (!clauses.length) return {};
+  return clauses.length === 1 ? clauses[0] : { $and: clauses };
 }
 
 /** Collection handle plus the base filter that isolates that document kind. */
@@ -138,12 +193,7 @@ async function collectionFor(kind) {
     err.code = 'COLLECTION_MISSING';
     throw err;
   }
-  let base = {};
-  if (map.exitWindowsSharesCollection && map.exitWindows === name) {
-    // Isolate the kind: exit windows in, or everything that is not one out.
-    base = kind === 'exitWindows' ? EXIT_WINDOW_FILTER : { type: { $ne: 'exit_window' } };
-  }
-  return { col: db.collection(name), name, base };
+  return { col: db.collection(name), name, base: baseFilterFor(kind, map) };
 }
 
 async function ping() {
@@ -161,4 +211,13 @@ async function close() {
   store.resolved = null;
 }
 
-module.exports = { getDb, resolveCollections, collectionFor, ping, close, EXIT_WINDOW_FILTER };
+module.exports = {
+  getDb,
+  resolveCollections,
+  collectionFor,
+  ping,
+  close,
+  EXIT_WINDOW_FILTER,
+  SHIFT_TRAIL_FILTER,
+  KINDS,
+};

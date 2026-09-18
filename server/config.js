@@ -20,6 +20,7 @@ module.exports = {
     snapshots: process.env.COLLECTION_SNAPSHOTS || 'ekosClientState',
     clockInLogs: process.env.COLLECTION_CLOCKIN_LOGS || 'validateClockInLogs',
     exitWindows: process.env.COLLECTION_EXIT_WINDOWS || '', // '' => auto-detect
+    shiftTrails: process.env.COLLECTION_SHIFT_TRAILS || '', // '' => auto-detect
   },
   username: USERNAME,
   password: PASSWORD,

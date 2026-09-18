@@ -12,6 +12,7 @@ window.PM = (function () {
     { file: 'map.html', title: 'Live Map', icon: '◎', group: 'Monitoring' },
     { file: 'users.html', title: 'Users & Devices', icon: '☰', group: 'Monitoring' },
     { file: 'heartbeats.html', title: 'Heartbeats', icon: '∿', group: 'Monitoring', countKey: 'snapshots' },
+    { file: 'shift-trails.html', title: 'Shift Trails', icon: '⌁', group: 'Monitoring', countKey: 'shiftTrails' },
     { file: 'checks.html', title: 'Geofence Checks', icon: '⛨', group: 'Geofencing', countKey: 'clockInLogs' },
     { file: 'exit-windows.html', title: 'Exit Windows', icon: '⇥', group: 'Geofencing' },
     { file: 'sites.html', title: 'Geofence Sites', icon: '⬡', group: 'Geofencing' },

@@ -432,6 +432,114 @@ function exitWindowMatch(q) {
   return and(clauses);
 }
 
+// ---------------------------------------------------------------------------
+// device state lines
+// ---------------------------------------------------------------------------
+
+/**
+ * Every field on a line is top-level and scalar, so unlike the other three
+ * kinds there is no path map to keep - the query-string name and the stored
+ * name are the same word.
+ */
+function shiftTrailMatch(q) {
+  const clauses = [];
+
+  /**
+   * `recordedAt` is the only clock these documents carry, so it is the one the
+   * range applies to. When the writer adds a server-stamped arrival time this
+   * should accept either, the way exitWindowMatch already does.
+   *
+   * Matched as a date OR as an ISO string. The payload shows a quoted
+   * timestamp, and whether that reaches Mongo as a BSON date or as a string
+   * depends on how the writer builds the document - but Mongo compares by BSON
+   * type before value, so a date-typed range silently matches none of the
+   * string-typed documents. Getting no rows for a range that plainly contains
+   * data is the least debuggable failure there is, so both are asked for.
+   * UTC ISO-8601 sorts lexicographically in time order, which is what makes
+   * the string half of this correct rather than approximate.
+   */
+  const from = str(q.from);
+  const to = str(q.to);
+  if (from || to) {
+    const asDate = {};
+    const asText = {};
+    if (from) {
+      const d = new Date(from);
+      if (!Number.isNaN(d.getTime())) {
+        asDate.$gte = d;
+        asText.$gte = d.toISOString();
+      }
+    }
+    if (to) {
+      const d = new Date(to);
+      if (!Number.isNaN(d.getTime())) {
+        asDate.$lte = d;
+        asText.$lte = d.toISOString();
+      }
+    }
+    if (Object.keys(asDate).length) {
+      clauses.push({ $or: [{ recordedAt: asDate }, { recordedAt: asText }] });
+    }
+  }
+
+  const users = nums(q.userId);
+  if (users.length) clauses.push({ userId: { $in: users } });
+
+  // `jobSiteId` is what the shared filter bar calls a site everywhere else, so
+  // both spellings are accepted and the page keeps carrying its site filter
+  // when you move to it from Heartbeats or Sites.
+  const siteTokens = list(q.siteId).concat(list(q.jobSiteId));
+  const sites = siteTokens.map(Number).filter(Number.isFinite);
+  const wantsNoSite = siteTokens.some((t) => t === 'null' || t === 'none');
+  if (sites.length || wantsNoSite) {
+    const or = [];
+    if (sites.length) or.push({ siteId: { $in: sites } });
+    // A line with no site is a device not clocked into a mapped one. That is a
+    // selectable state, not an absence, so it gets its own token.
+    if (wantsNoSite) or.push({ siteId: null });
+    clauses.push(or.length === 1 ? or[0] : { $or: or });
+  }
+
+  const devices = list(q.deviceType);
+  if (devices.length) clauses.push({ deviceType: { $in: devices } });
+
+  const runs = list(q.runId);
+  if (runs.length) clauses.push({ runId: { $in: runs } });
+
+  const permissions = list(q.locationPermission);
+  if (permissions.length) clauses.push({ locationPermission: { $in: permissions } });
+
+  const precisions = list(q.locationPrecision);
+  if (precisions.length) {
+    // "Not reported" is a value here - it is what every iOS line says - so it
+    // has to be selectable, and it is null rather than a missing field.
+    const wanted = precisions.filter((p) => p !== 'null');
+    const or = [];
+    if (wanted.length) or.push({ locationPrecision: { $in: wanted } });
+    if (precisions.includes('null')) or.push({ locationPrecision: null });
+    if (or.length) clauses.push(or.length === 1 ? or[0] : { $or: or });
+  }
+
+  const battery = {};
+  if (num(q.batteryMin) !== null) battery.$gte = num(q.batteryMin);
+  if (num(q.batteryMax) !== null) battery.$lte = num(q.batteryMax);
+  if (Object.keys(battery).length) clauses.push({ batteryPercentage: battery });
+
+  const search = str(q.search);
+  if (search) {
+    const rx = { $regex: escapeRegex(search), $options: 'i' };
+    const or = [{ runId: rx }, { deviceType: rx }, { locationPermission: rx }];
+    const asNumber = Number(search);
+    if (Number.isFinite(asNumber)) or.push({ userId: asNumber }, { siteId: asNumber });
+    clauses.push({ $or: or });
+  }
+
+  const where = parseWhere(q.where);
+  if (where) clauses.push(where);
+
+  return and(clauses);
+}
+
 /** Applied after sample statistics have been computed. */
 function exitWindowPostMatch(q) {
   const clauses = [];
@@ -482,6 +590,7 @@ module.exports = {
   logMatch,
   exitWindowMatch,
   exitWindowPostMatch,
+  shiftTrailMatch,
   parseWhere,
   assertReadOnly,
   pagination,

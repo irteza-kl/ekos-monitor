@@ -47,6 +47,20 @@ const PLAN = [
       { key: { status: 1, openedAt: -1 }, name: 'status_openedAt', why: 'open/expired/resolved filters' },
     ],
   },
+  {
+    collection: 'shiftTrails',
+    indexes: [
+      // This one is not a nicety. The shift-trails table sorts by recordedAt
+      // with find(), which without an index is a blocking sort - and this
+      // cluster does not honour allowDiskUse, so at volume it would fail at
+      // 32 MB rather than merely run slowly. See the README.
+      { key: { recordedAt: -1 }, name: 'recordedAt_desc', why: 'the shift-trails table default sort and every time range' },
+      { key: { userId: 1, recordedAt: -1 }, name: 'user_recordedAt', why: 'per-user lines and the run index' },
+      { key: { userId: 1, runId: 1 }, name: 'user_run', why: 'grouping lines into runs, which is what detects a restart' },
+      { key: { siteId: 1, recordedAt: -1 }, name: 'site_recordedAt', why: 'site filter' },
+      { key: { locationPermission: 1, recordedAt: -1 }, name: 'permission_recordedAt', why: 'the denied / foreground-only filters and tiles' },
+    ],
+  },
 ];
 
 (async () => {

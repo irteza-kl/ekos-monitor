@@ -11,7 +11,7 @@ const router = express.Router();
 /** Only collections the dashboard knows about can be queried. */
 async function allowedCollections() {
   const map = await resolveCollections();
-  return [map.snapshots, map.clockInLogs, map.exitWindows].filter(Boolean);
+  return [map.snapshots, map.clockInLogs, map.exitWindows, map.shiftTrails].filter(Boolean);
 }
 
 function parseObject(value, label) {

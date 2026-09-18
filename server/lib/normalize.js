@@ -282,6 +282,72 @@ function snapshot(doc) {
 }
 
 /**
+ * Device state line -> flat row.
+ *
+ * Eight fields, and deliberately no more: this normalizer invents nothing the
+ * document does not say. In particular it does NOT derive a position, a fence
+ * verdict or an accuracy band - a line carries no coordinates at all, and a
+ * column that reads "unknown" on every row is worse than a column that is not
+ * there.
+ *
+ * Three fields the console has elsewhere are answered better here, and the
+ * difference is worth stating because it is why this is not folded into the
+ * heartbeat's shape:
+ *
+ *   locationPermission   read live off the OS, where the heartbeat carries a
+ *                        cached array plus a separate "allow all the time"
+ *                        flag. One live enum, no reconciliation.
+ *   locationPrecision    null on iOS, and that is a real answer - "not
+ *                        reported" - not a missing one. Never defaulted.
+ *   runId                no equivalent anywhere in the store. A change in it
+ *                        between two lines is the app process having been
+ *                        recreated, which is the one failure this console has
+ *                        never been able to see.
+ */
+const LOCATION_PERMISSIONS = ['always', 'when_in_use', 'denied'];
+
+function shiftTrail(doc) {
+  if (!doc) return null;
+
+  // One clock today. `recordedAt` is when the line was written, and until the
+  // writer also sends a server-stamped arrival time there is nothing to
+  // measure sync lag against - so none is reported rather than guessed.
+  const recordedAt = flexibleIso(doc.recordedAt);
+  const permission = doc.locationPermission || null;
+
+  return {
+    id: String(doc._id),
+    kind: 'shiftTrail',
+    recordedAt,
+    // The name every other row in this console uses for "when this happened",
+    // so the shared filter bar, the pager and the CSV need no special case.
+    capturedAt: recordedAt,
+    ageMinutes: minutesSince(recordedAt),
+
+    runId: doc.runId ? String(doc.runId) : null,
+    userId: n(doc.userId),
+    siteId: n(doc.siteId),
+    deviceType: doc.deviceType || null,
+
+    battery: n(doc.batteryPercentage),
+
+    locationPermission: permission,
+    // An unrecognised value is reported as-is and flagged, never silently
+    // bucketed into one of the three we know - a new enum member arriving from
+    // the app is something to notice, not to hide.
+    locationPermissionKnown: permission === null || LOCATION_PERMISSIONS.includes(permission),
+    // "always" is the only setting that keeps tracking alive in the background.
+    locationAlways: permission === 'always',
+    locationDenied: permission === 'denied',
+
+    locationPrecision: doc.locationPrecision || null,
+    // Android only. On iOS the field is null by design, so "not coarse" here
+    // means "not reported", and the two must not read the same.
+    coarseLocation: doc.locationPrecision === 'coarse',
+  };
+}
+
+/**
  * validateClockInLogs document -> flat row. Recomputes the geometry from the
  * stored coordinates so the dashboard can show what the device reported next to
  * what the numbers actually say.
@@ -505,4 +571,5 @@ function consecutive(samples, verdict) {
 
 module.exports = {
   flexibleIso,
-  heartbeatTime, snapshot, clockInLog, exitWindow, ALL_PERMISSIONS, iso, num: n };
+  heartbeatTime, snapshot, clockInLog, exitWindow, shiftTrail,
+  ALL_PERMISSIONS, LOCATION_PERMISSIONS, iso, num: n };

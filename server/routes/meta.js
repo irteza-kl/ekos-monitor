@@ -38,6 +38,7 @@ router.get('/meta', async (req, res, next) => {
         snapshots: collections.snapshots,
         clockInLogs: collections.clockInLogs,
         exitWindows: collections.exitWindows,
+        shiftTrails: collections.shiftTrails,
         counts: collections.counts,
         available: collections.available,
       },
@@ -263,6 +264,7 @@ router.get('/health', async (req, res) => {
         snapshots: collections.snapshots,
         clockInLogs: collections.clockInLogs,
         exitWindows: collections.exitWindows,
+        shiftTrails: collections.shiftTrails,
       },
       serverTime: new Date().toISOString(),
     });
