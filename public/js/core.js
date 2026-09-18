@@ -16,6 +16,7 @@ window.PM = (function () {
     { file: 'checks.html', title: 'Geofence Checks', icon: '⛨', group: 'Geofencing', countKey: 'clockInLogs' },
     { file: 'exit-windows.html', title: 'Exit Windows', icon: '⇥', group: 'Geofencing' },
     { file: 'sites.html', title: 'Geofence Sites', icon: '⬡', group: 'Geofencing' },
+    { file: 'raw.html', title: 'Raw Documents', icon: '❴❵', group: 'Data' },
     { file: 'explorer.html', title: 'Query Explorer', icon: '⌨', group: 'Data' },
   ];
 

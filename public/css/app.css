@@ -738,6 +738,23 @@ pre.json {
   border-radius: var(--radius-sm); overflow: auto; max-height: 460px;
   font-family: var(--mono); font-size: 12px; color: var(--ink-2); line-height: 1.55;
 }
+/* ------------------------------------------------------- raw document table */
+/* A normal table of chosen columns, with the whole document folded into a row
+   underneath each one. Collapsed by default because these are long - a
+   heartbeat carries the embedded employee record - and the reason to open this
+   page is usually to scan what arrived, not to read one document end to end. */
+.raw-caret-col { width: 22px; padding-right: 0 !important; }
+.raw-caret { color: var(--ink-muted); font-size: 13px; }
+.raw-table td.raw-at { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.raw-table td.raw-actions { width: 1%; text-align: right; }
+
+.raw-json-row > td { padding: 0 !important; background: var(--surface-2); }
+.raw-json-row pre.json {
+  border: 0; border-top: 1px solid var(--border); border-radius: 0;
+  max-height: 620px; background: var(--surface-2);
+}
+.raw-json-row:hover > td { background: var(--surface-2); }
+
 pre.json .k { color: var(--json-key); }
 pre.json .s { color: var(--json-string); }
 pre.json .n { color: var(--json-number); }

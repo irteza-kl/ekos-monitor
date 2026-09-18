@@ -146,6 +146,7 @@ app.use('/api', require('./routes/shiftTrails'));
 app.use('/api', require('./routes/sites'));
 app.use('/api', require('./routes/issues'));
 app.use('/api', require('./routes/fence'));
+app.use('/api', require('./routes/raw'));
 app.use('/api', require('./routes/query'));
 
 app.get('/api/refresh-schema', async (req, res, next) => {
