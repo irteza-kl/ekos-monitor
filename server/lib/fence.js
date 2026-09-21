@@ -64,109 +64,119 @@ const JITTER_MS = 60 * 1000;
 
 
 /**
- * Both halves of the answer in one pass over the collection.
+ * Both halves of the answer, as two aggregations run at once.
  *
- * The dwell branch needs a partition sort, which $setWindowFields does in
- * memory against a hard 32 MB budget on this deployment - allowDiskUse is not
- * honoured here - so that branch re-projects down to four fields before the
- * sort while the other branch keeps the wider set it needs. Running them as
- * $facet branches rather than two aggregations halves the read work, which is
- * what the cold path actually pays for.
+ * This was one `$facet` with both halves as branches, which halved the read
+ * work - and died with "Sort exceeded memory limit of 33554432 bytes" once the
+ * collection passed ~80,000 heartbeats, taking /api/fence-time and
+ * /api/issues down with it.
+ *
+ * **The `$facet` was the whole problem, not the size of the data.** Measured on
+ * the collection that failed: the dwell branch on its own completes in 1.1 s;
+ * the identical branch wrapped in a `$facet` exceeds the budget. A `$facet`
+ * materialises its branches, so the partition sort inside `$setWindowFields`
+ * loses whatever bounding it otherwise gets and has to hold the whole matched
+ * set at once - against a hard 32 MB ceiling, because this deployment does not
+ * honour allowDiskUse (Atlas shared tiers ignore it; the README records the
+ * same finding for `$sort`).
+ *
+ * So the branches are two pipelines now, issued together. That costs a second
+ * pass over the collection, and buys a query that finishes: both halves take
+ * about the same second, and running them concurrently puts the wall-clock
+ * back where the `$facet` had it. Half a pass that fails is not cheaper.
+ *
+ * The dwell pipeline also projects its four fields straight off the
+ * collection rather than narrowing a wider projection, so the partition sort
+ * carries the least it can.
  */
 async function loadFence(query) {
   const { col, base } = await collectionFor('snapshots');
   const match = F.and([base, F.snapshotMatch(query)]);
 
-  const facet = await col
-    .aggregate(
-      [
-        { $match: match },
-        {
-          $project: {
-            _id: 0,
-            createdAt: 1,
-            _u: '$' + SNAP.userId,
-            _in: '$isInsideGeofence',
-            _clocked: '$clockedIn',
-            _name: '$' + SNAP.fullName,
-            _tz: '$timezone',
-            _gin: '$geofenceIn',
-            _gout: '$geofenceOut',
-            _site: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
-          },
-        },
-        { $match: { _u: { $ne: null } } },
-        {
-          $facet: {
-            // Time per state, by integration.
-            dwell: [
-              // Narrow again before the partition sort - this is the budget.
-              { $project: { createdAt: 1, _u: 1, _in: 1, _clocked: 1 } },
-              {
-                $setWindowFields: {
-                  partitionBy: '$_u',
-                  sortBy: { createdAt: 1 },
-                  output: { _nextAt: { $shift: { output: '$createdAt', by: 1 } } },
-                },
-              },
-              { $addFields: { _rawMs: { $subtract: ['$_nextAt', '$createdAt'] } } },
-              // The last heartbeat of a partition has nothing to measure against.
-              { $match: { _rawMs: { $ne: null } } },
-              { $addFields: { _ms: { $min: ['$_rawMs', CAP_MS] } } },
-              {
-                $group: {
-                  _id: { user: '$_u', inside: '$_in' },
-                  // Capped time is what was observed; the difference from raw
-                  // time is silence, reported rather than quietly credited.
-                  ms: { $sum: '$_ms' },
-                  rawMs: { $sum: '$_rawMs' },
-                  onClockMs: { $sum: { $cond: [{ $eq: ['$_clocked', true] }, '$_ms', 0] } },
-                },
-              },
-            ],
-            // Crossing events, the watched span, and what the newest heartbeat
-            // claims. Crossing markers are rare, so collecting them as sets
-            // costs little and saves two more passes.
-            observed: [
-              {
-                $group: {
-                  _id: '$_u',
-                  name: { $max: '$_name' },
-                  timezone: { $max: '$_tz' },
-                  beats: { $sum: 1 },
-                  firstBeatAt: { $min: '$createdAt' },
-                  lastBeatAt: { $max: '$createdAt' },
-                  insideBeats: { $sum: { $cond: [{ $eq: ['$_in', true] }, 1, 0] } },
-                  clockedBeats: { $sum: { $cond: [{ $eq: ['$_clocked', true] }, 1, 0] } },
-                  entries: {
-                    $addToSet: {
-                      $cond: [
-                        { $ne: ['$_gin', null] },
-                        { at: '$_gin', site: '$_site', onClock: '$_clocked' },
-                        '$$REMOVE',
-                      ],
-                    },
-                  },
-                  exits: { $addToSet: { $cond: [{ $ne: ['$_gout', null] }, '$_gout', '$$REMOVE'] } },
-                  // Decides "inside right now": the event stream alone cannot
-                  // tell a missing exit from a visit still in progress.
-                  latest: {
-                    $top: {
-                      sortBy: { createdAt: -1 },
-                      output: { inside: '$_in', at: '$createdAt', out: '$_gout', clockedIn: '$_clocked' },
-                    },
-                  },
-                },
-              },
-            ],
-          },
-        },
-      ],
-      opts
-    )
-    .next();
+  const dwellPipeline = [
+    { $match: match },
+    // Four fields, nothing else: this is the sort's budget.
+    { $project: { _id: 0, createdAt: 1, _u: '$' + SNAP.userId, _in: '$isInsideGeofence', _clocked: '$clockedIn' } },
+    { $match: { _u: { $ne: null } } },
+    {
+      $setWindowFields: {
+        partitionBy: '$_u',
+        sortBy: { createdAt: 1 },
+        output: { _nextAt: { $shift: { output: '$createdAt', by: 1 } } },
+      },
+    },
+    { $addFields: { _rawMs: { $subtract: ['$_nextAt', '$createdAt'] } } },
+    // The last heartbeat of a partition has nothing to measure against.
+    { $match: { _rawMs: { $ne: null } } },
+    { $addFields: { _ms: { $min: ['$_rawMs', CAP_MS] } } },
+    {
+      $group: {
+        _id: { user: '$_u', inside: '$_in' },
+        // Capped time is what was observed; the difference from raw time is
+        // silence, reported rather than quietly credited.
+        ms: { $sum: '$_ms' },
+        rawMs: { $sum: '$_rawMs' },
+        onClockMs: { $sum: { $cond: [{ $eq: ['$_clocked', true] }, '$_ms', 0] } },
+      },
+    },
+  ];
 
-  return { dwell: (facet && facet.dwell) || [], observed: (facet && facet.observed) || [] };
+  // Crossing events, the watched span, and what the newest heartbeat claims.
+  // Crossing markers are rare, so collecting them as sets costs little and
+  // saves two more passes.
+  const observedPipeline = [
+    { $match: match },
+    {
+      $project: {
+        _id: 0,
+        createdAt: 1,
+        _u: '$' + SNAP.userId,
+        _in: '$isInsideGeofence',
+        _clocked: '$clockedIn',
+        _name: '$' + SNAP.fullName,
+        _tz: '$timezone',
+        _gin: '$geofenceIn',
+        _gout: '$geofenceOut',
+        _site: { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+      },
+    },
+    { $match: { _u: { $ne: null } } },
+    {
+      $group: {
+        _id: '$_u',
+        name: { $max: '$_name' },
+        timezone: { $max: '$_tz' },
+        beats: { $sum: 1 },
+        firstBeatAt: { $min: '$createdAt' },
+        lastBeatAt: { $max: '$createdAt' },
+        insideBeats: { $sum: { $cond: [{ $eq: ['$_in', true] }, 1, 0] } },
+        clockedBeats: { $sum: { $cond: [{ $eq: ['$_clocked', true] }, 1, 0] } },
+        entries: {
+          $addToSet: {
+            $cond: [{ $ne: ['$_gin', null] }, { at: '$_gin', site: '$_site', onClock: '$_clocked' }, '$$REMOVE'],
+          },
+        },
+        exits: { $addToSet: { $cond: [{ $ne: ['$_gout', null] }, '$_gout', '$$REMOVE'] } },
+        // Decides "inside right now": the event stream alone cannot tell a
+        // missing exit from a visit still in progress.
+        latest: {
+          $top: {
+            sortBy: { createdAt: -1 },
+            output: { inside: '$_in', at: '$createdAt', out: '$_gout', clockedIn: '$_clocked' },
+          },
+        },
+      },
+    },
+  ];
+
+  // Issued together: two reads, one wall-clock. Serialising them would double
+  // the time a cold /api/fence-time takes for no benefit.
+  const [dwell, observed] = await Promise.all([
+    col.aggregate(dwellPipeline, opts).toArray(),
+    col.aggregate(observedPipeline, opts).toArray(),
+  ]);
+
+  return { dwell: dwell || [], observed: observed || [] };
 }
 
 function ms(value) {

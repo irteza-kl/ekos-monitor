@@ -1576,6 +1576,17 @@ storage engine, so the sort would be quietly lost between the two queries.
 users had ever sent, ordered to read one name off the newest - and was one wide
 exit-window query from the same failure. Same `$max`-over-an-object treatment.
 
+**`$facet` did it again, to `$setWindowFields` this time.** `/api/fence-time` and
+`/api/issues` both 500ed with the 32 MB sort error once the store passed ~80,000
+heartbeats. `lib/fence.js` ran both halves of its answer as `$facet` branches to halve
+the read work, and the dwell branch needs a partition sort. Measured on the collection
+that failed: **the dwell branch alone completes in 1.1 s; the identical branch wrapped
+in a `$facet` exceeds the budget.** A `$facet` materialises its branches, so the sort
+inside `$setWindowFields` loses its bounding and holds the whole matched set at once.
+The branches are two pipelines now, issued concurrently: two reads, one wall-clock,
+and a query that finishes. Half a pass that fails is not cheaper than a pass that
+works.
+
 **Deliberately left alone:** the exit-windows list sorts its documents after
 `$addFields`, which is the same shape. There are 35 exit windows in this store and they
 accrue one per fence departure, not one per heartbeat every few seconds, so the ceiling
