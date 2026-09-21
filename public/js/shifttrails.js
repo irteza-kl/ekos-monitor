@@ -46,7 +46,11 @@
   const ENTRY_KIND = {
     fix: { label: 'Fix', badge: 'badge-good' },
     gap: { label: 'Gap', badge: 'badge-critical' },
-    runtime_start: { label: 'Runtime start', badge: 'badge-warning' },
+    // The app's own field is `runtime_start`; a reader comparing this against
+    // the raw document needs that word, so it goes in the tooltip rather than
+    // being lost. On screen it is a restart, which is what it means and what
+    // the tile, the column and the filter beside it already call it.
+    runtime_start: { label: 'Restart', badge: 'badge-warning', title: 'the app process was recreated - "runtime_start" in the document' },
   };
 
   /** `services_disabled` -> `services disabled`, for a value we have no label for. */
@@ -389,7 +393,8 @@
     } else if (e.isRuntimeStart && e.foregroundServicePresent === true) {
       sub = '<div class="person-sub">service alive</div>';
     }
-    return '<span class="badge ' + known.badge + '">' + esc(known.label) + '</span>' + sub;
+    const title = known.title ? ' title="' + esc(known.title) + '"' : '';
+    return '<span class="badge ' + known.badge + '"' + title + '>' + esc(known.label) + '</span>' + sub;
   }
 
   function renderTable(data) {
@@ -528,7 +533,7 @@
                     [
                       fmt.int(s.fixCount) + ' fixes',
                       s.gapCount ? fmt.int(s.gapCount) + ' gaps' : null,
-                      fmt.int(s.runtimeStartCount) + ' runtime starts',
+                      fmt.int(s.runtimeStartCount) + ' restarts',
                     ]
                       .filter(Boolean)
                       .join(', '),
