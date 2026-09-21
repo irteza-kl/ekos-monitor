@@ -558,6 +558,13 @@ function shiftTrailMatch(q) {
   if (restarts === false) clauses.push({ $or: [{ 'summary.runtimeStarts': 0 }, { 'summary.runtimeStarts': null }] });
   if (num(q.minRestarts) !== null) clauses.push({ 'summary.runtimeStarts': { $gte: num(q.minRestarts) } });
 
+  // A gap is an ENTRY the app wrote - "I am awake and cannot get a position".
+  // An absence is a stretch where it wrote nothing at all. Different failures,
+  // so they filter separately.
+  const gapped = bool(q.hasGaps);
+  if (gapped === true) clauses.push({ entries: { $elemMatch: { kind: 'gap' } } });
+  if (gapped === false) clauses.push({ entries: { $not: { $elemMatch: { kind: 'gap' } } } });
+
   const absent = bool(q.hasAbsences);
   // An absence is an element of an array, so "has one" is the first element
   // existing - `$size: {$gt: 0}` is not a thing Mongo will match on.

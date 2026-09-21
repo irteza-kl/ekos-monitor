@@ -129,6 +129,10 @@ const CSV_COLUMNS = [
   { key: 'distinctRuns', label: 'Distinct Runs', get: (r) => r.stats.distinctRuns },
   { key: 'positionedMinutes', label: 'Positioned (min)', get: (r) => r.stats.positionedMinutes },
   { key: 'coverage', label: 'Coverage (%)', get: (r) => r.stats.coverage },
+  // Gaps and absences are different failures - the app awake and blind, versus
+  // the app not writing at all - so they export as separate columns.
+  { key: 'gapCount', label: 'Gaps', get: (r) => r.stats.gapCount },
+  { key: 'gapReasons', label: 'Gap Reasons', get: (r) => (r.stats.gapReasons || []).join(' | ') },
   { key: 'absenceCount', label: 'Absences' },
   { key: 'absentMinutes', label: 'Absent (min)' },
   { key: 'absencesWithRestart', label: 'Absences With A Restart' },

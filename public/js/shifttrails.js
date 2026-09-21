@@ -110,6 +110,7 @@
           })),
         },
         { kind: 'tri', key: 'hasRestarts', label: 'App restarted', yes: 'Only these' },
+        { kind: 'tri', key: 'hasGaps', label: 'Has gaps', yes: 'Only these' },
         { kind: 'tri', key: 'hasAbsences', label: 'Has absences', yes: 'Only these' },
         { kind: 'tri', key: 'noFixes', label: 'No fixes at all', yes: 'Only these' },
         { kind: 'number', key: 'maxCoverage', label: 'Coverage <= %' },
@@ -226,7 +227,13 @@
           'the network allowed. <b>Coverage</b> is how much of the shift the app could say where somebody ' +
           'was; the rest is in <b>absences</b>, which the app itself works out and flags when the runtime ' +
           'restarted across one. A <b>restart</b> is the app process being recreated mid-shift - an OS kill, ' +
-          'a crash or a force-quit - which nothing else in this console can see.</span>',
+          'a crash or a force-quit - which nothing else in this console can see.' +
+          '<br><br><b>Gaps and absences are different failures.</b> A <b>gap</b> is an entry the app wrote to ' +
+          'say it was awake and could not get a position - it names the reason, usually location services ' +
+          'switched off. An <b>absence</b> is a stretch where it wrote nothing at all: silence rather than a ' +
+          'report of blindness, which is why the only clue to its cause is whether the runtime restarted ' +
+          'across it. A shift can have gaps and no absences - the app talking steadily while blind - or ' +
+          'absences and no gaps, which is the phone gone.</span>',
       })
     );
 
@@ -298,9 +305,15 @@
         s.runtimeStarts ? 'serious' : undefined
       ),
       tile(
+        'Gaps',
+        fmt.int(s.gaps),
+        'the app was awake but blind',
+        s.gaps ? 'serious' : undefined
+      ),
+      tile(
         'Absences',
         fmt.int(s.absences),
-        fmt.int(s.shiftsWithAbsences) + ' shift(s) went dark',
+        fmt.int(s.shiftsWithAbsences) + ' shift(s) went silent',
         s.absences ? 'critical' : undefined
       ),
       tile(
@@ -409,7 +422,9 @@
     const node = el('table');
     node.innerHTML =
       '<thead><tr><th>Shift</th><th>User</th><th>Site</th><th class="num">Duration</th><th>Coverage</th>' +
-      '<th class="num">Fixes</th><th class="num">Restarts</th><th class="num">Absences</th>' +
+      '<th class="num">Fixes</th><th class="num">Restarts</th>' +
+      '<th class="num" title="entries where the app was running and said it could not get a position - it knows why">Gaps</th>' +
+      '<th class="num" title="stretches where the app wrote nothing at all - silence, not a report of blindness">Absences</th>' +
       '<th class="num">Travelled</th><th class="num">Accuracy</th><th>Permission</th><th>Device</th></tr></thead>';
     const body = el('tbody');
 
@@ -441,6 +456,13 @@
             (s.runtimeStartsDisagree
               ? '<div class="person-sub" title="the app reported a different number of restarts than the runtime_start entries it sent">app said ' +
                 fmt.int(row.reported.runtimeStarts) + '</div>'
+              : '') + '</td>' +
+            // Gaps carry their reason, absences their duration: the count alone
+            // says how often, and what you actually want to know is why, or for
+            // how long.
+            '<td class="num">' + (s.gapCount ? '<span class="badge badge-critical">' + s.gapCount + '</span>' : '0') +
+            (s.gapReasons && s.gapReasons.length
+              ? '<div class="person-sub">' + esc(s.gapReasons.map(humanise).join(', ')) + '</div>'
               : '') + '</td>' +
             '<td class="num">' + (row.absenceCount ? '<span class="badge badge-critical">' + row.absenceCount + '</span>' : '0') +
             (row.absentMinutes ? '<div class="person-sub">' + fmt.duration(row.absentMinutes) + '</div>' : '') + '</td>' +
