@@ -22,12 +22,15 @@
  *    is labelled with the kind it looks like instead.
  */
 const express = require('express');
+const { ObjectId } = require('mongodb');
 const config = require('../config');
 const { getDb, resolveCollections } = require('../db');
 const F = require('../lib/filters');
 const { redact } = require('../lib/redact');
+const cache = require('../lib/cache');
 
 const router = express.Router();
+const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
 
 // Raw documents are large - a heartbeat carries the whole embedded employee
 // record - and a Vercel function may return at most 4.5 MB. Responses are
@@ -96,6 +99,40 @@ router.get('/raw/collections', async (req, res, next) => {
   }
 });
 
+/**
+ * What each kind looks like, in the order a document is tested against them.
+ *
+ * ONE definition, used three ways: to label a row, to filter by kind, and to
+ * count the kinds for the dropdown. Writing the same shapes a second time in
+ * the aggregation language would have been two definitions to keep in step,
+ * and the one that drifted would have produced a filter that disagreed with
+ * the label beside it.
+ *
+ * Order is precedence and matters: an exit window also has no `runId`, and a
+ * heartbeat test would match plenty of things that are really something else.
+ * Each kind's filter below is its own shape AND none of the shapes above it,
+ * which is exactly what kindOf() does by returning early.
+ */
+const KIND_SHAPES = [
+  { key: 'exit window', filter: { $or: [{ type: 'exit_window' }, { samples: { $type: 'array' }, fence: { $exists: true } }] } },
+  { key: 'shift trail', filter: { runId: { $exists: true, $ne: null } } },
+  { key: 'heartbeat', filter: { $or: [{ currentUser: { $exists: true } }, { currentUserLocation: { $exists: true } }] } },
+  { key: 'clock-in check', filter: { requestBody: { $exists: true }, response: { $exists: true } } },
+];
+
+const UNRECOGNISED = 'unrecognised';
+
+/**
+ * The dropdown contents for one collection: which kinds are in it, and whose
+ * names appear on them.
+ *
+ * Both are full scans - nothing indexes "documents shaped like an exit window"
+ * - so this goes through a cache with a long TTL. What it returns changes over
+ * days (a new person, a new kind of document starting to arrive), not over
+ * seconds, and the Refresh button sends refresh=1 to step past it.
+ */
+const metaCache = cache.create({ ttlMs: 5 * 60 * 1000, maxKeys: 6 });
+
 /** A label for what a document looks like, so a mixed collection stays legible. */
 function kindOf(doc) {
   if (!doc || typeof doc !== 'object') return null;
@@ -105,6 +142,86 @@ function kindOf(doc) {
   if (doc.requestBody && doc.response) return 'clock-in check';
   return null;
 }
+
+/** The query that selects exactly the documents kindOf() would give this label. */
+function filterForKind(key) {
+  if (key === UNRECOGNISED) return { $nor: KIND_SHAPES.map((s) => s.filter) };
+  const index = KIND_SHAPES.findIndex((s) => s.key === key);
+  if (index === -1) return null;
+  const earlier = KIND_SHAPES.slice(0, index).map((s) => s.filter);
+  if (!earlier.length) return KIND_SHAPES[index].filter;
+  return { $and: [KIND_SHAPES[index].filter, { $nor: earlier }] };
+}
+
+/**
+ * Where a person's name lives, both of them.
+ *
+ * The Android client sends `currentUser` unwrapped on about a quarter of its
+ * heartbeats while iOS wraps it in `data`, so a name filter that knew only one
+ * path would quietly miss thousands of documents - which on a filter is worse
+ * than on a column, because nothing on screen hints that rows are missing.
+ */
+const NAME_PATHS = ['currentUser.data.fullName', 'currentUser.fullName'];
+const NAME_EXPR = { $ifNull: ['$currentUser.data.fullName', '$currentUser.fullName'] };
+
+router.get('/raw/meta', async (req, res, next) => {
+  try {
+    const db = await getDb();
+    const map = await resolveCollections();
+    const names = (await db.listCollections({}, { nameOnly: true }).toArray())
+      .map((c) => c.name)
+      .filter((n) => !n.startsWith('system.'));
+    const wanted = F.str(req.query.collection);
+    const collection = wanted && names.includes(wanted) ? wanted : map.snapshots && names.includes(map.snapshots) ? map.snapshots : names[0];
+    if (!collection) return res.json({ available: false, kinds: [], names: [] });
+
+    const data = await metaCache.through({ collection, refresh: req.query.refresh }, async () => {
+      const col = db.collection(collection);
+      const keys = KIND_SHAPES.map((s) => s.key).concat(UNRECOGNISED);
+
+      const [counts, people] = await Promise.all([
+        Promise.all(
+          keys.map(async (key) => {
+            try {
+              return { key, count: await col.countDocuments(filterForKind(key), { maxTimeMS: config.queryTimeoutMs }) };
+            } catch (err) {
+              // A kind that times out is still a kind; it just cannot say how
+              // many, and an absent count beats a dropdown that fails to open.
+              return { key, count: null };
+            }
+          })
+        ),
+        col
+          .aggregate(
+            [
+              { $match: { $or: NAME_PATHS.map((p) => ({ [p]: { $nin: [null, ''] } })) } },
+              { $group: { _id: NAME_EXPR, n: { $sum: 1 } } },
+              { $sort: { n: -1 } },
+              { $limit: 300 },
+            ],
+            opts
+          )
+          .toArray()
+          .catch(() => []),
+      ]);
+
+      return {
+        available: true,
+        collection,
+        // Only the kinds actually present: a dropdown offering four options
+        // that return nothing is four ways to empty the table.
+        kinds: counts.filter((k) => k.count === null || k.count > 0),
+        names: people
+          .filter((p) => p._id !== null && p._id !== undefined && p._id !== '')
+          .map((p) => ({ key: p._id, count: p.n })),
+      };
+    });
+
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.get('/raw', async (req, res, next) => {
   try {
@@ -135,7 +252,49 @@ router.get('/raw', async (req, res, next) => {
     // The range applies to the field actually being ordered by, so the window
     // on the filter bar and the order on the page can never disagree.
     const range = sort.field === 'createdAt' ? F.dateRange(req.query, 'createdAt') : null;
-    const match = F.and([range]);
+
+    // Kind and name are matched in Mongo, not over the page that came back.
+    // Filtering a page of 25 would return three rows, call it page 1 of 80,243
+    // and page backwards into nothing - a filter has to narrow the query or it
+    // is not a filter.
+    const kinds = F.list(req.query.kind);
+    const kindClauses = kinds.map(filterForKind).filter(Boolean);
+    const kindClause = kindClauses.length ? (kindClauses.length === 1 ? kindClauses[0] : { $or: kindClauses }) : null;
+
+    /**
+     * Matched on the words, not on the exact string.
+     *
+     * These names are stored dirty - "Yenny  Montoya " has a double space and a
+     * trailing one - and an exact `$in` missed every one of them, because the
+     * query string is trimmed on the way in and so no longer equalled the value
+     * it was picked from. Rather than carefully preserving whitespace through
+     * the whole round trip so two pieces of dirt can match each other, each
+     * selected name becomes a pattern anchored at both ends whose gaps accept
+     * any run of whitespace. "Yenny Montoya" typed by hand then finds the same
+     * rows the dropdown does, which is the behaviour anybody would expect.
+     */
+    const wantedNames = F.list(req.query.name);
+    const nameClause = wantedNames.length
+      ? {
+          $or: wantedNames.flatMap((name) => {
+            const pattern = '^\\s*' + name.split(/\s+/).map(F.escapeRegex).join('\\s+') + '\\s*$';
+            return NAME_PATHS.map((p) => ({ [p]: { $regex: pattern, $options: 'i' } }));
+          }),
+        }
+      : null;
+
+    // Free text: a name fragment, or the id of a document somebody was handed.
+    // Both are what people actually arrive at this page holding.
+    const search = F.str(req.query.search);
+    let searchClause = null;
+    if (search) {
+      const rx = { $regex: F.escapeRegex(search), $options: 'i' };
+      const or = NAME_PATHS.map((p) => ({ [p]: rx }));
+      if (ObjectId.isValid(search)) or.push({ _id: new ObjectId(search) });
+      searchClause = { $or: or };
+    }
+
+    const match = F.and([range, kindClause, nameClause, searchClause]);
 
     const [docs, total] = await Promise.all([
       col

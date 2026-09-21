@@ -26,6 +26,11 @@
 
   let data = { rows: [], total: 0 };
   let collections = [];
+  let rawMeta = { kinds: [], names: [] };
+  // The kind and name lists belong to one collection, so switching collections
+  // has to refetch them - otherwise you would be offered the previous
+  // collection's people and pick a filter that matches nothing here.
+  let metaFor = null;
 
   /**
    * What to show when nothing has been picked, by the kind that dominates the
@@ -96,13 +101,38 @@
           })),
         },
         {
+          kind: 'multi',
+          key: 'kind',
+          label: 'Kind',
+          options: (rawMeta.kinds || []).map((k) => ({ value: k.key, label: k.key, count: k.count })),
+        },
+        // Only where there are names to offer. A collection of clock-in checks
+        // carries none, and an empty dropdown is a control that cannot do
+        // anything - which is worse than no control.
+        (rawMeta.names || []).length
+          ? {
+              kind: 'multi',
+              key: 'name',
+              label: 'Full name',
+              options: (rawMeta.names || []).map((n) => ({
+                // The stored value, spaces and all - these names carry double
+                // and trailing spaces, and matching is exact, so the option has
+                // to be the real string rather than a tidied one.
+                value: n.key,
+                label: n.key.replace(/\s+/g, ' ').trim() || '(blank)',
+                count: n.count,
+              })),
+            }
+          : null,
+        { kind: 'text', key: 'search', label: 'Search', placeholder: 'name, or a document id' },
+        {
           kind: 'select',
           key: 'limit',
           label: 'Per page',
           default: '25',
           options: [10, 25, 50, 100].map((n) => ({ value: n, label: String(n) })),
         },
-      ]);
+      ].filter(Boolean));
 
       root.append(
         el('div', { id: 'raw-banner' }),
@@ -122,8 +152,12 @@
       await loadCollections();
       await load();
       window.addEventListener('pm:filters', load);
+      // Refresh steps past the five-minute cache behind the kind and name
+      // lists, which is the only way a person who started reporting today shows
+      // up in the dropdown before it expires.
       window.addEventListener('pm:refresh', async () => {
         await loadCollections();
+        await loadRawMeta(true);
         await load();
       });
     },
@@ -357,8 +391,25 @@
     PM.rebuildFilterBar();
   }
 
+  /** Kinds and names for whichever collection is selected. */
+  async function loadRawMeta(force) {
+    const wanted = PM.state.filters.collection || '';
+    if (!force && metaFor === wanted) return;
+    try {
+      rawMeta = await api('/api/raw/meta?' + PM.queryString());
+      metaFor = wanted;
+    } catch (err) {
+      rawMeta = { kinds: [], names: [] };
+      metaFor = null;
+    }
+    PM.rebuildFilterBar();
+  }
+
   async function load() {
     PM.showSkeleton({ '#raw-list': 'table:8x6' });
+    // Before the rows, so the dropdowns describe the collection being shown
+    // rather than the one that was showing a moment ago.
+    await loadRawMeta(false);
     try {
       data = await api('/api/raw?' + PM.queryString());
     } catch (err) {
