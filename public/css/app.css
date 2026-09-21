@@ -716,7 +716,40 @@ td .truncate { max-width: 260px; }
 }
 .drawer-head h2 { margin: 0; font-size: 15px; }
 .drawer-head .sub { font-size: 12px; color: var(--ink-muted); }
-.drawer-body { overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+/**
+ * The body is the drawer's scrollport, and it has to be told so twice.
+ *
+ * `flex: 1` because a flex item defaults to `0 1 auto` - it may shrink but
+ * never grows - so the body sized itself to its content and left the rest of
+ * the panel as dead space below it. That is the gap under a short table.
+ *
+ * `min-height: 0` because a flex item will not shrink below its content's
+ * intrinsic height without it, which is what stops `overflow: auto` from ever
+ * engaging. Together they are the difference between a panel that fills the
+ * screen and scrolls, and one that neither fills nor scrolls.
+ */
+.drawer-body {
+  overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px;
+  flex: 1 1 auto; min-height: 0;
+}
+/* The panel keeps its content's height and lets the BODY scroll. Without
+   this it inherits `flex-shrink: 1` from the body's column and is squeezed
+   to fit instead of overflowing - which squashes a fixed-height map and
+   means the scrollbar never appears. */
+.drawer-body > .tab-panel.active { flex-shrink: 0; }
+
+/**
+ * Inside a drawer a table keeps no height cap of its own.
+ *
+ * `.table-scroll` caps itself at 70vh, which on a page is right - the table is
+ * one card among several. In a drawer it builds a second, shorter scrollport
+ * inside the one that already scrolls: the table stopped at 70% of the window
+ * and left ~30vh of empty panel beneath it, with two scrollbars for one list.
+ * Same reasoning for a raw document, which capped itself at 460px above a
+ * blank half-panel.
+ */
+.drawer-body .table-scroll { max-height: none; }
+.drawer-body pre.json { max-height: none; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); padding: 0 16px; background: var(--surface); }
 .tabs button {
   all: unset; cursor: pointer; padding: 9px 12px; font-size: 13px; font-weight: 550;
