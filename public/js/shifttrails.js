@@ -53,6 +53,26 @@
     runtime_start: { label: 'Restart', badge: 'badge-warning', title: 'the app process was recreated - "runtime_start" in the document' },
   };
 
+  /**
+   * A count in the table, wearing the same colour its entries wear in the
+   * drawer.
+   *
+   * The badge class comes from ENTRY_KIND rather than being written out again
+   * here, because it already had been: the table drew a restart in
+   * `badge-serious` while the drawer drew it in `badge-warning`, and fixes had
+   * no colour at all. Two lists of colours for one set of things drift the
+   * moment either is edited, so there is one list and this reads it.
+   *
+   * Zero stays muted and unbadged. A badge is for something that happened, and
+   * a column of coloured noughts buries the rows where something did.
+   */
+  function countCell(count, badgeClass, title) {
+    if (!count) return '<span class="hint">0</span>';
+    return (
+      '<span class="badge ' + badgeClass + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + fmt.int(count) + '</span>'
+    );
+  }
+
   /** `services_disabled` -> `services disabled`, for a value we have no label for. */
   function humanise(value) {
     const words = String(value).replace(/_/g, ' ');
@@ -302,13 +322,13 @@
         'App restarts',
         fmt.int(s.runtimeStarts),
         fmt.int(s.shiftsWithRestarts) + ' shift(s) affected',
-        s.runtimeStarts ? 'serious' : undefined
+        s.runtimeStarts ? 'warning' : undefined
       ),
       tile(
         'Gaps',
         fmt.int(s.gaps),
         'the app was awake but blind',
-        s.gaps ? 'serious' : undefined
+        s.gaps ? 'critical' : undefined
       ),
       tile(
         'Absences',
@@ -450,9 +470,15 @@
             '</td>' +
             '<td class="num">' + fmt.duration(row.durationMinutes) + '</td>' +
             '<td>' + coverageCell(row) + '</td>' +
-            '<td class="num">' + fmt.int(s.fixCount) +
-            (s.fixCount === 0 ? ' <span class="badge badge-critical">none</span>' : '') + '</td>' +
-            '<td class="num">' + (s.runtimeStartCount ? '<span class="badge badge-serious">' + s.runtimeStartCount + '</span>' : '0') +
+            // Each count wears its entry kind's colour, read from ENTRY_KIND so
+            // the table and the drawer cannot say different things about the
+            // same entry. A shift with no fix at all is the exception: zero
+            // fixes is not a quiet nought, it is the worst outcome there is.
+            '<td class="num">' +
+            (s.fixCount === 0
+              ? '<span class="badge badge-critical" title="this shift sealed without a single position">none</span>'
+              : countCell(s.fixCount, ENTRY_KIND.fix.badge)) + '</td>' +
+            '<td class="num">' + countCell(s.runtimeStartCount, ENTRY_KIND.runtime_start.badge, ENTRY_KIND.runtime_start.title) +
             (s.runtimeStartsDisagree
               ? '<div class="person-sub" title="the app reported a different number of restarts than the runtime_start entries it sent">app said ' +
                 fmt.int(row.reported.runtimeStarts) + '</div>'
@@ -460,11 +486,14 @@
             // Gaps carry their reason, absences their duration: the count alone
             // says how often, and what you actually want to know is why, or for
             // how long.
-            '<td class="num">' + (s.gapCount ? '<span class="badge badge-critical">' + s.gapCount + '</span>' : '0') +
+            '<td class="num">' + countCell(s.gapCount, ENTRY_KIND.gap.badge, 'the app was awake and could not get a position') +
             (s.gapReasons && s.gapReasons.length
               ? '<div class="person-sub">' + esc(s.gapReasons.map(humanise).join(', ')) + '</div>'
               : '') + '</td>' +
-            '<td class="num">' + (row.absenceCount ? '<span class="badge badge-critical">' + row.absenceCount + '</span>' : '0') +
+            // An absence is not an entry kind, so it has no ENTRY_KIND colour -
+            // but it means the same thing to a reader as a gap does, only
+            // worse, so it keeps the same red.
+            '<td class="num">' + countCell(row.absenceCount, 'badge-critical', 'the app wrote nothing at all for a stretch') +
             (row.absentMinutes ? '<div class="person-sub">' + fmt.duration(row.absentMinutes) + '</div>' : '') + '</td>' +
             '<td class="num">' + (s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres)) +
             (s.impossibleSteps
