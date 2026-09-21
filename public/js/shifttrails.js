@@ -1,17 +1,23 @@
-/* Shift Trails: the app's own state, written as a trail of entries rather than
-   as heartbeats.
+/* Shift Trails: one sealed document per shift, and everything in it.
 
-   Eight fields - when, which process, which person, which site, which handset,
-   battery, and the live location permission and precision. No coordinates, so
-   there is no map, no trail and no fence verdict on this page, and none is
-   implied: a column that reads "unknown" on every row is worse than a column
-   that is not there.
+   The app seals a trail at clock-out and pushes it when the network allows.
+   Each one carries the shift's own facts, a summary it computed itself, and an
+   entries array - every entry either a GPS `fix` or a `runtime_start`, the app
+   process having been recreated mid-shift.
 
-   What this stream can say that nothing else in the console can:
-     - the app process was RECREATED (runId changed), which is what an OS kill
-       or a crash looks like from the outside;
-     - the location permission RIGHT NOW, read live rather than cached;
-     - that a person exists at all, before they have ever sent a heartbeat. */
+   So a row here is a SHIFT, not a ping. What it answers that nothing else in
+   this console can:
+
+     - how much of a shift the app could actually say where somebody was
+       (coverage), and where the rest of it went (absences);
+     - that the app process was recreated during the shift, how many times, and
+       whether the foreground service survived it;
+     - the live location permission and precision, and whether either changed
+       halfway through - which is what explains a trail that stops dead.
+
+   The path is drawn in the drawer against the site's own fence, because a
+   trail with nothing to measure it against is half an answer on a geofence
+   console. */
 (function () {
   'use strict';
   const { el, fmt, api, queryString, esc } = PM;
@@ -19,95 +25,85 @@
 
   let rows = [];
   let total = 0;
-  let trailMeta = { available: false, users: [], devices: [], permissions: [], precisions: [], sites: [] };
+  let trailMeta = { available: false, users: [], sites: [], devices: [], permissions: [], precisions: [] };
 
-  const PERMISSION_LABEL = {
-    always: 'Always',
-    when_in_use: 'While using the app',
-    denied: 'Denied',
-  };
-
-  const PRECISION_LABEL = {
-    fine: 'Fine',
-    coarse: 'Coarse',
-    null: 'Not reported (iOS)',
-  };
+  const PERMISSION_LABEL = { always: 'Always', when_in_use: 'While using the app', denied: 'Denied' };
+  const PRECISION_LABEL = { fine: 'Fine', coarse: 'Coarse' };
 
   PM.boot('shift-trails.html', async ({ root }) => {
-    // Built before the dropdown contents arrive and rebuilt when they do, so
-    // a snapshot taken here would leave every list empty for the life of the
-    // page. Same reason the Exit Windows page passes a function.
-    PM.buildFilterBar(() => [
-      { kind: 'daterange' },
-      {
-        kind: 'multi',
-        key: 'userId',
-        label: 'User',
-        options: (trailMeta.users || []).map((u) => ({
-          value: u.id,
-          // A person with no heartbeat has no name anywhere in this store, so
-          // the id is the only honest label and the list says why.
-          label: (u.name || 'User ' + u.id) + (u.heartbeatKnown ? '' : ' · trails only'),
-          count: u.count,
-        })),
-      },
-      {
-        kind: 'multi',
-        key: 'deviceType',
-        label: 'Device',
-        options: PM.optionsFrom(trailMeta.devices || [], 'key', 'key', 'count'),
-      },
-      {
-        kind: 'multi',
-        key: 'locationPermission',
-        label: 'Location permission',
-        options: (trailMeta.permissions || []).map((p) => ({
-          value: p.key,
-          label: PERMISSION_LABEL[p.key] || p.key,
-          count: p.count,
-        })),
-      },
-      {
-        kind: 'multi',
-        key: 'locationPrecision',
-        label: 'Precision',
-        options: (trailMeta.precisions || []).map((p) => ({
-          value: p.key === null ? 'null' : p.key,
-          label: p.key === null ? PRECISION_LABEL.null : PRECISION_LABEL[p.key] || p.key,
-          count: p.count,
-        })),
-      },
-      {
-        kind: 'multi',
-        key: 'siteId',
-        label: 'Site',
-        options: (trailMeta.sites || []).map((s) => ({
-          value: s.key === null ? 'null' : s.key,
-          label: s.key === null ? 'No site (unmapped)' : siteLabel(s.key),
-          count: s.count,
-        })),
-      },
-      { kind: 'number', key: 'batteryMax', label: 'Battery <= %' },
-      { kind: 'number', key: 'batteryMin', label: 'Battery >= %' },
-      { kind: 'text', key: 'search', label: 'Search', placeholder: 'run id, user id, site id, device' },
-    ]);
+    PM.buildFilterBar(() =>
+      [
+        { kind: 'daterange' },
+        {
+          kind: 'multi',
+          key: 'userId',
+          label: 'User',
+          options: (trailMeta.users || []).map((u) => ({
+            value: u.id,
+            label: (u.name || 'User ' + u.id) + (u.heartbeatKnown ? '' : ' · trails only'),
+            count: u.count,
+          })),
+        },
+        {
+          kind: 'multi',
+          key: 'siteId',
+          label: 'Site',
+          options: (trailMeta.sites || []).map((s) => ({
+            value: s.key === null ? 'null' : s.key,
+            label: s.key === null ? 'No site (unmapped)' : siteLabel(s.key),
+            count: s.count,
+          })),
+        },
+        {
+          kind: 'multi',
+          key: 'deviceType',
+          label: 'Device',
+          options: PM.optionsFrom(trailMeta.devices || [], 'key', 'key', 'count'),
+        },
+        {
+          kind: 'multi',
+          key: 'locationPermission',
+          label: 'Location permission',
+          options: (trailMeta.permissions || []).map((p) => ({
+            value: p.key,
+            label: PERMISSION_LABEL[p.key] || p.key,
+            count: p.count,
+          })),
+        },
+        {
+          kind: 'multi',
+          key: 'locationPrecision',
+          label: 'Precision',
+          options: (trailMeta.precisions || []).map((p) => ({
+            value: p.key === null ? 'null' : p.key,
+            label: p.key === null ? 'Not reported (iOS)' : PRECISION_LABEL[p.key] || p.key,
+            count: p.count,
+          })),
+        },
+        { kind: 'tri', key: 'hasRestarts', label: 'App restarted', yes: 'Only these' },
+        { kind: 'tri', key: 'hasAbsences', label: 'Has absences', yes: 'Only these' },
+        { kind: 'tri', key: 'noFixes', label: 'No fixes at all', yes: 'Only these' },
+        { kind: 'number', key: 'maxCoverage', label: 'Coverage <= %' },
+        { kind: 'number', key: 'minDurationMinutes', label: 'Shift >= min' },
+        { kind: 'text', key: 'search', label: 'Search', placeholder: 'shift key, run id, user or site id' },
+      ].filter(Boolean)
+    );
 
     root.append(
       el('div', { id: 'st-banner' }),
       el('div', { class: 'tiles', id: 'st-tiles' }),
       el('div', { class: 'card', id: 'st-chart-card' }, [
         el('div', { class: 'card-head' }, [
-          el('h2', { text: 'Trail entries over time' }),
-          el('span', { class: 'sub', text: 'how often the app actually writes, and how many devices are writing' }),
+          el('h2', { text: 'Shifts and restarts' }),
+          el('span', { class: 'sub', text: 'sealed trails per day, and the app restarts inside them' }),
         ]),
         el('div', { class: 'card-body' }, [
           el('div', { class: 'chart-wrap' }, [el('canvas', { id: 'st-timeline' })]),
           el('div', {
-            class: 'hint',
-            text:
-              'The shape of this line is the cadence. Until the payload says why each entry was written, ' +
-              'a flat rate means the app is reporting on a timer and a ragged one means it is reporting on ' +
-              'events - and only the first of those makes a gap meaningful.',
+            html: PMChart.legend([
+              { color: C.series[0], label: 'Shifts sealed' },
+              { color: C.series[3], label: 'App restarts' },
+            ]),
           }),
         ]),
       ]),
@@ -146,17 +142,13 @@
     try {
       trailMeta = await api('/api/shift-trails/meta');
     } catch (err) {
-      trailMeta = { available: false, users: [], devices: [], permissions: [], precisions: [], sites: [] };
+      trailMeta = { available: false, users: [], sites: [], devices: [], permissions: [], precisions: [] };
     }
     PM.rebuildFilterBar();
   }
 
   async function load() {
-    PM.showSkeleton({
-      '#st-tiles': 'tiles:10',
-      '#st-timeline': 'chart',
-      '#st-table': 'table:12x8',
-    });
+    PM.showSkeleton({ '#st-tiles': 'tiles:10', '#st-timeline': 'chart', '#st-table': 'table:10x11' });
     const qs = queryString();
     const [data, stats] = await Promise.all([api('/api/shift-trails?' + qs), api('/api/shift-trails/summary?' + qs)]);
     rows = data.rows || [];
@@ -164,8 +156,6 @@
 
     renderBanner(data, stats);
     if (data.unavailable) {
-      // Nothing to count, chart or page through. The banner is the whole
-      // answer, and an empty chart frame beside it would only look broken.
       document.querySelector('#st-tiles').innerHTML = '';
       document.querySelector('#st-table').innerHTML = '';
       document.querySelector('#pager').innerHTML = '';
@@ -177,8 +167,8 @@
     document.querySelector('#st-chart-card').hidden = false;
     renderTiles(stats);
     renderChart(stats);
-    renderTable();
-    PM.setSubtitle(fmt.int(total) + ' entries match');
+    renderTable(data);
+    PM.setSubtitle(fmt.int(total) + ' shifts match');
     PM.markLoaded();
   }
 
@@ -192,29 +182,22 @@
           class: 'notice',
           html:
             '<span>◷</span><span><b>No shift trails yet.</b> Nothing in this database has the shape of one. ' +
-            'The page is ready for them: trails are found by shape rather than by collection name, so they ' +
-            'will appear here whether the writer gives them their own collection or mixes them into ' +
-            '<code>ekosClientState</code> the way the exit windows are.</span>',
+            'They are found by shape rather than by collection name, so they will appear here whether the ' +
+            'writer gives them their own collection or mixes them into <code>ekosClientState</code>.</span>',
         })
       );
       return;
     }
 
-    // What this stream cannot answer yet, stated once, at the top. Each of
-    // these is a field the payload review asks the writer for, and each one is
-    // a thing a reader would otherwise assume the page is telling them.
     host.append(
       el('div', {
         class: 'notice',
         html:
-          '<span>ℹ</span><span><b>This stream carries eight fields and no position.</b> ' +
-          'There is no map and no fence verdict here because an entry has no coordinates - for where ' +
-          'someone was, the heartbeats are still the only source. Three limits worth holding in mind: ' +
-          '<b>a gap between entries is not yet evidence of anything</b>, because the payload does not say ' +
-          'whether it writes on a timer or on events; <b>a restart is only counted when both runs sit ' +
-          'inside the selected range</b>, so the earliest run of each person is never counted as one; and ' +
-          'the payload carries no device id, so <b>one person on two handsets is indistinguishable from ' +
-          'one handset restarting</b>.</span>',
+          '<span>ℹ</span><span><b>One row is one shift</b>, sealed by the app at clock-out and pushed when ' +
+          'the network allowed. <b>Coverage</b> is how much of the shift the app could say where somebody ' +
+          'was; the rest is in <b>absences</b>, which the app itself works out and flags when the runtime ' +
+          'restarted across one. A <b>restart</b> is the app process being recreated mid-shift - an OS kill, ' +
+          'a crash or a force-quit - which nothing else in this console can see.</span>',
       })
     );
 
@@ -227,23 +210,24 @@
             fmt.int(stats.usersWithoutHeartbeats) +
             ' of these ' +
             fmt.int(stats.users) +
-            ' people have never sent a heartbeat.</b> ' +
-            'They exist in this console on this page and nowhere else - no user page, no position, and no ' +
-            'name, because the name comes from the employee record embedded on a heartbeat. This is the ' +
-            'case the payload was added for.</span>',
+            ' people have never sent a heartbeat.</b> They exist in this console on this page and nowhere ' +
+            'else - no user page, and no name, because the name comes from the employee record embedded on ' +
+            'a heartbeat.</span>',
         })
       );
     }
 
-    if (stats && stats.anonymousEntries) {
+    if (data.postFiltered) {
       host.append(
         el('div', {
           class: 'notice',
           html:
-            '<span>⚠</span><span><b>' +
-            fmt.int(stats.anonymousEntries) +
-            ' entries carry no user id.</b> Unlike an exit window, an entry has no GPS samples to fingerprint ' +
-            'against the heartbeat stream, so these cannot be matched to a person by any route at all.</span>',
+            '<span>⚠</span><span>The coverage, distance and duration filters are applied after the query, so ' +
+            'the total above counts shifts <b>before</b> them. This page shows ' +
+            fmt.int(data.matchedOnPage) +
+            ' of the ' +
+            fmt.int(data.limit) +
+            ' it fetched.</span>',
         })
       );
     }
@@ -259,191 +243,172 @@
         el('div', { class: 'tile-note', text: note }),
       ]);
 
-    const permission = (key) => (s.permissions || []).find((p) => p.key === key);
-    const denied = (permission('denied') || {}).count || 0;
-    const whenInUse = (permission('when_in_use') || {}).count || 0;
+    const denied = ((s.permissions || []).find((p) => p.key === 'denied') || {}).count || 0;
+    const whenInUse = ((s.permissions || []).find((p) => p.key === 'when_in_use') || {}).count || 0;
     const coarse = ((s.precisions || []).find((p) => p.key === 'coarse') || {}).count || 0;
-    const notReported = ((s.precisions || []).find((p) => p.key === null) || {}).count || 0;
-    const battery = s.battery || {};
-    const namedSites = (s.sites || []).filter((x) => x.key !== null).length;
-    const noSite = ((s.sites || []).find((x) => x.key === null) || {}).count || 0;
 
     host.append(
-      tile('Entries', fmt.int(s.total), s.range.min ? 'first ' + fmt.dayTime(s.range.min) : 'in this range'),
+      tile('Shifts', fmt.int(s.total), s.range.min ? 'from ' + fmt.dayTime(s.range.min) : 'sealed trails'),
       tile(
         'People',
         fmt.int(s.users),
-        s.usersWithoutHeartbeats
-          ? fmt.int(s.usersWithoutHeartbeats) + ' seen only here'
-          : 'all known to the heartbeats',
+        s.usersWithoutHeartbeats ? fmt.int(s.usersWithoutHeartbeats) + ' seen only here' : 'all known to the heartbeats',
         s.usersWithoutHeartbeats ? 'info' : undefined
       ),
-      tile('Runs', fmt.int(s.runs), 'distinct app processes'),
       tile(
-        'Restarts',
-        fmt.int(s.restarts),
-        'the process was recreated',
-        s.restarts ? 'serious' : undefined
+        'Coverage',
+        s.coverage === null ? '--' : fmt.pct(s.coverage),
+        fmt.num(s.positionedMinutes, 0) + ' of ' + fmt.num(s.shiftMinutes, 0) + ' shift minutes positioned',
+        s.coverage !== null && s.coverage < 80 ? 'serious' : undefined
+      ),
+      tile('Fixes', fmt.int(s.fixes), fmt.int(s.entries) + ' entries in total'),
+      tile(
+        'App restarts',
+        fmt.int(s.runtimeStarts),
+        fmt.int(s.shiftsWithRestarts) + ' shift(s) affected',
+        s.runtimeStarts ? 'serious' : undefined
+      ),
+      tile(
+        'Absences',
+        fmt.int(s.absences),
+        fmt.int(s.shiftsWithAbsences) + ' shift(s) went dark',
+        s.absences ? 'critical' : undefined
+      ),
+      tile(
+        'Shifts with no fix',
+        fmt.int(s.shiftsWithNoFix),
+        'sealed without a single position',
+        s.shiftsWithNoFix ? 'critical' : undefined
       ),
       tile(
         'Location denied',
         fmt.int(denied),
-        denied ? 'no location at all on these entries' : 'none refused outright',
+        denied ? 'entries with no location at all' : 'none refused outright',
         denied ? 'critical' : undefined
       ),
       tile(
         'Foreground only',
         fmt.int(whenInUse),
-        'tracking stops when the app is backgrounded',
+        'entries that cannot track in the background',
         whenInUse ? 'serious' : undefined
       ),
-      tile(
-        'Coarse location',
-        fmt.int(coarse),
-        coarse ? 'fixes land 1-3 km out at this setting' : fmt.int(notReported) + ' not reported (iOS)',
-        coarse ? 'warning' : undefined
-      ),
-      tile(
-        'Battery critical',
-        fmt.int(battery.critical || 0),
-        'at or below 10%',
-        battery.critical ? 'critical' : undefined
-      ),
-      tile(
-        'Battery low',
-        fmt.int(battery.low || 0),
-        'at or below 20%' + (battery.avg === null ? '' : ' · avg ' + fmt.num(battery.avg, 1) + '%'),
-        battery.low ? 'warning' : undefined
-      ),
-      tile(
-        'Sites',
-        fmt.int(namedSites),
-        noSite ? fmt.int(noSite) + ' entries with no site' : 'named on these entries'
-      )
+      tile('Coarse fixes', fmt.int(coarse), coarse ? 'accurate to 1-3 km, not metres' : 'every fix was fine-grained', coarse ? 'warning' : undefined)
     );
   }
 
   function renderChart(s) {
-    const timeline = PM.padBuckets(s.timeline || [], s.granularity, { zero: ['count', 'users'] });
+    const timeline = PM.padBuckets(s.timeline || [], s.granularity, { zero: ['count', 'restarts'] });
     PMChart.lineTime(document.querySelector('#st-timeline'), {
       labels: timeline.map((t) => fmt.dayTime(t.at)),
-      yTitle: 'entries',
+      yTitle: 'per day',
       series: [
-        { label: 'Entries', data: timeline.map((t) => t.count), color: C.series[0] },
-        { label: 'People writing', data: timeline.map((t) => t.users), color: C.series[2], dashed: true },
+        { label: 'Shifts sealed', data: timeline.map((t) => t.count), color: C.series[0] },
+        { label: 'App restarts', data: timeline.map((t) => t.restarts), color: C.series[3], dashed: true },
       ],
     });
   }
 
   function personCell(row) {
-    if (row.userId === null || row.userId === undefined) {
-      return '<span class="badge badge-warning">no user id</span>';
-    }
+    if (row.userId === null || row.userId === undefined) return '<span class="badge badge-warning">no user id</span>';
     const label = esc(row.name || 'User ' + row.userId);
     if (!row.heartbeatKnown) {
-      // No user page to send them to: that page is built from heartbeats and
-      // would be empty. Saying so beats a link that goes nowhere useful.
       return (
         '<b>' + label + '</b> <span class="badge badge-info" title="this person has never sent a heartbeat, so ' +
-        'there is no user page, no position and no name for them anywhere else in this console">trails only</span>' +
+        'there is no user page and no name for them anywhere else in this console">trails only</span>' +
         '<div class="person-sub">#' + row.userId + '</div>'
       );
     }
-    return (
-      '<a href="/user.html?userId=' + row.userId + '"><b>' + label + '</b></a>' +
-      '<div class="person-sub">#' + row.userId + '</div>'
-    );
+    return '<a href="/user.html?userId=' + row.userId + '"><b>' + label + '</b></a><div class="person-sub">#' + row.userId + '</div>';
   }
 
-  function runCell(row) {
-    if (!row.runId) return '<span class="hint">--</span>';
-    const short = row.runId.length > 10 ? row.runId.slice(0, 8) + '…' : row.runId;
-    const badge = row.restart
-      ? '<span class="badge badge-critical" title="this is the first entry of a new run for this person - ' +
-        'the app process was recreated at this point">restart</span>'
-      : '';
-    const position = row.run ? 'run ' + row.run.ordinal + ' of ' + row.run.of + ' · ' + fmt.int(row.run.entries) + ' entries' : '';
+  function coverageCell(row) {
+    const c = row.stats.coverage;
+    if (c === null) return '<span class="hint">--</span>';
+    const cls = c >= 90 ? 'badge-good' : c >= 60 ? 'badge-warning' : 'badge-critical';
     return (
-      '<span class="mono" title="' + esc(row.runId) + '">' + esc(short) + '</span> ' + badge +
-      (position ? '<div class="person-sub">' + position + '</div>' : '')
+      '<span class="badge ' + cls + '">' + fmt.pct(c) + '</span>' +
+      '<div class="person-sub">' + fmt.num(row.stats.positionedMinutes, 0) + ' of ' + fmt.num(row.durationMinutes, 0) + ' min</div>'
     );
   }
 
   function permissionCell(row) {
-    const value = row.locationPermission;
-    if (value === null) return '<span class="badge badge-neutral">not reported</span>';
-    if (!row.locationPermissionKnown) {
-      return (
-        '<span class="badge badge-warning" title="the app sent a value this console does not recognise">' +
-        esc(value) + '</span>'
-      );
-    }
-    const cls = value === 'denied' ? 'badge-critical' : value === 'when_in_use' ? 'badge-warning' : 'badge-good';
-    return '<span class="badge ' + cls + '">' + esc(PERMISSION_LABEL[value]) + '</span>';
+    const worst = row.stats.worstPermission;
+    if (!worst) return '<span class="badge badge-neutral">not reported</span>';
+    const cls = worst === 'denied' ? 'badge-critical' : worst === 'when_in_use' ? 'badge-warning' : 'badge-good';
+    return (
+      '<span class="badge ' + cls + '">' + esc(PERMISSION_LABEL[worst] || worst) + '</span>' +
+      (row.stats.permissionChanged
+        ? '<div class="person-sub" title="the permission was not the same for the whole shift, which is what ' +
+          'explains a trail that stops part way through">changed mid-shift</div>'
+        : '')
+    );
   }
 
-  function precisionCell(row) {
-    if (row.locationPrecision === null) {
-      // Not a gap in the data: iOS does not report this, and "not reported"
-      // must never read as "fine".
-      return '<span class="badge badge-neutral" title="iOS does not report a precision - this is the ' +
-        'documented value, not missing data">not reported</span>';
-    }
-    const cls = row.coarseLocation ? 'badge-warning' : 'badge-neutral';
-    return '<span class="badge ' + cls + '">' + esc(PRECISION_LABEL[row.locationPrecision] || row.locationPrecision) + '</span>';
-  }
-
-  function renderTable() {
+  function renderTable(data) {
     const host = document.querySelector('#st-table');
     host.innerHTML = '';
     if (!rows.length) {
-      host.append(
-        el('div', {
-          class: 'empty',
-          text: 'No shift trails match these filters, in ' + PM.rangeLabel() + '.',
-        })
-      );
+      host.append(el('div', { class: 'empty', text: 'No shift trails match these filters, in ' + PM.rangeLabel() + '.' }));
       document.querySelector('#pager').innerHTML = '';
       return;
     }
 
     const node = el('table');
     node.innerHTML =
-      '<thead><tr><th>Recorded</th><th>User</th><th>Run</th><th>Site</th><th>Device</th>' +
-      '<th class="num">Battery</th><th>Location permission</th><th>Precision</th></tr></thead>';
+      '<thead><tr><th>Shift</th><th>User</th><th>Site</th><th class="num">Duration</th><th>Coverage</th>' +
+      '<th class="num">Fixes</th><th class="num">Restarts</th><th class="num">Absences</th>' +
+      '<th class="num">Travelled</th><th class="num">Accuracy</th><th>Permission</th><th>Device</th></tr></thead>';
     const body = el('tbody');
+
     for (const row of rows) {
+      const s = row.stats;
+      const flagged = row.absenceCount || s.runtimeStartCount || s.fixCount === 0;
       body.append(
         el('tr', {
-          class: 'clickable' + (row.restart ? ' is-flagged' : ''),
-          title: 'Open this entry',
+          class: 'clickable' + (flagged ? ' is-flagged' : ''),
+          title: 'Open this shift',
           onclick: (event) => {
             if (event.target.closest('a')) return;
             openDetail(row);
           },
           html:
-            '<td>' + fmt.dayTime(row.recordedAt) + '<div class="person-sub">' + fmt.ago(row.recordedAt) + '</div></td>' +
+            '<td>' + fmt.dayTime(row.clockOut || row.sealedAt) +
+            '<div class="person-sub mono" title="the key the app knows this shift by">' + esc(row.shiftKey || '--') + '</div></td>' +
             '<td>' + personCell(row) + '</td>' +
-            '<td>' + runCell(row) + '</td>' +
             '<td>' +
             (row.siteId === null
-              ? '<span class="badge badge-neutral" title="the payload sends null here for an unmapped clock-in">no site</span>'
+              ? '<span class="badge badge-neutral" title="this clock-in was never mapped to a site">no site</span>'
               : esc(siteLabel(row.siteId))) +
             '</td>' +
-            '<td>' + esc(row.deviceType || '?') + '</td>' +
-            '<td class="num">' + PM.batteryBadge(row.battery) + '</td>' +
+            '<td class="num">' + fmt.duration(row.durationMinutes) + '</td>' +
+            '<td>' + coverageCell(row) + '</td>' +
+            '<td class="num">' + fmt.int(s.fixCount) +
+            (s.fixCount === 0 ? ' <span class="badge badge-critical">none</span>' : '') + '</td>' +
+            '<td class="num">' + (s.runtimeStartCount ? '<span class="badge badge-serious">' + s.runtimeStartCount + '</span>' : '0') +
+            (s.runtimeStartsDisagree
+              ? '<div class="person-sub" title="the app reported a different number of restarts than the runtime_start entries it sent">app said ' +
+                fmt.int(row.reported.runtimeStarts) + '</div>'
+              : '') + '</td>' +
+            '<td class="num">' + (row.absenceCount ? '<span class="badge badge-critical">' + row.absenceCount + '</span>' : '0') +
+            (row.absentMinutes ? '<div class="person-sub">' + fmt.duration(row.absentMinutes) + '</div>' : '') + '</td>' +
+            '<td class="num">' + (s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres)) + '</td>' +
+            '<td class="num">' + fmt.accuracy(s.avgAccuracy) +
+            (s.coarseFixes ? '<div class="person-sub">' + s.coarseFixes + ' coarse</div>' : '') + '</td>' +
             '<td>' + permissionCell(row) + '</td>' +
-            '<td>' + precisionCell(row) + '</td>',
+            '<td>' + esc(row.deviceType || '?') +
+            '<div class="person-sub">' + esc(row.appVersion || '') +
+            (s.batteryStart === null ? '' : ' · ' + s.batteryStart + '→' + s.batteryEnd + '%') + '</div></td>',
         })
       );
     }
+
     node.append(body);
     host.append(node);
 
     const pager = document.querySelector('#pager');
     pager.innerHTML = '';
     const page = Number(PM.state.filters.page || 1);
-    const limit = Number(PM.state.filters.limit || 100);
+    const limit = Number(data.limit || 50);
     pager.append(
       el('span', { text: 'Showing ' + rows.length + ' of ' + fmt.int(total) }),
       el('div', { class: 'spacer' }),
@@ -461,69 +426,164 @@
         onclick: () => PM.setFilter('page', String(page + 1)),
       })
     );
-    document.querySelector('#st-sub').textContent = 'click an entry for its full breakdown';
+    document.querySelector('#st-sub').textContent = 'click a shift to walk its path';
   }
 
+  // ------------------------------------------------------------------ drawer
+
+  /**
+   * Leaflet holds window listeners and tile caches until remove() is called,
+   * and openDrawer only wipes the body - which detaches the container and
+   * leaves the map running. The other drawers in this console release theirs
+   * on pm:drawer-close; this one does the same.
+   */
+  let drawerMap = null;
+  function releaseDrawerMap() {
+    if (!drawerMap) return;
+    try {
+      drawerMap.remove();
+    } catch (err) {
+      /* the container went with the drawer body */
+    }
+    drawerMap = null;
+  }
+  window.addEventListener('pm:drawer-close', releaseDrawerMap);
+
   function openDetail(row) {
+    releaseDrawerMap();
+    const s = row.stats;
     PM.openDrawer({
-      title: row.name || (row.userId === null ? 'Entry with no user' : 'User ' + row.userId),
-      subtitle: fmt.date(row.recordedAt) + (row.restart ? ' · the app process was recreated here' : ''),
+      title: (row.name || 'User ' + row.userId) + ' · shift ' + (row.shiftKey || ''),
+      subtitle:
+        fmt.dayTime(row.clockIn) + ' → ' + fmt.dayTime(row.clockOut) + ' · ' + fmt.duration(row.durationMinutes) +
+        (row.timezone ? ' · ' + row.timezone : ''),
       tabs: [
         {
-          id: 'entry',
-          label: 'The entry',
+          id: 'shift',
+          label: 'The shift',
           render: (host) => {
+            host.append(el('div', { class: 'map-wrap', id: 'st-map', style: 'height:320px;margin-bottom:12px' }));
+
             host.append(
               PM.kv([
-                ['Recorded at', fmt.date(row.recordedAt)],
-                ['Age', fmt.ago(row.recordedAt)],
+                ['Coverage', coverageCell(row)],
+                ['Positioned', fmt.duration(s.positionedMinutes) + ' of ' + fmt.duration(row.durationMinutes)],
+                s.unpositionedMinutes ? ['Unpositioned', fmt.duration(s.unpositionedMinutes)] : null,
+                ['Entries', fmt.int(s.entryCount) + ' (' + fmt.int(s.fixCount) + ' fixes, ' + fmt.int(s.runtimeStartCount) + ' runtime starts)'],
+                ['Distinct runs', fmt.int(s.distinctRuns)],
                 [
-                  'User',
-                  row.userId === null
-                    ? '<span class="badge badge-warning">no user id on this entry</span>'
-                    : (row.name ? esc(row.name) + ' ' : '') +
-                      '<span class="hint">#' + row.userId + '</span>' +
-                      (row.heartbeatKnown
-                        ? ' <a href="/user.html?userId=' + row.userId + '">open their page →</a>'
-                        : ' <span class="badge badge-info">never sent a heartbeat</span>'),
+                  'App restarts',
+                  s.runtimeStartsDisagree
+                    ? '<span class="badge badge-warning">' + s.runtimeStartCount + ' entries, app reported ' +
+                      fmt.int(row.reported.runtimeStarts) + '</span>'
+                    : fmt.int(s.runtimeStartCount),
                 ],
-                ['Site', row.siteId === null ? 'none - unmapped clock-in' : esc(siteLabel(row.siteId))],
-                ['Device', esc(row.deviceType || '--')],
-                ['Battery', PM.batteryBadge(row.battery)],
-                ['Location permission', permissionCell(row)],
-                ['Location precision', precisionCell(row)],
+                s.serviceMissingOnRestart
+                  ? [
+                      'Foreground service gone',
+                      '<span class="badge badge-critical">' + s.serviceMissingOnRestart + '</span> restart(s) came back with no service - ' +
+                        'the strongest sign here that the OS killed the app',
+                    ]
+                  : null,
+                ['Travelled', s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres) + ' along the path'],
+                s.largestStepMetres ? ['Largest single step', fmt.metres(s.largestStepMetres)] : null,
+                ['Longest gap between entries', fmt.duration(s.longestEntryGapMinutes)],
+                ['Accuracy', fmt.accuracy(s.avgAccuracy) + ' avg, worst ' + fmt.accuracy(s.maxAccuracy)],
+                s.coarseFixes ? ['Coarse fixes', s.coarseFixes + ' of ' + s.fixCount] : null,
+                ['Battery', s.batteryStart === null ? '--' : s.batteryStart + '% → ' + s.batteryEnd + '% (min ' + s.batteryMin + '%)'],
+                ['Permission', permissionCell(row)],
+                ['Precision', (s.precisions || []).map((p) => PRECISION_LABEL[p] || p).join(', ') || 'not reported'],
+                row.site && row.fence
+                  ? [
+                      'Against the fence',
+                      fmt.int(row.fence.inside) + ' inside, ' + fmt.int(row.fence.outside) + ' outside, ' +
+                        fmt.int(row.fence.uncertain) + ' uncertain' +
+                        (row.fence.furthestOutside !== null ? ' · furthest ' + fmt.metres(row.fence.furthestOutside) : ''),
+                    ]
+                  : null,
+                ['Sealed', fmt.date(row.sealedAt) + (row.sealLagSeconds !== null ? ' · ' + row.sealLagSeconds + 's after clock-out' : '')],
+                ['Pushed', fmt.date(row.pushedAt) + (row.pushLagSeconds !== null ? ' · ' + row.pushLagSeconds + 's after sealing' : '')],
+                ['Device', esc(row.deviceType || '--') + ' · ' + esc(row.appVersion || '?') + ' (' + esc(row.buildVersion || '?') + ')'],
               ])
             );
 
-            host.append(el('h3', { text: 'This run' }));
-            host.append(
-              PM.kv([
-                ['Run id', '<span class="mono">' + esc(row.runId || '--') + '</span>'],
-                row.run ? ['Position', 'run ' + row.run.ordinal + ' of ' + row.run.of + ' for this person, in ' + PM.rangeLabel()] : null,
-                row.run ? ['Entries in this run', fmt.int(row.run.entries)] : null,
-                row.run ? ['Run first seen', fmt.date(row.run.firstAt)] : null,
-                row.run ? ['Run last seen', fmt.date(row.run.lastAt)] : null,
-                [
-                  'Restart',
-                  row.restart
-                    ? '<span class="badge badge-critical">yes</span> the previous run ended and this one began'
-                    : row.run && row.run.ordinal === 1
-                      ? 'not visible - this is the earliest run for this person in ' +
-                        PM.rangeLabel() +
-                        ', so there is nothing before it to compare against'
-                      : 'no - the same run as the entry before it',
-                ],
-              ])
-            );
-            host.append(
-              el('div', {
-                class: 'hint',
-                text:
-                  'A run is one life of the app process. The payload carries no start time for it, so ' +
-                  '"first seen" is the earliest entry this run wrote that is still in the store - which is ' +
-                  'not the same thing as when the process actually started.',
-              })
-            );
+            if (row.absences.length) {
+              host.append(el('h3', { text: 'Absences' }));
+              const table = el('table');
+              table.innerHTML =
+                '<thead><tr><th>From</th><th>To</th><th class="num">Minutes</th><th>Runtime restarted</th></tr></thead>';
+              const tbody = el('tbody');
+              for (const a of row.absences) {
+                tbody.append(
+                  el('tr', {
+                    html:
+                      '<td>' + fmt.dayTime(a.from) + '</td><td>' + fmt.dayTime(a.to) + '</td>' +
+                      '<td class="num">' + fmt.num(a.minutes, 0) + '</td>' +
+                      '<td>' + (a.runtimeRestarted
+                        ? '<span class="badge badge-serious">yes</span>'
+                        : '<span class="badge badge-neutral">no</span>') + '</td>',
+                  })
+                );
+              }
+              table.append(tbody);
+              host.append(el('div', { class: 'table-scroll' }, [table]));
+              host.append(
+                el('div', {
+                  class: 'hint',
+                  text:
+                    'An absence is the app’s own judgement that it could not say where the device was. ' +
+                    'Where the runtime restarted across one, the process died and came back - which is a ' +
+                    'different failure from a device that simply lost its fix.',
+                })
+              );
+            }
+
+            // The map is sized after the panel is visible; a map built inside a
+            // hidden container comes out 0x0.
+            requestAnimationFrame(() => drawMap(row));
+          },
+        },
+        {
+          id: 'entries',
+          label: 'Entries (' + row.entries.length + ')',
+          render: (host) => {
+            const table = el('table');
+            table.innerHTML =
+              '<thead><tr><th>Recorded</th><th>Kind</th><th>Position</th><th class="num">Accuracy</th>' +
+              '<th class="num">Battery</th><th>Permission</th><th>Precision</th><th>Run</th></tr></thead>';
+            const tbody = el('tbody');
+            for (const e of row.entries) {
+              tbody.append(
+                el('tr', {
+                  class: e.isRuntimeStart ? 'is-flagged' : '',
+                  html:
+                    '<td>' + fmt.dayTime(e.recordedAt) +
+                    (e.fixLagSeconds ? '<div class="person-sub" title="how stale the fix was when it was logged">fix ' + e.fixLagSeconds + 's earlier</div>' : '') +
+                    '</td>' +
+                    '<td>' + (e.isRuntimeStart
+                      ? '<span class="badge badge-serious">runtime start</span>' +
+                        (e.foregroundServicePresent === false
+                          ? '<div class="person-sub">no foreground service</div>'
+                          : e.foregroundServicePresent === true
+                            ? '<div class="person-sub">service alive</div>'
+                            : '')
+                      : '<span class="badge badge-neutral">fix</span>') + '</td>' +
+                    '<td>' + (e.location
+                      ? '<span class="mono">' + fmt.coords(e.location) + '</span>' +
+                        (e.fenceVerdict ? ' ' + PM.geofenceBadge(e.fenceVerdict === 'in' ? true : e.fenceVerdict === 'out' ? false : null) : '')
+                      : '<span class="hint">no position</span>') + '</td>' +
+                    '<td class="num">' + fmt.accuracy(e.accuracy) + '</td>' +
+                    '<td class="num">' + (e.battery === null ? '--' : e.battery + '%') + '</td>' +
+                    '<td>' + esc(PERMISSION_LABEL[e.locationPermission] || e.locationPermission || '--') + '</td>' +
+                    '<td>' + (e.locationPrecision === null
+                      ? '<span class="hint">not reported</span>'
+                      : esc(PRECISION_LABEL[e.locationPrecision] || e.locationPrecision)) + '</td>' +
+                    '<td class="mono" title="' + esc(e.runId || '') + '">' + esc((e.runId || '--').slice(0, 8)) + '</td>',
+                })
+              );
+            }
+            table.append(tbody);
+            host.append(el('div', { class: 'table-scroll' }, [table]));
           },
         },
         {
@@ -532,9 +592,9 @@
           render: (host) => {
             host.append(el('div', { class: 'sk sk-line' }));
             api('/api/shift-trails/' + row.id).then(
-              (data) => {
+              (res) => {
                 host.innerHTML = '';
-                host.append(el('pre', { class: 'json', html: PM.jsonHighlight(data.raw) }));
+                host.append(el('pre', { class: 'json', html: PM.jsonHighlight(res.raw) }));
               },
               (err) => {
                 host.innerHTML = '';
@@ -545,5 +605,35 @@
         },
       ],
     });
+  }
+
+  function drawMap(row) {
+    const target = document.querySelector('#st-map');
+    if (!target) return;
+    if (!row.path.length) {
+      target.innerHTML = '';
+      target.append(
+        el('div', {
+          class: 'empty',
+          text: 'This shift sealed without a single position, so there is no path to draw.',
+        })
+      );
+      return;
+    }
+    drawerMap = PMMap.create(target);
+    const points = row.path.map((p) => ({ lat: p.lat, lng: p.lng, at: p.at, accuracy: p.accuracy }));
+
+    // The fence first, so the path draws over it rather than under.
+    if (row.site && row.site.fence) {
+      PMMap.siteCircle(drawerMap, {
+        lat: row.site.fence.lat,
+        lng: row.site.fence.lng,
+        radius: row.site.fence.radius,
+        radiusIsAuthoritative: row.site.fence.radius !== null && row.site.fence.radius !== undefined,
+        label: row.site.displayName || row.site.name || 'Site ' + row.site.siteId,
+      });
+    }
+    PMMap.track(drawerMap, points, { dots: true });
+    PMMap.fit(drawerMap, points.concat(row.site && row.site.fence ? [row.site.fence] : []));
   }
 })();

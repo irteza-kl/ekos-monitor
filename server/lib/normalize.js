@@ -282,71 +282,250 @@ function snapshot(doc) {
 }
 
 /**
- * Device state line -> flat row.
+ * A sealed shift trail -> one flat row per SHIFT.
  *
- * Eight fields, and deliberately no more: this normalizer invents nothing the
- * document does not say. In particular it does NOT derive a position, a fence
- * verdict or an accuracy band - a line carries no coordinates at all, and a
- * column that reads "unknown" on every row is worse than a column that is not
- * there.
+ * The document is an envelope the app seals at clock-out: the shift's own
+ * facts, a `summary` it computed itself, and an `entries` array. An entry is
+ * either a `fix` (a GPS position) or a `runtime_start` (the app process being
+ * created), so the entries are both the path and the log of what interrupted
+ * it.
  *
- * Three fields the console has elsewhere are answered better here, and the
- * difference is worth stating because it is why this is not folded into the
- * heartbeat's shape:
+ * The row is per shift, not per entry, because the document is: a shift is the
+ * thing that has a duration, a coverage, an outcome and a person. The entries
+ * ride along so the drawer can draw the path and the table can summarise it.
  *
- *   locationPermission   read live off the OS, where the heartbeat carries a
- *                        cached array plus a separate "allow all the time"
- *                        flag. One live enum, no reconciliation.
- *   locationPrecision    null on iOS, and that is a real answer - "not
- *                        reported" - not a missing one. Never defaulted.
- *   runId                no equivalent anywhere in the store. A change in it
- *                        between two lines is the app process having been
- *                        recreated, which is the one failure this console has
- *                        never been able to see.
+ * Everything the app already worked out is kept as it sent it, and the things
+ * it did not are derived here - distance walked, accuracy spread, battery
+ * drain, whether the permission changed mid-shift, how long the seal took to
+ * arrive. Where a derived number can be checked against the app's own
+ * (`runtimeStarts` against the distinct runIds seen), both are kept and the
+ * disagreement is reported rather than one of them silently winning.
  */
+const ENTRY_FIX = 'fix';
+const ENTRY_RUNTIME_START = 'runtime_start';
 const LOCATION_PERMISSIONS = ['always', 'when_in_use', 'denied'];
+
+/** Worst-first, so "the worst this shift ever was" is a max over this order. */
+const PERMISSION_SEVERITY = { denied: 3, when_in_use: 2, always: 1 };
 
 function shiftTrail(doc) {
   if (!doc) return null;
 
-  // One clock today. `recordedAt` is when the line was written, and until the
-  // writer also sends a server-stamped arrival time there is nothing to
-  // measure sync lag against - so none is reported rather than guessed.
-  const recordedAt = flexibleIso(doc.recordedAt);
-  const permission = doc.locationPermission || null;
+  const summary = doc.summary || {};
+  const rawEntries = Array.isArray(doc.entries) ? doc.entries : [];
+
+  const entries = rawEntries.map((e) => {
+    const lat = n(e.latitude);
+    const lng = n(e.longitude);
+    const accuracy = n(e.accuracy);
+    return {
+      kind: e.kind || null,
+      isFix: e.kind === ENTRY_FIX,
+      isRuntimeStart: e.kind === ENTRY_RUNTIME_START,
+      // When the app wrote the entry, and - on a fix - when the GPS actually
+      // read. Kept apart for the same reason the heartbeat keeps them apart:
+      // the gap between them is how stale the position was when it was logged.
+      recordedAt: flexibleIso(e.recordedAt),
+      capturedAt: flexibleIso(e.capturedAt),
+      fixLagSeconds:
+        flexibleIso(e.capturedAt) && flexibleIso(e.recordedAt)
+          ? geo.round((new Date(flexibleIso(e.recordedAt)).getTime() - new Date(flexibleIso(e.capturedAt)).getTime()) / 1000, 1)
+          : null,
+      runId: e.runId ? String(e.runId) : null,
+      siteId: n(e.siteId),
+      deviceType: e.deviceType || null,
+      battery: n(e.batteryPercentage),
+      locationPermission: e.locationPermission || null,
+      locationPrecision: e.locationPrecision || null,
+      coarse: e.locationPrecision === 'coarse',
+      // Only a runtime_start carries this: whether the foreground service was
+      // still alive when the process came back, which is the difference
+      // between the OS restarting the app and the app being killed outright.
+      foregroundServicePresent:
+        e.foregroundServicePresent === undefined ? null : e.foregroundServicePresent,
+      location: lat === null || lng === null ? null : { lat, lng, accuracy },
+      accuracy,
+      accuracyBand: geo.accuracyBand(accuracy),
+    };
+  });
+
+  const fixes = entries.filter((e) => e.location);
+  const runtimeStarts = entries.filter((e) => e.isRuntimeStart);
+
+  // The path, in the order the fixes were taken rather than the order they sit
+  // in the array - a path drawn in the wrong order measures the wrong pairs.
+  const path = fixes
+    .slice()
+    .sort((a, b) => new Date(a.capturedAt || a.recordedAt || 0) - new Date(b.capturedAt || b.recordedAt || 0));
+
+  let travelledMetres = null;
+  let largestStepMetres = null;
+  if (path.length > 1) {
+    travelledMetres = 0;
+    largestStepMetres = 0;
+    for (let i = 1; i < path.length; i += 1) {
+      const step = geo.haversine(path[i - 1].location, path[i].location);
+      if (step === null) continue;
+      travelledMetres += step;
+      if (step > largestStepMetres) largestStepMetres = step;
+    }
+    travelledMetres = geo.round(travelledMetres, 1);
+    largestStepMetres = geo.round(largestStepMetres, 1);
+  }
+
+  // The longest silence BETWEEN entries, which is not the same as the app's
+  // `absences`: the app decides what counts as an absence, this is simply the
+  // biggest hole in what it sent.
+  let longestEntryGapMinutes = null;
+  const stamped = entries
+    .map((e) => e.recordedAt)
+    .filter(Boolean)
+    .sort();
+  for (let i = 1; i < stamped.length; i += 1) {
+    const gap = (new Date(stamped[i]).getTime() - new Date(stamped[i - 1]).getTime()) / 60000;
+    if (longestEntryGapMinutes === null || gap > longestEntryGapMinutes) longestEntryGapMinutes = gap;
+  }
+  longestEntryGapMinutes = geo.round(longestEntryGapMinutes, 1);
+
+  const accuracies = fixes.map((e) => e.accuracy).filter((v) => v !== null);
+  const batteries = entries.map((e) => e.battery).filter((v) => v !== null);
+  const permissions = [...new Set(entries.map((e) => e.locationPermission).filter(Boolean))];
+  const precisions = [...new Set(entries.map((e) => e.locationPrecision).filter(Boolean))];
+  const runIds = [...new Set(entries.map((e) => e.runId).filter(Boolean))];
+
+  const clockIn = iso(doc.clockIn);
+  const clockOut = iso(doc.clockOut);
+  const durationMinutes =
+    clockIn && clockOut ? geo.round((new Date(clockOut).getTime() - new Date(clockIn).getTime()) / 60000, 1) : null;
+
+  const positionedMinutes = n(summary.positionedMinutes);
+  const absences = (Array.isArray(summary.absences) ? summary.absences : []).map((a) => ({
+    from: iso(a.from),
+    to: iso(a.to),
+    minutes: n(a.minutes),
+    runtimeRestarted: a.runtimeRestarted === true,
+  }));
+  const absentMinutes = absences.reduce((total, a) => total + (a.minutes || 0), 0);
+
+  const sealedAt = iso(doc.sealedAt);
+  const pushedAt = iso(doc.pushedAt);
+
+  // How much of the shift the app could actually say where the person was.
+  // The number that says whether this trail is evidence of anything.
+  const coverage =
+    durationMinutes && durationMinutes > 0 && positionedMinutes !== null
+      ? geo.round(Math.min(100, (positionedMinutes / durationMinutes) * 100), 1)
+      : null;
+
+  const worstPermission = permissions.length
+    ? permissions.slice().sort((a, b) => (PERMISSION_SEVERITY[b] || 0) - (PERMISSION_SEVERITY[a] || 0))[0]
+    : null;
 
   return {
     id: String(doc._id),
     kind: 'shiftTrail',
-    recordedAt,
-    // The name every other row in this console uses for "when this happened",
-    // so the shared filter bar, the pager and the CSV need no special case.
-    capturedAt: recordedAt,
-    ageMinutes: minutesSince(recordedAt),
+    type: doc.type || 'shift_location_trail',
+    shiftKey: doc.shiftKey ? String(doc.shiftKey) : null,
 
-    runId: doc.runId ? String(doc.runId) : null,
     userId: n(doc.userId),
+    tenantId: n(doc.tenantId),
     siteId: n(doc.siteId),
+    deviceId: doc.deviceId || null,
+
+    clockIn,
+    clockOut,
+    sealedAt,
+    pushedAt,
+    createdAt: iso(doc.createdAt),
+    // The instant the rest of the console orders and filters rows by.
+    capturedAt: clockOut || sealedAt || iso(doc.createdAt),
+    durationMinutes,
+    ageMinutes: minutesSince(clockOut || sealedAt || iso(doc.createdAt)),
+
+    // Sealing happens at clock-out and pushing when the network allows, so
+    // these two lags separate "the app was slow to close the shift" from "the
+    // phone had no signal until later".
+    sealLagSeconds:
+      clockOut && sealedAt ? geo.round((new Date(sealedAt).getTime() - new Date(clockOut).getTime()) / 1000, 1) : null,
+    pushLagSeconds:
+      sealedAt && pushedAt ? geo.round((new Date(pushedAt).getTime() - new Date(sealedAt).getTime()) / 1000, 1) : null,
+
     deviceType: doc.deviceType || null,
+    appVersion: doc.applicationVersion || null,
+    buildVersion: doc.buildVersion || null,
+    timezone: doc.timezone || null,
+    timezoneOffsetMinutes: n(doc.timezoneOffsetMinutes),
 
-    battery: n(doc.batteryPercentage),
+    // What the app said about itself, untouched.
+    reported: {
+      entries: n(summary.entries),
+      fixes: n(summary.fixes),
+      gaps: n(summary.gaps),
+      runtimeStarts: n(summary.runtimeStarts),
+      firstEntryAt: iso(summary.firstEntryAt),
+      lastEntryAt: iso(summary.lastEntryAt),
+      positionedMinutes,
+    },
 
-    locationPermission: permission,
-    // An unrecognised value is reported as-is and flagged, never silently
-    // bucketed into one of the three we know - a new enum member arriving from
-    // the app is something to notice, not to hide.
-    locationPermissionKnown: permission === null || LOCATION_PERMISSIONS.includes(permission),
-    // "always" is the only setting that keeps tracking alive in the background.
-    locationAlways: permission === 'always',
-    locationDenied: permission === 'denied',
+    absences,
+    absenceCount: absences.length,
+    absentMinutes: geo.round(absentMinutes, 1),
+    absencesWithRestart: absences.filter((a) => a.runtimeRestarted).length,
 
-    locationPrecision: doc.locationPrecision || null,
-    // Android only. On iOS the field is null by design, so "not coarse" here
-    // means "not reported", and the two must not read the same.
-    coarseLocation: doc.locationPrecision === 'coarse',
+    entries,
+    path: path.map((e) => ({ lat: e.location.lat, lng: e.location.lng, at: e.capturedAt || e.recordedAt, accuracy: e.accuracy })),
+    firstFix: path.length ? path[0] : null,
+    lastFix: path.length ? path[path.length - 1] : null,
+    location: path.length ? path[path.length - 1].location : null,
+
+    stats: {
+      entryCount: entries.length,
+      fixCount: fixes.length,
+      runtimeStartCount: runtimeStarts.length,
+      // The app counts restarts itself. This counts the distinct runIds it
+      // actually sent. They should agree - a run beginning IS a restart after
+      // the first - and when they do not, that is a finding about the writer
+      // rather than about the shift, so both numbers stay on the row.
+      distinctRuns: runIds.length,
+      runtimeStartsDisagree:
+        n(summary.runtimeStarts) !== null && runtimeStarts.length !== n(summary.runtimeStarts),
+      // A foreground service that was gone when the process restarted is the
+      // strongest evidence in this payload that the OS killed the app.
+      serviceMissingOnRestart: runtimeStarts.filter((e) => e.foregroundServicePresent === false).length,
+
+      coverage,
+      positionedMinutes,
+      unpositionedMinutes:
+        durationMinutes !== null && positionedMinutes !== null
+          ? geo.round(Math.max(0, durationMinutes - positionedMinutes), 1)
+          : null,
+      longestEntryGapMinutes,
+
+      travelledMetres,
+      largestStepMetres,
+
+      minAccuracy: accuracies.length ? geo.round(Math.min(...accuracies), 1) : null,
+      maxAccuracy: accuracies.length ? geo.round(Math.max(...accuracies), 1) : null,
+      avgAccuracy: accuracies.length ? geo.round(accuracies.reduce((a, b) => a + b, 0) / accuracies.length, 1) : null,
+
+      batteryStart: batteries.length ? batteries[0] : null,
+      batteryEnd: batteries.length ? batteries[batteries.length - 1] : null,
+      batteryMin: batteries.length ? Math.min(...batteries) : null,
+      // Negative means it was charging. Reported as measured either way.
+      batteryDrop: batteries.length > 1 ? geo.round(batteries[0] - batteries[batteries.length - 1], 1) : null,
+
+      permissions,
+      worstPermission,
+      // A permission that changed mid-shift explains a trail that stops dead
+      // halfway through, and nothing else in this document would show it.
+      permissionChanged: permissions.length > 1,
+      precisions,
+      precisionChanged: precisions.length > 1,
+      coarseFixes: fixes.filter((e) => e.coarse).length,
+      unknownAccuracy: fixes.filter((e) => e.accuracy === null).length,
+    },
   };
 }
-
 /**
  * validateClockInLogs document -> flat row. Recomputes the geometry from the
  * stored coordinates so the dashboard can show what the device reported next to

@@ -50,15 +50,15 @@ const PLAN = [
   {
     collection: 'shiftTrails',
     indexes: [
-      // This one is not a nicety. The shift-trails table sorts by recordedAt
-      // with find(), which without an index is a blocking sort - and this
-      // cluster does not honour allowDiskUse, so at volume it would fail at
-      // 32 MB rather than merely run slowly. See the README.
-      { key: { recordedAt: -1 }, name: 'recordedAt_desc', why: 'the shift-trails table default sort and every time range' },
-      { key: { userId: 1, recordedAt: -1 }, name: 'user_recordedAt', why: 'per-user lines and the run index' },
-      { key: { userId: 1, runId: 1 }, name: 'user_run', why: 'grouping lines into runs, which is what detects a restart' },
-      { key: { siteId: 1, recordedAt: -1 }, name: 'site_recordedAt', why: 'site filter' },
-      { key: { locationPermission: 1, recordedAt: -1 }, name: 'permission_recordedAt', why: 'the denied / foreground-only filters and tiles' },
+      // One document per SHIFT, so these stay small tables even at fleet
+      // scale: a device reporting every minute produces one of these a day,
+      // not six hundred. That is also why the list can use a plain find()
+      // without the projection-sort treatment /api/snapshots needed.
+      { key: { clockOut: -1 }, name: 'clockOut_desc', why: 'the shift-trails table default sort and every time range' },
+      { key: { userId: 1, clockOut: -1 }, name: 'user_clockOut', why: 'per-user shifts' },
+      { key: { siteId: 1, clockOut: -1 }, name: 'site_clockOut', why: 'site filter' },
+      { key: { shiftKey: 1 }, name: 'shiftKey', why: 'opening a shift by the key the app knows it as' },
+      { key: { 'summary.runtimeStarts': -1 }, name: 'runtimeStarts', why: 'the app-restart filter and tile' },
     ],
   },
 ];

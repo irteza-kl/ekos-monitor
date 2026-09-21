@@ -433,69 +433,81 @@ function exitWindowMatch(q) {
 }
 
 // ---------------------------------------------------------------------------
-// device state lines
+// shift trails ({ type: 'shift_location_trail' })
 // ---------------------------------------------------------------------------
 
 /**
- * Every field on a line is top-level and scalar, so unlike the other three
- * kinds there is no path map to keep - the query-string name and the stored
- * name are the same word.
+ * A shift trail is a sealed envelope for one shift, so the filters split in
+ * two: the shift's own fields, which are top level and can be matched
+ * directly, and the entries', which are inside an array.
+ *
+ * Anything about the entries uses `$elemMatch`, and that distinction is not
+ * cosmetic. `{ 'entries.locationPermission': 'denied', 'entries.kind': 'fix' }`
+ * matches a shift where SOME entry was denied and SOME OTHER entry was a fix -
+ * two different entries - which is not the question anybody is asking. Every
+ * entry clause here therefore names one entry.
  */
 function shiftTrailMatch(q) {
   const clauses = [];
 
+  // A shift is bounded by its clock-in and clock-out, and the interesting
+  // question is which shifts overlap the window rather than which started
+  // inside it - a night shift that began before the window is still part of
+  // it. `createdAt` is the fallback for a document with no clock times.
   /**
-   * `recordedAt` is the only clock these documents carry, so it is the one the
-   * range applies to. When the writer adds a server-stamped arrival time this
-   * should accept either, the way exitWindowMatch already does.
+   * The clock times are ISO **strings** in this store, while `createdAt` next
+   * to them is a BSON date. Mongo compares by type before value, so a
+   * date-typed bound matches no string at all - the range would silently
+   * return nothing for a collection plainly full of shifts.
    *
-   * Matched as a date OR as an ISO string. The payload shows a quoted
-   * timestamp, and whether that reaches Mongo as a BSON date or as a string
-   * depends on how the writer builds the document - but Mongo compares by BSON
-   * type before value, so a date-typed range silently matches none of the
-   * string-typed documents. Getting no rows for a range that plainly contains
-   * data is the least debuggable failure there is, so both are asked for.
    * UTC ISO-8601 sorts lexicographically in time order, which is what makes
-   * the string half of this correct rather than approximate.
+   * comparing them as strings correct rather than approximate. Both forms are
+   * offered anyway, because the writer has already changed a field's type once
+   * and the store will hold both shapes forever when it does it again.
    */
   const from = str(q.from);
   const to = str(q.to);
   if (from || to) {
-    const asDate = {};
-    const asText = {};
-    if (from) {
-      const d = new Date(from);
-      if (!Number.isNaN(d.getTime())) {
-        asDate.$gte = d;
-        asText.$gte = d.toISOString();
-      }
-    }
-    if (to) {
-      const d = new Date(to);
-      if (!Number.isNaN(d.getTime())) {
-        asDate.$lte = d;
-        asText.$lte = d.toISOString();
-      }
-    }
-    if (Object.keys(asDate).length) {
-      clauses.push({ $or: [{ recordedAt: asDate }, { recordedAt: asText }] });
+    const lo = from && !Number.isNaN(new Date(from).getTime()) ? new Date(from) : null;
+    const hi = to && !Number.isNaN(new Date(to).getTime()) ? new Date(to) : null;
+    if (lo || hi) {
+      const overlapAs = (cast) => {
+        const clause = {};
+        if (lo) clause.clockOut = { $gte: cast(lo) };
+        if (hi) clause.clockIn = { $lte: cast(hi) };
+        return clause;
+      };
+      const createdRange = {};
+      if (lo) createdRange.$gte = lo;
+      if (hi) createdRange.$lte = hi;
+      clauses.push({
+        $or: [
+          // Which shifts OVERLAP the window, not which started inside it: a
+          // night shift that began before it is still part of it.
+          overlapAs((d) => d.toISOString()),
+          overlapAs((d) => d),
+          // A document with no clock times falls back to when it was stored.
+          { clockIn: null, createdAt: createdRange },
+          { clockIn: { $exists: false }, createdAt: createdRange },
+        ],
+      });
     }
   }
 
   const users = nums(q.userId);
   if (users.length) clauses.push({ userId: { $in: users } });
 
-  // `jobSiteId` is what the shared filter bar calls a site everywhere else, so
-  // both spellings are accepted and the page keeps carrying its site filter
-  // when you move to it from Heartbeats or Sites.
+  const tenants = nums(q.tenantId);
+  if (tenants.length) clauses.push({ tenantId: { $in: tenants } });
+
   const siteTokens = list(q.siteId).concat(list(q.jobSiteId));
   const sites = siteTokens.map(Number).filter(Number.isFinite);
   const wantsNoSite = siteTokens.some((t) => t === 'null' || t === 'none');
   if (sites.length || wantsNoSite) {
     const or = [];
     if (sites.length) or.push({ siteId: { $in: sites } });
-    // A line with no site is a device not clocked into a mapped one. That is a
-    // selectable state, not an absence, so it gets its own token.
+    // A shift with no site is a clock-in that was never mapped to one. A real
+    // state, so it is selectable rather than simply absent.
     if (wantsNoSite) or.push({ siteId: null });
     clauses.push(or.length === 1 ? or[0] : { $or: or });
   }
@@ -503,34 +515,65 @@ function shiftTrailMatch(q) {
   const devices = list(q.deviceType);
   if (devices.length) clauses.push({ deviceType: { $in: devices } });
 
-  const runs = list(q.runId);
-  if (runs.length) clauses.push({ runId: { $in: runs } });
+  const versions = list(q.appVersion);
+  if (versions.length) clauses.push({ applicationVersion: { $in: versions } });
+
+  const timezones = list(q.timezone);
+  if (timezones.length) clauses.push({ timezone: { $in: timezones } });
+
+  const shiftKeys = list(q.shiftKey);
+  if (shiftKeys.length) clauses.push({ shiftKey: { $in: shiftKeys } });
+
+  // --- the entries -----------------------------------------------------------
 
   const permissions = list(q.locationPermission);
-  if (permissions.length) clauses.push({ locationPermission: { $in: permissions } });
+  if (permissions.length) clauses.push({ entries: { $elemMatch: { locationPermission: { $in: permissions } } } });
 
   const precisions = list(q.locationPrecision);
   if (precisions.length) {
-    // "Not reported" is a value here - it is what every iOS line says - so it
-    // has to be selectable, and it is null rather than a missing field.
     const wanted = precisions.filter((p) => p !== 'null');
     const or = [];
+    // "Not reported" is what every iOS entry says, so it is a value to select
+    // rather than an absence to skip over.
     if (wanted.length) or.push({ locationPrecision: { $in: wanted } });
     if (precisions.includes('null')) or.push({ locationPrecision: null });
-    if (or.length) clauses.push(or.length === 1 ? or[0] : { $or: or });
+    clauses.push({ entries: { $elemMatch: or.length === 1 ? or[0] : { $or: or } } });
   }
+
+  const runIds = list(q.runId);
+  if (runIds.length) clauses.push({ entries: { $elemMatch: { runId: { $in: runIds } } } });
 
   const battery = {};
   if (num(q.batteryMin) !== null) battery.$gte = num(q.batteryMin);
   if (num(q.batteryMax) !== null) battery.$lte = num(q.batteryMax);
-  if (Object.keys(battery).length) clauses.push({ batteryPercentage: battery });
+  if (Object.keys(battery).length) clauses.push({ entries: { $elemMatch: { batteryPercentage: battery } } });
+
+  // --- what the app worked out for itself ------------------------------------
+
+  if (num(q.minEntries) !== null) clauses.push({ 'summary.entries': { $gte: num(q.minEntries) } });
+  if (num(q.minFixes) !== null) clauses.push({ 'summary.fixes': { $gte: num(q.minFixes) } });
+
+  const restarts = bool(q.hasRestarts);
+  if (restarts === true) clauses.push({ 'summary.runtimeStarts': { $gte: 1 } });
+  if (restarts === false) clauses.push({ $or: [{ 'summary.runtimeStarts': 0 }, { 'summary.runtimeStarts': null }] });
+  if (num(q.minRestarts) !== null) clauses.push({ 'summary.runtimeStarts': { $gte: num(q.minRestarts) } });
+
+  const absent = bool(q.hasAbsences);
+  // An absence is an element of an array, so "has one" is the first element
+  // existing - `$size: {$gt: 0}` is not a thing Mongo will match on.
+  if (absent === true) clauses.push({ 'summary.absences.0': { $exists: true } });
+  if (absent === false) clauses.push({ 'summary.absences.0': { $exists: false } });
+
+  const noFixes = bool(q.noFixes);
+  if (noFixes === true) clauses.push({ $or: [{ 'summary.fixes': 0 }, { 'summary.fixes': null }] });
+  if (noFixes === false) clauses.push({ 'summary.fixes': { $gte: 1 } });
 
   const search = str(q.search);
   if (search) {
     const rx = { $regex: escapeRegex(search), $options: 'i' };
-    const or = [{ runId: rx }, { deviceType: rx }, { locationPermission: rx }];
+    const or = [{ shiftKey: rx }, { deviceType: rx }, { timezone: rx }, { entries: { $elemMatch: { runId: rx } } }];
     const asNumber = Number(search);
-    if (Number.isFinite(asNumber)) or.push({ userId: asNumber }, { siteId: asNumber });
+    if (Number.isFinite(asNumber)) or.push({ userId: asNumber }, { siteId: asNumber }, { tenantId: asNumber });
     clauses.push({ $or: or });
   }
 
@@ -539,6 +582,14 @@ function shiftTrailMatch(q) {
 
   return and(clauses);
 }
+
+/**
+ * Filters that need the row's derived numbers - coverage, distance walked -
+ * rather than anything the document stores. Applied in Node after
+ * normalize.shiftTrail has computed them, which is why they are not here:
+ * see lib/shiftTrails.js.
+ */
+
 
 /** Applied after sample statistics have been computed. */
 function exitWindowPostMatch(q) {
