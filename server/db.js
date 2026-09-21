@@ -38,18 +38,20 @@ const EXIT_WINDOW_FILTER = {
 /**
  * Documents of this shape are shift trails, wherever they live.
  *
- * `runId` is the discriminator because it is the one field no other kind in
- * this store has, and it is not optional on a line: the whole point of the
- * payload is that a changed runId means the app process was recreated. The
- * writer may add a `type` later - that is asked for in the payload review -
- * and this accepts it either way rather than waiting for it.
+ * The writer shipped `type: 'shift_location_trail'`, and the document is not
+ * the flat line the payload review was written against: it is a **sealed
+ * envelope for one shift**, carrying a `summary` and an `entries` array, and
+ * `runId` lives on each entry rather than at the top level. So the `runId`
+ * discriminator this used to carry matched none of them, and they were
+ * detected as no kind at all - which meant the heartbeat base filter, being a
+ * negation, swept them up as heartbeats. Exactly the failure the negation was
+ * rewritten to prevent, reaching the store before the rewrite could catch it.
  *
- * Shape, not name: the same rule the other two kinds are found by, so the
- * lines are picked up whether they land in their own collection or get mixed
- * into ekosClientState the way the exit windows are.
+ * Shape as well as name: `entries` plus `shiftKey` identifies one of these
+ * without depending on the type string, so a renamed type still lands here.
  */
 const SHIFT_TRAIL_FILTER = {
-  $or: [{ type: 'device_state' }, { runId: { $exists: true, $ne: null } }],
+  $or: [{ type: 'shift_location_trail' }, { entries: { $type: 'array' }, shiftKey: { $exists: true } }],
 };
 
 /** Every kind this app reads, in the order a shared collection is split by. */
@@ -175,11 +177,15 @@ function baseFilterFor(kind, map) {
   if (kind === 'exitWindows') return EXIT_WINDOW_FILTER;
   if (kind === 'shiftTrails') return SHIFT_TRAIL_FILTER;
 
-  const clauses = [];
-  if (shares.includes('exitWindows')) clauses.push({ type: { $ne: 'exit_window' } });
-  if (shares.includes('shiftTrails')) clauses.push({ runId: { $exists: false } });
-  if (!clauses.length) return {};
-  return clauses.length === 1 ? clauses[0] : { $and: clauses };
+  // Excluded by the OTHER kinds' own positive filters, rather than by a
+  // hand-written negation of each. `{ type: { $ne: 'exit_window' } }` was the
+  // hand-written kind, and it let every shift trail through as a heartbeat the
+  // moment one arrived carrying a different type string. $nor over the real
+  // filters cannot drift from them, because it IS them.
+  const others = [];
+  if (shares.includes('exitWindows')) others.push(EXIT_WINDOW_FILTER);
+  if (shares.includes('shiftTrails')) others.push(SHIFT_TRAIL_FILTER);
+  return others.length ? { $nor: others } : {};
 }
 
 /** Collection handle plus the base filter that isolates that document kind. */

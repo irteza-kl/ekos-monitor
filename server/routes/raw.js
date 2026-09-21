@@ -115,7 +115,9 @@ router.get('/raw/collections', async (req, res, next) => {
  */
 const KIND_SHAPES = [
   { key: 'exit window', filter: { $or: [{ type: 'exit_window' }, { samples: { $type: 'array' }, fence: { $exists: true } }] } },
-  { key: 'shift trail', filter: { runId: { $exists: true, $ne: null } } },
+  // A sealed shift envelope: a summary and an `entries` array, with runId on
+  // each entry rather than at the top level.
+  { key: 'shift trail', filter: { $or: [{ type: 'shift_location_trail' }, { entries: { $type: 'array' }, shiftKey: { $exists: true } }] } },
   { key: 'heartbeat', filter: { $or: [{ currentUser: { $exists: true } }, { currentUserLocation: { $exists: true } }] } },
   { key: 'clock-in check', filter: { requestBody: { $exists: true }, response: { $exists: true } } },
 ];
@@ -137,7 +139,7 @@ const metaCache = cache.create({ ttlMs: 5 * 60 * 1000, maxKeys: 6 });
 function kindOf(doc) {
   if (!doc || typeof doc !== 'object') return null;
   if (doc.type === 'exit_window' || (Array.isArray(doc.samples) && doc.fence)) return 'exit window';
-  if (doc.runId !== undefined && doc.runId !== null) return 'shift trail';
+  if (doc.type === 'shift_location_trail' || (Array.isArray(doc.entries) && doc.shiftKey)) return 'shift trail';
   if (doc.currentUser || doc.currentUserLocation) return 'heartbeat';
   if (doc.requestBody && doc.response) return 'clock-in check';
   return null;
