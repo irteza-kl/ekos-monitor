@@ -42,6 +42,45 @@
   const MAX_COLUMNS = 8;
   const MAX_SUGGESTIONS = 120;
 
+  /**
+   * Envelopes the writers use interchangeably for the same fields.
+   *
+   * The Android client sends `currentUser` unwrapped on about a quarter of its
+   * heartbeats, where iOS always wraps it in `data` - same fields, same
+   * meaning, two paths, both being written today on the same build. A column
+   * asking for one of them printed `--` next to a name that was plainly there
+   * in the document below it, which is the one thing this page must not do.
+   *
+   * So a path resolves against both envelopes and the cell reports which one it
+   * actually came from. This is a deliberate exception, not a general rule: it
+   * is here because the store genuinely holds one field under two names, and
+   * each pair has to be written down to be believed. Guessing at equivalence by
+   * matching leaf names would be magic, and would eventually show a value from
+   * somewhere the reader never asked about.
+   */
+  const EQUIVALENT_PREFIXES = [['currentUser.data.', 'currentUser.']];
+
+  /** The paths that mean what this path means, this one first. */
+  function equivalentPaths(path) {
+    const out = [path];
+    for (const [wrapped, bare] of EQUIVALENT_PREFIXES) {
+      // The longer prefix is tested first: every wrapped path also starts with
+      // the bare one, and reversing these two produces currentUser.data.data.
+      if (path.startsWith(wrapped)) out.push(bare + path.slice(wrapped.length));
+      else if (path.startsWith(bare)) out.push(wrapped + path.slice(bare.length));
+    }
+    return out;
+  }
+
+  /** The value for a column, and the path it actually came from. */
+  function resolve(doc, path) {
+    for (const candidate of equivalentPaths(path)) {
+      const value = dig(doc, candidate);
+      if (value !== undefined) return { path: candidate, value };
+    }
+    return { path, value: undefined };
+  }
+
   PM.boot(
     'raw.html',
     async ({ root }) => {
@@ -153,9 +192,12 @@
     const preset = DEFAULT_COLUMNS[dominantKind()];
     if (preset) {
       // Only the ones this page actually has, so a preset never prints a column
-      // of dashes for a field this collection does not carry.
+      // of dashes for a field this collection does not carry. A column counts
+      // as present when EITHER envelope of it is - otherwise the whole page
+      // would drop the name column just because the rows it sampled happen to
+      // be the other shape.
       const present = new Set(suggestions().map((s) => s.path));
-      const kept = preset.filter((p) => present.has(p));
+      const kept = preset.filter((p) => equivalentPaths(p).some((a) => present.has(a)));
       if (kept.length) return kept;
     }
     return suggestions()
@@ -423,7 +465,19 @@
             : '<span class="badge badge-warning" title="this document matches none of the shapes this console knows">unrecognised</span>',
         })
       );
-      for (const path of columns) tr.append(el('td', { html: cell(dig(row.doc, path)) }));
+      for (const path of columns) {
+        const hit = resolve(row.doc, path);
+        tr.append(
+          el('td', {
+            html: cell(hit.value),
+            // Only when the value came from somewhere other than the column
+            // asked for, so the reader is never misled about which field they
+            // are looking at.
+            title: hit.value !== undefined && hit.path !== path ? 'from ' + hit.path : null,
+            class: hit.value !== undefined && hit.path !== path ? 'raw-aliased' : null,
+          })
+        );
+      }
       tr.append(
         el('td', { class: 'raw-actions' }, [
           el('button', {

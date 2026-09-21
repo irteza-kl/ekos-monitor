@@ -755,6 +755,12 @@ pre.json {
 }
 .raw-json-row:hover > td { background: var(--surface-2); }
 
+/* The value came from the other envelope of the same field (see
+   EQUIVALENT_PREFIXES in raw.js). Marked, because a reader comparing a column
+   against the document below it should be able to see why the paths differ -
+   hovering names the path it actually came from. */
+.raw-aliased { text-decoration: underline dotted var(--baseline); text-underline-offset: 3px; }
+
 pre.json .k { color: var(--json-key); }
 pre.json .s { color: var(--json-string); }
 pre.json .n { color: var(--json-number); }
