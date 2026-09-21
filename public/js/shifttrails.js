@@ -369,7 +369,7 @@
     const cls = c >= 90 ? 'badge-good' : c >= 60 ? 'badge-warning' : 'badge-critical';
     return (
       '<span class="badge ' + cls + '">' + fmt.pct(c) + '</span>' +
-      '<div class="person-sub">' + fmt.num(row.stats.positionedMinutes, 0) + ' of ' + fmt.num(row.durationMinutes, 0) + ' min</div>'
+      '<div class="person-sub">' + fmt.num(row.stats.positionedMinutes, 0) + ' of ' + fmt.num(row.stats.shiftMinutes, 0) + ' min had a fix</div>'
     );
   }
 
@@ -466,7 +466,12 @@
               : '') + '</td>' +
             '<td class="num">' + (row.absenceCount ? '<span class="badge badge-critical">' + row.absenceCount + '</span>' : '0') +
             (row.absentMinutes ? '<div class="person-sub">' + fmt.duration(row.absentMinutes) + '</div>' : '') + '</td>' +
-            '<td class="num">' + (s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres)) + '</td>' +
+            '<td class="num">' + (s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres)) +
+            (s.impossibleSteps
+              ? '<div class="person-sub"><span class="badge badge-warning" title="a fix landed ' +
+                fmt.metres(s.discardedMetres) + ' away at a speed nothing on the ground reaches - left out of this total">' +
+                s.impossibleSteps + ' bad fix</span></div>'
+              : '') + '</td>' +
             '<td class="num">' + fmt.accuracy(s.avgAccuracy) +
             (s.coarseFixes ? '<div class="person-sub">' + s.coarseFixes + ' coarse</div>' : '') + '</td>' +
             '<td>' + permissionCell(row) + '</td>' +
@@ -546,8 +551,8 @@
             host.append(
               PM.kv([
                 ['Coverage', coverageCell(row)],
-                ['Positioned', fmt.duration(s.positionedMinutes) + ' of ' + fmt.duration(row.durationMinutes)],
-                s.unpositionedMinutes ? ['Unpositioned', fmt.duration(s.unpositionedMinutes)] : null,
+                ['Positioned', fmt.int(s.positionedMinutes) + ' of ' + fmt.int(s.shiftMinutes) + ' wall-clock minutes contained a fix'],
+                s.unpositionedMinutes ? ['Minutes with no fix', fmt.int(s.unpositionedMinutes)] : null,
                 [
                   'Entries',
                   fmt.int(s.entryCount) +
@@ -594,7 +599,16 @@
                         'the strongest sign here that the OS killed the app',
                     ]
                   : null,
-                ['Travelled', s.travelledMetres === null ? '--' : fmt.metres(s.travelledMetres) + ' along the path'],
+                [
+                  'Travelled',
+                  s.travelledMetres === null
+                    ? '--'
+                    : fmt.metres(s.travelledMetres) + ' along the path' +
+                      (s.impossibleSteps
+                        ? '<div class="person-sub">' + s.impossibleSteps + ' step of ' + fmt.metres(s.discardedMetres) +
+                          ' left out: a fix that far away at that speed is a bad reading, not a journey</div>'
+                        : ''),
+                ],
                 s.largestStepMetres ? ['Largest single step', fmt.metres(s.largestStepMetres)] : null,
                 ['Longest gap between entries', fmt.duration(s.longestEntryGapMinutes)],
                 ['Accuracy', fmt.accuracy(s.avgAccuracy) + ' avg, worst ' + fmt.accuracy(s.maxAccuracy)],

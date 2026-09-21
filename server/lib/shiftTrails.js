@@ -259,8 +259,17 @@ async function summary(q) {
                   shiftsWithAbsences: { $sum: { $cond: [{ $gt: [{ $size: { $ifNull: ['$summary.absences', []] } }, 0] }, 1, 0] } },
                   absences: { $sum: { $size: { $ifNull: ['$summary.absences', []] } } },
                   shiftsWithNoFix: { $sum: { $cond: [{ $eq: [{ $ifNull: ['$summary.fixes', 0] }, 0] }, 1, 0] } },
-                  // Shift minutes, from the clock times rather than the app's
-                  // own count, so coverage can be checked against it.
+                  /**
+                   * The shift's length in WALL-CLOCK MINUTE BUCKETS, not
+                   * elapsed minutes.
+                   *
+                   * `positionedMinutes` is a count of the distinct minutes
+                   * containing a fix, so coverage has to divide it by a count
+                   * of minutes, not by a duration. Dividing by elapsed time
+                   * put 13 of 21 shifts over 100%. Same arithmetic as
+                   * normalize.shiftTrail: floor to the minute at each end and
+                   * count the buckets inclusively.
+                   */
                   shiftMinutes: {
                     $sum: {
                       $let: {
@@ -268,7 +277,17 @@ async function summary(q) {
                         in: {
                           $cond: [
                             { $and: [{ $ne: ['$$a', null] }, { $ne: ['$$b', null] }] },
-                            { $divide: [{ $subtract: ['$$b', '$$a'] }, 60000] },
+                            {
+                              $add: [
+                                {
+                                  $subtract: [
+                                    { $floor: { $divide: [{ $toLong: '$$b' }, 60000] } },
+                                    { $floor: { $divide: [{ $toLong: '$$a' }, 60000] } },
+                                  ],
+                                },
+                                1,
+                              ],
+                            },
                             0,
                           ],
                         },

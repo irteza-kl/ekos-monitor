@@ -304,6 +304,10 @@ function snapshot(doc) {
 const ENTRY_FIX = 'fix';
 const ENTRY_RUNTIME_START = 'runtime_start';
 const ENTRY_GAP = 'gap';
+
+/** A step this long AND this fast is a bad fix, not a journey. See below. */
+const IMPOSSIBLE_STEP_METRES = 1000;
+const IMPOSSIBLE_STEP_KMH = 300;
 const LOCATION_PERMISSIONS = ['always', 'when_in_use', 'denied'];
 
 /** Worst-first, so "the worst this shift ever was" is a max over this order. */
@@ -361,6 +365,25 @@ function shiftTrail(doc) {
     };
   });
 
+  /**
+   * Chronological, because the stored array is not.
+   *
+   * One trail in this store holds a `runtime_start` stamped 17:17:40 at index
+   * 3, after a `fix` stamped 17:17:41 at index 2 - the app appends entries as
+   * it generates them, and a restart can be written with a timestamp slightly
+   * behind a fix already queued. Rendered in array order the drawer showed
+   * time running backwards for a row, and `batteryStart`/`batteryEnd` read the
+   * wrong ends of the shift.
+   *
+   * The raw document tab still shows the stored order, so nothing is hidden -
+   * this is the order the shift happened in.
+   */
+  entries.sort((a, b) => {
+    const at = a.recordedAt ? new Date(a.recordedAt).getTime() : Infinity;
+    const bt = b.recordedAt ? new Date(b.recordedAt).getTime() : Infinity;
+    return at - bt;
+  });
+
   const fixes = entries.filter((e) => e.location);
   const runtimeStarts = entries.filter((e) => e.isRuntimeStart);
   const gaps = entries.filter((e) => e.isGap);
@@ -373,14 +396,44 @@ function shiftTrail(doc) {
     .slice()
     .sort((a, b) => new Date(a.capturedAt || a.recordedAt || 0) - new Date(b.capturedAt || b.recordedAt || 0));
 
+  /**
+   * Distance walked, with the teleports left out.
+   *
+   * One fix in this store lands 13,547 km from the one 53 seconds before it -
+   * reported at ±10 m, more confidently than the three real fixes around it -
+   * and summing it produced a 2.7-minute shift that had travelled the width of
+   * a planet. That is not a distance, and printing it makes the column
+   * worthless for the shifts where it is right.
+   *
+   * A step is discarded only when it is BOTH long and impossibly fast. Either
+   * test alone would be wrong: GPS jitter of 20 m across half a second is
+   * hundreds of km/h and is perfectly real, while a kilometre over ten minutes
+   * is just a walk. Measured on this store's 114 steps, the rule discards
+   * exactly one - the teleport - and the next largest step it keeps is 787 m
+   * at 38 km/h. The 708 m step at 110 km/h, somebody in a vehicle, survives.
+   *
+   * Discarded distance is reported rather than erased, because a fix that
+   * wrong is itself the finding.
+   */
   let travelledMetres = null;
   let largestStepMetres = null;
+  let impossibleSteps = 0;
+  let discardedMetres = 0;
   if (path.length > 1) {
     travelledMetres = 0;
     largestStepMetres = 0;
     for (let i = 1; i < path.length; i += 1) {
       const step = geo.haversine(path[i - 1].location, path[i].location);
       if (step === null) continue;
+      const fromAt = path[i - 1].capturedAt || path[i - 1].recordedAt;
+      const toAt = path[i].capturedAt || path[i].recordedAt;
+      const seconds = fromAt && toAt ? (new Date(toAt).getTime() - new Date(fromAt).getTime()) / 1000 : null;
+      const kmh = seconds && seconds > 0 ? (step / seconds) * 3.6 : null;
+      if (step > IMPOSSIBLE_STEP_METRES && (kmh === null || kmh > IMPOSSIBLE_STEP_KMH)) {
+        impossibleSteps += 1;
+        discardedMetres += step;
+        continue;
+      }
       travelledMetres += step;
       if (step > largestStepMetres) largestStepMetres = step;
     }
@@ -410,8 +463,9 @@ function shiftTrail(doc) {
 
   const clockIn = iso(doc.clockIn);
   const clockOut = iso(doc.clockOut);
-  const durationMinutes =
-    clockIn && clockOut ? geo.round((new Date(clockOut).getTime() - new Date(clockIn).getTime()) / 60000, 1) : null;
+  const inMs = clockIn ? new Date(clockIn).getTime() : null;
+  const outMs = clockOut ? new Date(clockOut).getTime() : null;
+  const durationMinutes = inMs !== null && outMs !== null ? geo.round((outMs - inMs) / 60000, 1) : null;
 
   const positionedMinutes = n(summary.positionedMinutes);
   const absences = (Array.isArray(summary.absences) ? summary.absences : []).map((a) => ({
@@ -425,12 +479,35 @@ function shiftTrail(doc) {
   const sealedAt = iso(doc.sealedAt);
   const pushedAt = iso(doc.pushedAt);
 
-  // How much of the shift the app could actually say where the person was.
-  // The number that says whether this trail is evidence of anything.
+  /**
+   * How much of the shift the app could actually say where the person was.
+   *
+   * `positionedMinutes` is NOT elapsed positioned time - it is a count of the
+   * distinct wall-clock minutes that contain a fix. Checked against every
+   * trail in the store: it equals the number of distinct minute buckets the
+   * fixes fall into on 19 of 21, and is one lower on the other two.
+   *
+   * So dividing it by the shift's elapsed duration divides a count by a
+   * duration, and the answer exceeded 100% on 13 of 21 shifts - a 3.20-minute
+   * shift reporting 4 positioned minutes. It was clamped to 100%, which turned
+   * a unit error into a tile reading "100.0% · 5 of 4 min": visibly wrong, and
+   * the clamp was what hid the cause.
+   *
+   * The denominator is now the same kind of thing as the numerator - how many
+   * wall-clock minutes the shift touches at all - so both sides count minute
+   * buckets and the ratio means something. A shift from 16:26:50 to 16:29:02
+   * touches four of them.
+   */
+  const shiftMinutes =
+    inMs === null || outMs === null ? null : Math.floor(outMs / 60000) - Math.floor(inMs / 60000) + 1;
   const coverage =
-    durationMinutes && durationMinutes > 0 && positionedMinutes !== null
-      ? geo.round(Math.min(100, (positionedMinutes / durationMinutes) * 100), 1)
+    shiftMinutes && shiftMinutes > 0 && positionedMinutes !== null
+      ? geo.round(Math.min(100, (positionedMinutes / shiftMinutes) * 100), 1)
       : null;
+  // The clamp above stays, because the app's own count can still exceed the
+  // buckets by one - but when it does, that is reported rather than smoothed
+  // away, which is the mistake this whole comment exists to record.
+  const coverageClamped = !!(shiftMinutes && positionedMinutes !== null && positionedMinutes > shiftMinutes);
 
   const worstPermission = permissions.length
     ? permissions.slice().sort((a, b) => (PERMISSION_SEVERITY[b] || 0) - (PERMISSION_SEVERITY[a] || 0))[0]
@@ -519,15 +596,24 @@ function shiftTrail(doc) {
       serviceMissingOnRestart: runtimeStarts.filter((e) => e.foregroundServicePresent === false).length,
 
       coverage,
+      coverageClamped,
       positionedMinutes,
+      // Both counts of wall-clock minutes, so they can be subtracted. The
+      // denominator coverage is measured against, and the minutes with no fix
+      // in them - which is what "where did the rest of the shift go" means.
+      shiftMinutes,
       unpositionedMinutes:
-        durationMinutes !== null && positionedMinutes !== null
-          ? geo.round(Math.max(0, durationMinutes - positionedMinutes), 1)
+        shiftMinutes !== null && positionedMinutes !== null
+          ? Math.max(0, shiftMinutes - positionedMinutes)
           : null,
       longestEntryGapMinutes,
 
       travelledMetres,
       largestStepMetres,
+      // Steps left out of `travelledMetres` because they were long AND
+      // impossibly fast. Reported, not erased: a fix that wrong is the finding.
+      impossibleSteps,
+      discardedMetres: impossibleSteps ? geo.round(discardedMetres, 1) : null,
 
       minAccuracy: accuracies.length ? geo.round(Math.min(...accuracies), 1) : null,
       maxAccuracy: accuracies.length ? geo.round(Math.max(...accuracies), 1) : null,
