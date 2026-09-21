@@ -1784,7 +1784,17 @@ window.PM = (function () {
             el('option', { value: '60000', text: 'Every 60s' }),
           ]
         ),
-        el('button', { class: 'btn btn-sm btn-primary', text: '⟳ Refresh', onclick: () => emit('pm:refresh') }),
+        el('button', {
+          class: 'btn btn-sm btn-primary',
+          text: '⟳ Refresh',
+          // The counts and dropdowns are part of what Refresh refreshes, and
+          // forced, because pressing it is a request for the current numbers
+          // rather than the ones the server last cached.
+          onclick: () => {
+            reloadMeta(true);
+            emit('pm:refresh');
+          },
+        }),
       ]),
     ]);
 
@@ -1867,11 +1877,63 @@ window.PM = (function () {
     });
   }
 
+  /**
+   * Re-read /api/meta: the sidebar counts, the database chip, and the contents
+   * of every filter dropdown.
+   *
+   * This ran once, at boot, and nothing ever ran it again - so the counts beside
+   * the nav were however many documents there had been when the tab was opened,
+   * and Refresh, which reloads everything the page itself shows, left them
+   * untouched. On a console watching a store that grows every few seconds, a
+   * number that never moves reads as a broken number.
+   *
+   * `force` sends refresh=1, which steps past the server's ten-minute cache AND
+   * makes it re-probe which collection holds which kind. That is what a person
+   * pressing Refresh is asking for. The auto-refresh tick does not force it:
+   * the collection map changes over days, and re-probing every collection in
+   * the database on a timer would cost seconds, repeatedly, to learn nothing.
+   *
+   * state.meta keeps ONE identity for the life of the page - every page
+   * destructures it out of the init argument - so it is filled in place and
+   * never replaced.
+   */
+  let metaInFlight = null;
+
+  function reloadMeta(force) {
+    // A second Refresh while the first is still running joins it rather than
+    // starting a rival probe of the whole database.
+    if (metaInFlight) return metaInFlight;
+    metaInFlight = api('/api/meta' + (force ? '?refresh=1' : ''))
+      .then(
+        (m) => m,
+        (err) => ({ error: err.message })
+      )
+      .then((m) => {
+        Object.assign(state.meta, m);
+        renderShellMeta();
+        // Now the dropdowns have something to list.
+        rebuildFilterBar();
+        emit('pm:meta');
+        if (m && m.error) toast('Metadata failed: ' + m.error, 'error');
+        return m;
+      })
+      .finally(() => {
+        metaInFlight = null;
+      });
+    return metaInFlight;
+  }
+
   function setRefresh(ms) {
     state.refreshMs = ms;
     localStorage.setItem('pm.refresh', String(ms));
     if (state.refreshTimer) clearInterval(state.refreshTimer);
-    if (ms > 0) state.refreshTimer = setInterval(() => emit('pm:refresh'), ms);
+    if (ms > 0)
+      state.refreshTimer = setInterval(() => {
+        // Unforced: the collection map moves over days, and re-probing every
+        // collection on a timer would cost seconds to learn nothing.
+        reloadMeta(false);
+        emit('pm:refresh');
+      }, ms);
     updateLive();
   }
 
@@ -1909,6 +1971,7 @@ window.PM = (function () {
           text: 'Retry',
           onclick: () => {
             clearStale();
+            reloadMeta(true);
             emit('pm:refresh');
           },
         }),
@@ -2026,18 +2089,7 @@ window.PM = (function () {
     // place, because every page destructures it out of the init argument and
     // would otherwise hold a reference to the empty original.
     state.meta = {};
-    const metaLoaded = api('/api/meta').then(
-      (m) => m,
-      (err) => ({ error: err.message })
-    );
-    metaLoaded.then((m) => {
-      Object.assign(state.meta, m);
-      renderShellMeta();
-      // Now the dropdowns have something to list.
-      rebuildFilterBar();
-      emit('pm:meta');
-      if (m && m.error) toast('Metadata failed: ' + m.error, 'error');
-    });
+    const metaLoaded = reloadMeta(false);
 
     renderShellMeta();
     setRefresh(state.refreshMs);
