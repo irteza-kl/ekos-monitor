@@ -14,11 +14,24 @@ window.PM = (function () {
     { file: 'heartbeats.html', title: 'Heartbeats', icon: '∿', group: 'Monitoring', countKey: 'snapshots' },
     { file: 'shift-trails.html', title: 'Shift Trails', icon: '⌁', group: 'Monitoring', countKey: 'shiftTrails' },
     { file: 'checks.html', title: 'Geofence Checks', icon: '⛨', group: 'Geofencing', countKey: 'clockInLogs' },
-    { file: 'exit-windows.html', title: 'Exit Windows', icon: '⇥', group: 'Geofencing' },
+    { file: 'exit-windows.html', title: 'Exit Windows', icon: '⇥', group: 'Geofencing', countKey: 'exitWindows' },
     { file: 'sites.html', title: 'Geofence Sites', icon: '⬡', group: 'Geofencing' },
     { file: 'raw.html', title: 'Raw Documents', icon: '❴❵', group: 'Data' },
     { file: 'explorer.html', title: 'Query Explorer', icon: '⌨', group: 'Data' },
   ];
+
+  /**
+   * Every document kind the app knows, by the key both `collections` and
+   * `collections.counts` use for it.
+   *
+   * It matters that this is the full list. In this store most of these kinds
+   * live in the SAME collection and are told apart only by their shape, so
+   * every count is a count of that kind and never of the collection - and the
+   * only way a reader can see that is for all of them to be listed and add up.
+   * The sidebar omitted shift trails when they started arriving, which made
+   * the heartbeat number look as though it had simply swallowed them.
+   */
+  const KIND_COLLECTION_KEYS = ['snapshots', 'clockInLogs', 'exitWindows', 'shiftTrails'];
 
   const THEME_KEY = 'pm.theme';
   const THEMES = [
@@ -1802,8 +1815,20 @@ window.PM = (function () {
     const cols = meta.collections || {};
     const counts = cols.counts || {};
     for (const node of document.querySelectorAll('.nav .count[data-count-key]')) {
-      const value = counts[node.getAttribute('data-count-key')];
+      const key = node.getAttribute('data-count-key');
+      const value = counts[key];
       node.textContent = value ? fmt.int(value) : '';
+      // Most of these kinds share one collection, so the number beside a page
+      // counts documents OF THAT KIND, not documents in the collection. Say so
+      // on hover: 80,324 heartbeats next to 39 exit windows in the same
+      // collection is confusing until you know which of the two it is.
+      const collection = cols[key];
+      const shared = collection && KIND_COLLECTION_KEYS.filter((k) => cols[k] === collection).length > 1;
+      node.title = collection
+        ? shared
+          ? fmt.int(value || 0) + ' in ' + collection + ', which holds more than one kind - this counts only this one'
+          : fmt.int(value || 0) + ' in ' + collection
+        : '';
     }
 
     const foot = document.querySelector('#sidebar-foot');
@@ -1814,9 +1839,10 @@ window.PM = (function () {
         el('div', {}, [el('b', { text: 'DB ' }), document.createTextNode(meta.database || '--')]),
         // Document kinds share a collection here, so label by kind and put the
         // collection name in the tooltip rather than printing it twice.
-        dbLine('snapshots', cols.snapshots, counts.snapshots, cols),
+        dbLine('heartbeats', cols.snapshots, counts.snapshots, cols),
         dbLine('clock-in logs', cols.clockInLogs, counts.clockInLogs, cols),
         dbLine('exit windows', cols.exitWindows, counts.exitWindows, cols),
+        dbLine('shift trails', cols.shiftTrails, counts.shiftTrails, cols),
       ]),
       // No sign-out button: HTTP Basic gives the browser no way to forget the
       // credentials, so a button that claimed to log you out would be lying.
@@ -1832,10 +1858,11 @@ window.PM = (function () {
   /** One "kind: count" line, flagged when the collection is shared. */
   function dbLine(label, collection, count, cols) {
     if (!collection) return el('div', { text: label + ': none yet' });
-    const shared =
-      [cols.snapshots, cols.clockInLogs, cols.exitWindows].filter((name) => name === collection).length > 1;
+    const shared = KIND_COLLECTION_KEYS.filter((key) => cols[key] === collection).length > 1;
     return el('div', {
-      title: collection + (shared ? ' (holds more than one document kind)' : ''),
+      title:
+        collection +
+        (shared ? ' - holds more than one document kind, so this counts ' + label + ' only, not the collection' : ''),
       text: label + ': ' + fmt.int(count) + (shared ? ' · shared' : ''),
     });
   }
