@@ -30,6 +30,31 @@
   const PERMISSION_LABEL = { always: 'Always', when_in_use: 'While using the app', denied: 'Denied' };
   const PRECISION_LABEL = { fine: 'Fine', coarse: 'Coarse' };
 
+  /**
+   * What each entry kind is and how it reads.
+   *
+   * Green for a fix, red for a gap, amber for a restart - the severity of the
+   * thing, not a palette: a fix is the app working, a gap is the app unable to
+   * see the device at all, and a restart is the process having died and come
+   * back, which is bad but not blind.
+   *
+   * Keyed by the app's own value, and anything not in here is rendered as
+   * itself rather than as the nearest kind we know. The Kind column used to
+   * ask "is this a runtime start?" and call everything else a fix, so when
+   * `gap` started arriving every one of them was drawn as its opposite.
+   */
+  const ENTRY_KIND = {
+    fix: { label: 'Fix', badge: 'badge-good' },
+    gap: { label: 'Gap', badge: 'badge-critical' },
+    runtime_start: { label: 'Runtime start', badge: 'badge-warning' },
+  };
+
+  /** `services_disabled` -> `services disabled`, for a value we have no label for. */
+  function humanise(value) {
+    const words = String(value).replace(/_/g, ' ');
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  }
+
   PM.boot('shift-trails.html', async ({ root }) => {
     PM.buildFilterBar(() =>
       [
@@ -344,6 +369,29 @@
     );
   }
 
+  /** One entry's kind, and the detail only that kind carries. */
+  function kindCell(e) {
+    const known = ENTRY_KIND[e.kind];
+    if (!known) {
+      return (
+        '<span class="badge badge-info" title="an entry kind this console does not know yet - shown as the app sent it">' +
+        esc(e.kind === null || e.kind === undefined ? 'no kind' : humanise(e.kind)) +
+        '</span>'
+      );
+    }
+    let sub = '';
+    if (e.isGap && e.reason) {
+      // The reason is the whole value of a gap: "services_disabled" means
+      // location services were switched off, which nothing else here records.
+      sub = '<div class="person-sub" title="why the app could not see the device">' + esc(humanise(e.reason)) + '</div>';
+    } else if (e.isRuntimeStart && e.foregroundServicePresent === false) {
+      sub = '<div class="person-sub" title="the process came back with no foreground service, which is the strongest sign here that the OS killed the app">no foreground service</div>';
+    } else if (e.isRuntimeStart && e.foregroundServicePresent === true) {
+      sub = '<div class="person-sub">service alive</div>';
+    }
+    return '<span class="badge ' + known.badge + '">' + esc(known.label) + '</span>' + sub;
+  }
+
   function renderTable(data) {
     const host = document.querySelector('#st-table');
     host.innerHTML = '';
@@ -362,7 +410,7 @@
 
     for (const row of rows) {
       const s = row.stats;
-      const flagged = row.absenceCount || s.runtimeStartCount || s.fixCount === 0;
+      const flagged = row.absenceCount || s.runtimeStartCount || s.gapCount || s.fixCount === 0;
       body.append(
         el('tr', {
           class: 'clickable' + (flagged ? ' is-flagged' : ''),
@@ -453,6 +501,10 @@
     releaseDrawerMap();
     const s = row.stats;
     PM.openDrawer({
+      // The Entries tab is an eight-column table. At the default 760px its
+      // last columns sit behind a horizontal scrollbar with most of the screen
+      // free beside it.
+      wide: true,
       title: (row.name || 'User ' + row.userId) + ' · shift ' + (row.shiftKey || ''),
       subtitle:
         fmt.dayTime(row.clockIn) + ' → ' + fmt.dayTime(row.clockOut) + ' · ' + fmt.duration(row.durationMinutes) +
@@ -469,7 +521,37 @@
                 ['Coverage', coverageCell(row)],
                 ['Positioned', fmt.duration(s.positionedMinutes) + ' of ' + fmt.duration(row.durationMinutes)],
                 s.unpositionedMinutes ? ['Unpositioned', fmt.duration(s.unpositionedMinutes)] : null,
-                ['Entries', fmt.int(s.entryCount) + ' (' + fmt.int(s.fixCount) + ' fixes, ' + fmt.int(s.runtimeStartCount) + ' runtime starts)'],
+                [
+                  'Entries',
+                  fmt.int(s.entryCount) +
+                    ' · ' +
+                    [
+                      fmt.int(s.fixCount) + ' fixes',
+                      s.gapCount ? fmt.int(s.gapCount) + ' gaps' : null,
+                      fmt.int(s.runtimeStartCount) + ' runtime starts',
+                    ]
+                      .filter(Boolean)
+                      .join(', '),
+                ],
+                s.gapCount
+                  ? [
+                      'Gaps',
+                      '<span class="badge badge-critical">' + fmt.int(s.gapCount) + '</span> ' +
+                        (s.gapReasons.length
+                          ? 'reported as ' + s.gapReasons.map((r) => '<b>' + esc(humanise(r)) + '</b>').join(', ')
+                          : 'with no reason given') +
+                        (s.gapsDisagree
+                          ? '<div class="person-sub">the app’s own summary counted ' + fmt.int(row.reported.gaps) + '</div>'
+                          : ''),
+                    ]
+                  : null,
+                s.unknownKinds && s.unknownKinds.length
+                  ? [
+                      'Unrecognised entries',
+                      '<span class="badge badge-info">' + s.unknownKinds.map(esc).join(', ') + '</span> - a kind this ' +
+                        'console does not know yet, shown as the app sent it',
+                    ]
+                  : null,
                 ['Distinct runs', fmt.int(s.distinctRuns)],
                 [
                   'App restarts',
@@ -555,19 +637,12 @@
             for (const e of row.entries) {
               tbody.append(
                 el('tr', {
-                  class: e.isRuntimeStart ? 'is-flagged' : '',
+                  class: e.isRuntimeStart || e.isGap ? 'is-flagged' : '',
                   html:
                     '<td>' + fmt.dayTime(e.recordedAt) +
                     (e.fixLagSeconds ? '<div class="person-sub" title="how stale the fix was when it was logged">fix ' + e.fixLagSeconds + 's earlier</div>' : '') +
                     '</td>' +
-                    '<td>' + (e.isRuntimeStart
-                      ? '<span class="badge badge-serious">runtime start</span>' +
-                        (e.foregroundServicePresent === false
-                          ? '<div class="person-sub">no foreground service</div>'
-                          : e.foregroundServicePresent === true
-                            ? '<div class="person-sub">service alive</div>'
-                            : '')
-                      : '<span class="badge badge-neutral">fix</span>') + '</td>' +
+                    '<td>' + kindCell(e) + '</td>' +
                     '<td>' + (e.location
                       ? '<span class="mono">' + fmt.coords(e.location) + '</span>' +
                         (e.fenceVerdict ? ' ' + PM.geofenceBadge(e.fenceVerdict === 'in' ? true : e.fenceVerdict === 'out' ? false : null) : '')

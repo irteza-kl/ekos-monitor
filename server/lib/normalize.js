@@ -303,6 +303,7 @@ function snapshot(doc) {
  */
 const ENTRY_FIX = 'fix';
 const ENTRY_RUNTIME_START = 'runtime_start';
+const ENTRY_GAP = 'gap';
 const LOCATION_PERMISSIONS = ['always', 'when_in_use', 'denied'];
 
 /** Worst-first, so "the worst this shift ever was" is a max over this order. */
@@ -322,6 +323,17 @@ function shiftTrail(doc) {
       kind: e.kind || null,
       isFix: e.kind === ENTRY_FIX,
       isRuntimeStart: e.kind === ENTRY_RUNTIME_START,
+      isGap: e.kind === ENTRY_GAP,
+      // A kind nobody here has seen before. Carried as a flag so the reader
+      // gets the app's own word for it rather than being shown one of the
+      // kinds we do know - which is exactly what went wrong when `gap` arrived
+      // and every one of them was labelled `fix` by a test that only asked
+      // "is this a runtime start?".
+      isKnownKind: [ENTRY_FIX, ENTRY_RUNTIME_START, ENTRY_GAP].includes(e.kind),
+      // Why the app could not see the device. `services_disabled` is the one
+      // that matters most: location services switched off mid-shift, which no
+      // other document in this store records.
+      reason: e.reason || null,
       // When the app wrote the entry, and - on a fix - when the GPS actually
       // read. Kept apart for the same reason the heartbeat keeps them apart:
       // the gap between them is how stale the position was when it was logged.
@@ -351,6 +363,9 @@ function shiftTrail(doc) {
 
   const fixes = entries.filter((e) => e.location);
   const runtimeStarts = entries.filter((e) => e.isRuntimeStart);
+  const gaps = entries.filter((e) => e.isGap);
+  const unknownKinds = [...new Set(entries.filter((e) => !e.isKnownKind).map((e) => e.kind).filter(Boolean))];
+  const gapReasons = [...new Set(gaps.map((e) => e.reason).filter(Boolean))];
 
   // The path, in the order the fixes were taken rather than the order they sit
   // in the array - a path drawn in the wrong order measures the wrong pairs.
@@ -482,6 +497,16 @@ function shiftTrail(doc) {
       entryCount: entries.length,
       fixCount: fixes.length,
       runtimeStartCount: runtimeStarts.length,
+      gapCount: gaps.length,
+      gapReasons,
+      // Same treatment as the restart counts: the app reports its own gap
+      // total, this counts the gap entries it actually sent, and where they
+      // disagree both numbers stay on the row.
+      gapsDisagree: n(summary.gaps) !== null && gaps.length !== n(summary.gaps),
+      // A kind this console does not know. Surfaced rather than swallowed, so
+      // the next new entry type is noticed on arrival instead of being drawn
+      // as whatever it is not.
+      unknownKinds,
       // The app counts restarts itself. This counts the distinct runIds it
       // actually sent. They should agree - a run beginning IS a restart after
       // the first - and when they do not, that is a finding about the writer

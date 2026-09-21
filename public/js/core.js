@@ -1643,8 +1643,17 @@ window.PM = (function () {
   }
 
   /** tabs: [{ id, label, render(host) }] */
-  function openDrawer({ title, subtitle, tabs }) {
+  /**
+   * `wide` widens the panel for a drawer whose content is a table rather than
+   * a list of pairs. The default 760px suits a key/value breakdown and forces
+   * anything with eight columns into a horizontal scrollbar - which puts the
+   * last column behind a gesture, on a panel that has most of the screen free
+   * beside it. Opt-in rather than global: the other drawers in this console
+   * are key/value and read better narrow.
+   */
+  function openDrawer({ title, subtitle, tabs, wide }) {
     const { scrim, panel } = drawer();
+    panel.classList.toggle('is-wide', !!wide);
     document.querySelector('#drawer-title').textContent = title || '';
     document.querySelector('#drawer-sub').textContent = subtitle || '';
     const tabHost = document.querySelector('#drawer-tabs');

@@ -705,6 +705,11 @@ td .truncate { max-width: 260px; }
   display: flex; flex-direction: column; box-shadow: var(--shadow);
 }
 .drawer.open { transform: none; }
+/* For a drawer whose content is a table. 760px fits a key/value breakdown and
+   pushes an eight-column table into a horizontal scrollbar while most of the
+   screen sits empty beside it. Still capped against the viewport, so a narrow
+   window gets the scrollbar back rather than a panel wider than the screen. */
+.drawer.is-wide { width: min(1120px, 96vw); }
 .drawer-head {
   padding: 14px 16px; border-bottom: 1px solid var(--border);
   display: flex; align-items: center; gap: 12px; background: var(--surface);
