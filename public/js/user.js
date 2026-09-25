@@ -18,6 +18,7 @@
   // charts - and "let me read the offline pings" is a question about this one
   // table, not a decision to view the person through an offline-only lens.
   let heartbeatOfflineOnly = false;
+  let shiftTrailPage = 1;
   // The trail map, its preferences, its window bar, its replay and the note
   // that accounts for every heartbeat all live in PMTrailMap now - the
   // Heartbeats page mounts the same panel. What stays here is the time window,
@@ -64,6 +65,7 @@
           { id: 'heartbeats', label: 'Heartbeats', render: renderHeartbeatsTab },
           { id: 'calls', label: 'Geofence validation calls', render: renderCallsTab },
           { id: 'exit-windows', label: 'Exit windows', render: renderExitWindowsTab },
+          { id: 'shift-trails', label: 'Shift trails', render: renderShiftTrailsTab },
           { id: 'raw', label: 'Raw document', render: renderRawTab },
         ],
         // Nothing to render until the first load() resolves.
@@ -110,6 +112,7 @@
     const row = detail.current;
     const stats = detail.stats || {};
     heartbeatPage = 1; // a new time range means the old page numbers are moot
+    shiftTrailPage = 1;
     PM.setTitle(row.name || (row.userId === null ? 'Unidentified device' : 'User ' + row.userId));
     PM.setSubtitle(
       [
@@ -134,6 +137,12 @@
     tabs.setCount('heartbeats', stats.snapshots);
     tabs.setCount('calls', (detail.logs || []).length);
     tabs.setCount('exit-windows', (detail.exitWindows || []).length);
+    // Shift trails are not part of the user payload, so their count is asked
+    // for separately - and not awaited, because the rest of the page has no
+    // reason to wait on it. The old badge goes first: a count from the previous
+    // time range must not stand beside a range it no longer describes.
+    tabs.setCount('shift-trails', null);
+    loadShiftTrailCount();
     tabs.invalidate();
     PM.markLoaded();
   }
@@ -1004,6 +1013,186 @@
       PM.setSubtitle('could not load this user');
     }
     host.append(box);
+  }
+
+  /**
+   * Shift trails: one sealed document per shift, the same table and the same
+   * drawer as the Shift Trails page - this tab is that page, filtered to one
+   * person, so it renders through PMShiftTrails rather than a thinner copy
+   * that could not be opened.
+   *
+   * It fetches its own rows instead of reading `detail`, because a trail is
+   * not a heartbeat: the user payload is built from ekosClientState snapshots
+   * and carries none of these. Paged for the same reason the Heartbeats tab
+   * is - a year of shifts is a lot of rows - though the page size is smaller
+   * because each row here is a whole shift.
+   */
+  async function renderShiftTrailsTab(host) {
+    host.append(
+      el('div', { class: 'tab-block' }, [
+        tabHeader(
+          'Every shift this person’s app sealed and pushed, newest first · the date range on the bar applies here · ' +
+            'click a shift to walk its path',
+          el('a', {
+            class: 'btn btn-sm',
+            href: PM.withWindow('/shift-trails.html'),
+            text: 'All shift trails',
+          })
+        ),
+        el('div', { class: 'table-scroll', id: 'st-tab-table' }, [
+          el('div', { class: 'empty', text: 'loading shift trails…' }),
+        ]),
+        el('div', { class: 'pager', id: 'st-tab-pager' }),
+      ])
+    );
+    await loadShiftTrails();
+  }
+
+  /**
+   * A trail is matched to a person by `userId`, which the store holds as a
+   * number. This page's identity is whatever came in on the query string, and
+   * it is not always one - `anonymous` is a real value here, and so is a
+   * device that has never carried a session.
+   *
+   * That matters more than it looks: the server drops a non-numeric `userId`
+   * rather than failing on it, so asking for one would quietly return EVERY
+   * shift in the database under this person's name. So the tab refuses to ask
+   * the question it cannot ask, and says why.
+   */
+  function trailUserId() {
+    // Digits only. Number() alone accepts "0x10", "1e2" and "1.5", and would
+    // turn a malformed link into some other person's shifts.
+    const raw = String(userId).trim();
+    return /^\d+$/.test(raw) ? Number(raw) : null;
+  }
+
+  /**
+   * The tab badge, at page load rather than when the tab is first opened.
+   *
+   * `limit=1` because only `total` is wanted, and the list endpoint computes it
+   * with a countDocuments over the same match the tab itself runs - so this is
+   * the number the tab will show, not an estimate of it.
+   *
+   * Every load() starts one of these, and a slow answer to an old range must
+   * not land on top of a newer one, so only the latest request may write.
+   */
+  let shiftTrailCountSeq = 0;
+  async function loadShiftTrailCount() {
+    const seq = ++shiftTrailCountSeq;
+    const id = trailUserId();
+    if (id === null) return; // no numeric id: no shift can be matched, so no count
+    try {
+      const data = await api('/api/shift-trails?' + scopedQuery({ userId: id, limit: 1, page: 1 }));
+      if (seq !== shiftTrailCountSeq || data.unavailable) return;
+      tabs.setCount('shift-trails', data.total || 0);
+    } catch (err) {
+      // A badge is not worth an error on the page; the tab reports it if opened.
+    }
+  }
+
+  // Pager clicks and range changes can overlap, and the answers can come back
+  // out of order. Only the latest request may write - otherwise a slow page 2
+  // lands on top of page 3, or an old range's total on the tab badge.
+  let shiftTrailTabSeq = 0;
+  async function loadShiftTrails() {
+    const seq = ++shiftTrailTabSeq;
+    const table = document.querySelector('#st-tab-table');
+    const pager = document.querySelector('#st-tab-pager');
+    if (!table) return;
+
+    const id = trailUserId();
+    if (id === null) {
+      table.innerHTML = '';
+      table.append(
+        el('div', { class: 'empty' }, [
+          el('div', { text: 'This device has no user id, so no shift can be matched to it.' }),
+          el('div', {
+            class: 'hint',
+            style: 'margin-top:8px',
+            text:
+              'Shift trails are keyed to a numeric user id. A device reporting without a session cannot be ' +
+              'matched to one, and showing every shift here would be worse than showing none.',
+          }),
+        ])
+      );
+      pager.innerHTML = '';
+      tabs.setCount('shift-trails', null);
+      return;
+    }
+
+    PM.showSkeleton({ '#st-tab-table': 'table:8x13' }, { force: true });
+    let data;
+    try {
+      // page is overridden explicitly: the number on the filter bar belongs to
+      // whatever page set it, not to this tab's pagination.
+      data = await api('/api/shift-trails?' + scopedQuery({ userId: id, limit: 25, page: shiftTrailPage }));
+    } catch (err) {
+      if (seq !== shiftTrailTabSeq) return;
+      table.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
+      pager.innerHTML = '';
+      return;
+    }
+
+    if (seq !== shiftTrailTabSeq) return;
+
+    // No trails have ever been written to this database. That is a property of
+    // the store, not of this person, so it says so rather than reading as
+    // "this person sealed no shifts".
+    if (data.unavailable) {
+      table.innerHTML = '';
+      table.append(
+        el('div', { class: 'empty' }, [
+          el('div', { text: 'No shift trails exist in this database yet.' }),
+          el('div', { class: 'hint', style: 'margin-top:8px', text: data.unavailable }),
+        ])
+      );
+      pager.innerHTML = '';
+      tabs.setCount('shift-trails', null);
+      return;
+    }
+
+    const rows = data.rows || [];
+    const total = data.total || 0;
+    tabs.setCount('shift-trails', total);
+
+    PMShiftTrails.table(table, rows, {
+      empty: el('div', { class: 'empty' }, [
+        el('div', { text: 'No shifts sealed for this person in ' + PM.rangeLabel() + '.' }),
+        el('div', {
+          class: 'hint',
+          style: 'margin-top:8px',
+          text:
+            'A trail is written at clock-out and pushed when the network allows, so a shift still running - or ' +
+            'one sealed on a phone that has not been online since - will not be here yet.',
+        }),
+      ]),
+    });
+
+    pager.innerHTML = '';
+    if (!rows.length) return;
+    const limit = Number(data.limit || 25);
+    pager.append(
+      el('span', { text: 'Showing ' + rows.length + ' of ' + fmt.int(total) + ' · page ' + shiftTrailPage }),
+      el('div', { class: 'spacer' }),
+      el('button', {
+        class: 'btn btn-sm',
+        text: '← Newer',
+        disabled: shiftTrailPage <= 1 ? 'disabled' : null,
+        onclick: () => {
+          shiftTrailPage -= 1;
+          loadShiftTrails();
+        },
+      }),
+      el('button', {
+        class: 'btn btn-sm',
+        text: 'Older →',
+        disabled: shiftTrailPage * limit >= total ? 'disabled' : null,
+        onclick: () => {
+          shiftTrailPage += 1;
+          loadShiftTrails();
+        },
+      })
+    );
   }
 
   function renderRawTab(host) {
