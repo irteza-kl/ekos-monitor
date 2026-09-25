@@ -8,6 +8,7 @@ const normalize = require('../lib/normalize');
 const csv = require('../lib/csv');
 const { redact } = require('../lib/redact');
 const { listTrail, summary, namesFor, attachSites } = require('../lib/shiftTrails');
+const { groupWithTenants, tenantCounts } = require('../lib/pipelines');
 
 const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
@@ -52,23 +53,26 @@ router.get('/shift-trails/meta', async (req, res, next) => {
           { $match: base },
           {
             $facet: {
-              users: [{ $group: { _id: '$userId', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
-              sites: [{ $group: { _id: '$siteId', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
+              // Every dropdown but the tenant one keeps its per-tenant split,
+              // so picking a tenant narrows the rest (see groupWithTenants).
+              // The entry facets unwind first, and the tenant is the shift's.
+              users: [...groupWithTenants('$userId', '$tenantId'), { $sort: { n: -1 } }],
+              sites: [...groupWithTenants('$siteId', '$tenantId'), { $sort: { n: -1 } }],
               tenants: [{ $group: { _id: '$tenantId', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
-              devices: [{ $group: { _id: '$deviceType', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
-              versions: [{ $group: { _id: '$applicationVersion', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
-              timezones: [{ $group: { _id: '$timezone', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
+              devices: [...groupWithTenants('$deviceType', '$tenantId'), { $sort: { n: -1 } }],
+              versions: [...groupWithTenants('$applicationVersion', '$tenantId'), { $sort: { n: -1 } }],
+              timezones: [...groupWithTenants('$timezone', '$tenantId'), { $sort: { n: -1 } }],
               permissions: [
                 { $unwind: '$entries' },
-                { $group: { _id: '$entries.locationPermission', n: { $sum: 1 } } },
+                ...groupWithTenants('$entries.locationPermission', '$tenantId'),
                 { $sort: { n: -1 } },
               ],
               precisions: [
                 { $unwind: '$entries' },
-                { $group: { _id: '$entries.locationPrecision', n: { $sum: 1 } } },
+                ...groupWithTenants('$entries.locationPrecision', '$tenantId'),
                 { $sort: { n: -1 } },
               ],
-              kinds: [{ $unwind: '$entries' }, { $group: { _id: '$entries.kind', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
+              kinds: [{ $unwind: '$entries' }, ...groupWithTenants('$entries.kind', '$tenantId'), { $sort: { n: -1 } }],
             },
           },
         ],
@@ -77,7 +81,9 @@ router.get('/shift-trails/meta', async (req, res, next) => {
       .next();
 
     const asList = (arr, keepNull) =>
-      (arr || []).map((x) => ({ key: x._id, count: x.n })).filter((x) => keepNull || (x.key !== null && x.key !== undefined));
+      (arr || [])
+        .map((x) => ({ key: x._id, count: x.n, ...(x.byTenant ? { byTenant: tenantCounts(x.byTenant) } : {}) }))
+        .filter((x) => keepNull || (x.key !== null && x.key !== undefined));
     const userIds = (facet.users || []).map((u) => u._id).filter((u) => u !== null && u !== undefined);
     const { names, seenInHeartbeats } = await namesFor(userIds);
 
@@ -85,7 +91,13 @@ router.get('/shift-trails/meta', async (req, res, next) => {
       available: true,
       users: (facet.users || [])
         .filter((u) => u._id !== null && u._id !== undefined)
-        .map((u) => ({ id: u._id, count: u.n, name: names.get(u._id) || null, heartbeatKnown: seenInHeartbeats.has(u._id) })),
+        .map((u) => ({
+          id: u._id,
+          count: u.n,
+          byTenant: tenantCounts(u.byTenant),
+          name: names.get(u._id) || null,
+          heartbeatKnown: seenInHeartbeats.has(u._id),
+        })),
       // Null is a value here: a shift with no site is an unmapped clock-in.
       sites: asList(facet.sites, true),
       tenants: asList(facet.tenants),

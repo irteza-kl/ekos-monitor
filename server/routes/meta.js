@@ -2,10 +2,16 @@
 const express = require('express');
 const config = require('../config');
 const { resolveCollections, collectionFor, ping } = require('../db');
-const { SNAP, LOG } = require('../lib/filters');
+const { SNAP, LOG, SNAP_TENANT_EXPR } = require('../lib/filters');
 const { ACCURACY_BANDS } = require('../lib/geo');
 const { ALL_PERMISSIONS } = require('../lib/normalize');
 const { getSites } = require('../lib/sites');
+const { groupWithTenants, tenantCounts } = require('../lib/pipelines');
+
+/** Whose heartbeat it is, for splitting each dropdown by tenant - either envelope. */
+const TENANT = SNAP_TENANT_EXPR;
+/** Exit windows carry `tenantId`; older writers used `companyId`. */
+const EXIT_TENANT = { $ifNull: ['$companyId', '$tenantId'] };
 
 const router = express.Router();
 const opts = { allowDiskUse: true, maxTimeMS: config.queryTimeoutMs };
@@ -64,51 +70,68 @@ router.get('/meta', async (req, res, next) => {
             {
               $facet: {
                 range: [{ $group: { _id: null, min: { $min: '$createdAt' }, max: { $max: '$createdAt' } } }],
+                // Each dropdown facet below keeps its per-tenant split, so a
+                // tenant picked on the bar can narrow the others - see
+                // groupWithTenants. `$max` for a name across tenants, because
+                // it ranks any string above null.
                 users: [
-                  {
-                    $group: {
-                      _id: '$' + SNAP.userId,
-                      name: { $last: '$' + SNAP.fullName },
-                      tenantId: { $last: '$' + SNAP.tenantId },
-                      lastSeenAt: { $max: '$createdAt' },
-                      snapshots: { $sum: 1 },
-                    },
-                  },
+                  ...groupWithTenants(
+                    '$' + SNAP.userId,
+                    TENANT,
+                    { name: { $last: '$' + SNAP.fullName }, lastSeenAt: { $max: '$createdAt' } },
+                    { name: { $max: '$name' }, tenantId: { $max: '$_id.t' }, lastSeenAt: { $max: '$lastSeenAt' } }
+                  ),
                   { $sort: { lastSeenAt: -1 } },
                 ],
                 tenants: [
                   {
                     $group: {
-                      _id: '$' + SNAP.tenantId,
-                      name: { $last: { $arrayElemAt: ['$currentUser.data.tenantAccount.tenant.name', 0] } },
+                      _id: TENANT,
+                      // Either envelope, and $max rather than $last: it ranks
+                      // any name above null, so one heartbeat without it cannot
+                      // turn "KoderLabs LLC" into "Tenant 29".
+                      name: {
+                        $max: {
+                          $ifNull: [
+                            { $arrayElemAt: ['$currentUser.data.tenantAccount.tenant.name', 0] },
+                            { $arrayElemAt: ['$currentUser.tenantAccount.tenant.name', 0] },
+                          ],
+                        },
+                      },
                       snapshots: { $sum: 1 },
                     },
                   },
                   { $sort: { snapshots: -1 } },
                 ],
-                deviceTypes: [{ $group: { _id: '$deviceType', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
+                deviceTypes: [...groupWithTenants('$deviceType', TENANT), { $sort: { n: -1 } }],
                 appVersions: [
-                  { $group: { _id: '$' + SNAP.appVersion, builds: { $addToSet: '$' + SNAP.build }, n: { $sum: 1 } } },
+                  ...groupWithTenants(
+                    '$' + SNAP.appVersion,
+                    TENANT,
+                    { builds: { $addToSet: '$' + SNAP.build } },
+                    // An array per tenant, flattened in JS below.
+                    { builds: { $addToSet: '$builds' } }
+                  ),
                   { $sort: { n: -1 } },
                 ],
-                timezones: [{ $group: { _id: '$timezone', n: { $sum: 1 } } }, { $sort: { n: -1 } }],
+                timezones: [...groupWithTenants('$timezone', TENANT), { $sort: { n: -1 } }],
                 jobSites: [
-                  {
-                    $group: {
-                      _id: {
-                        $ifNull: [
-                          '$' + SNAP.siteRecordId,
-                          { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
-                        ],
-                      },
-                      n: { $sum: 1 },
-                      // The name, so the Site dropdown can list places rather
-                      // than ids. $max over an object takes the newest record
-                      // field by field, with no sort - see pipelines for why
-                      // this deployment cannot afford one.
-                      newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.siteName, null] } } },
+                  ...groupWithTenants(
+                    {
+                      $ifNull: [
+                        '$' + SNAP.siteRecordId,
+                        { $ifNull: ['$' + SNAP.jobSiteId, '$' + SNAP.jobSiteIdAlt] },
+                      ],
                     },
-                  },
+                    TENANT,
+                    // The name, so the Site dropdown can list places rather
+                    // than ids. $max over an object takes the newest record
+                    // field by field, with no sort - see pipelines for why
+                    // this deployment cannot afford one. Carried through both
+                    // groups, so it is still the newest across every tenant.
+                    { newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.siteName, null] } } } },
+                    { newest: { $max: '$newest' } }
+                  ),
                   { $sort: { n: -1 } },
                 ],
               },
@@ -125,22 +148,37 @@ router.get('/meta', async (req, res, next) => {
         name: u.name || (u._id === null ? 'Unidentified device' : 'User ' + u._id),
         tenantId: u.tenantId ?? null,
         lastSeenAt: u.lastSeenAt,
-        snapshots: u.snapshots,
+        snapshots: u.n,
+        byTenant: tenantCounts(u.byTenant),
       }));
       data.tenants = facet.tenants.map((t) => ({
         id: t._id,
-        name: t.name || (t._id === null ? 'No tenant' : 'Tenant ' + t._id),
+        // The null group is "No tenant" whatever name its documents carry: a
+        // heartbeat with a tenant name but no readable id is still one the
+        // tenant filter cannot place, and labelling it with a real tenant's
+        // name listed "KoderLabs LLC" twice.
+        name: t._id === null ? 'No tenant' : t.name || 'Tenant ' + t._id,
         snapshots: t.snapshots,
       }));
-      data.deviceTypes = facet.deviceTypes.map((d) => ({ key: d._id, count: d.n })).filter((d) => d.key);
+      data.deviceTypes = facet.deviceTypes
+        .map((d) => ({ key: d._id, count: d.n, byTenant: tenantCounts(d.byTenant) }))
+        .filter((d) => d.key);
       data.appVersions = facet.appVersions
-        .map((v) => ({ key: v._id, builds: (v.builds || []).filter(Boolean), count: v.n }))
+        .map((v) => ({
+          key: v._id,
+          builds: [...new Set([].concat(...(v.builds || [])))].filter(Boolean),
+          count: v.n,
+          byTenant: tenantCounts(v.byTenant),
+        }))
         .filter((v) => v.key);
-      data.timezones = facet.timezones.map((t) => ({ key: t._id, count: t.n })).filter((t) => t.key);
+      data.timezones = facet.timezones
+        .map((t) => ({ key: t._id, count: t.n, byTenant: tenantCounts(t.byTenant) }))
+        .filter((t) => t.key);
       data.jobSiteIds = facet.jobSites
         .map((s) => ({
           id: s._id,
           snapshots: s.n,
+          byTenant: tenantCounts(s.byTenant),
           name: (s.newest && s.newest.name) || null,
           // What the dropdown shows. The id stays in it because every filter,
           // CSV and cross-page link keys on the id, so a row picked by name
@@ -188,11 +226,16 @@ router.get('/meta', async (req, res, next) => {
             { $match: base },
             {
               $facet: {
-                statuses: [{ $group: { _id: '$status', n: { $sum: 1 } } }],
-                resolutions: [{ $group: { _id: '$resolution', n: { $sum: 1 } } }],
-                openedBy: [{ $group: { _id: '$openedBy', n: { $sum: 1 } } }],
-                deviceTypes: [{ $group: { _id: '$deviceType', n: { $sum: 1 } } }],
-                users: [{ $group: { _id: '$userId', employeeId: { $last: '$employeeId' }, n: { $sum: 1 } } }],
+                statuses: groupWithTenants('$status', EXIT_TENANT),
+                resolutions: groupWithTenants('$resolution', EXIT_TENANT),
+                openedBy: groupWithTenants('$openedBy', EXIT_TENANT),
+                deviceTypes: groupWithTenants('$deviceType', EXIT_TENANT),
+                users: groupWithTenants(
+                  '$userId',
+                  EXIT_TENANT,
+                  { employeeId: { $last: '$employeeId' } },
+                  { employeeId: { $max: '$employeeId' } }
+                ),
                 companies: [{ $group: { _id: { $ifNull: ['$companyId', '$tenantId'] }, n: { $sum: 1 } } }],
                 range: [{ $group: { _id: null, min: { $min: '$openedAt' }, max: { $max: '$openedAt' } } }],
                 total: [{ $count: 'value' }],
@@ -202,7 +245,8 @@ router.get('/meta', async (req, res, next) => {
           opts
         )
         .next();
-      const asList = (a) => a.map((x) => ({ key: x._id, count: x.n })).filter((x) => x.key !== null);
+      const asList = (a) =>
+        a.map((x) => ({ key: x._id, count: x.n, byTenant: tenantCounts(x.byTenant) })).filter((x) => x.key !== null);
       const epochToIso = (v) => (Number.isFinite(v) ? new Date(v).toISOString() : v || null);
       data.exitWindows = {
         available: true,
@@ -212,7 +256,9 @@ router.get('/meta', async (req, res, next) => {
         openedBy: asList(facet.openedBy),
         deviceTypes: asList(facet.deviceTypes),
         // Windows written without a session have userId null - not a filterable value.
-        users: facet.users.filter((u) => u._id !== null).map((u) => ({ id: u._id, employeeId: u.employeeId, count: u.n })),
+        users: facet.users
+          .filter((u) => u._id !== null)
+          .map((u) => ({ id: u._id, employeeId: u.employeeId, count: u.n, byTenant: tenantCounts(u.byTenant) })),
         anonymousWindows: (facet.users.find((u) => u._id === null) || {}).n || 0,
         companies: asList(facet.companies),
         sites: [],
@@ -238,6 +284,9 @@ router.get('/meta', async (req, res, next) => {
         centreSource: s.centreSource,
         radiusSource: s.radiusSource,
         address: s.address,
+        // Whose people have reported from this site, so a picked tenant can
+        // narrow the Site dropdowns that list the catalogue itself.
+        tenantIds: s.tenantIds || [],
       }));
     } catch (err) {
       data.sites = [];

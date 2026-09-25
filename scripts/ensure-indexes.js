@@ -25,6 +25,12 @@ const PLAN = [
       { key: { createdAt: -1 }, name: 'createdAt_desc', why: 'every time-range filter and the newest-per-user sort' },
       { key: { [SNAP.userId]: 1, createdAt: -1 }, name: 'user_createdAt', why: 'per-user history and the users table grouping' },
       { key: { [SNAP.tenantId]: 1, createdAt: -1 }, name: 'tenant_createdAt', why: 'tenant filter' },
+      // The tenant filter also reads the flat envelope (see SNAP.tenantIdFlat),
+      // as an $or. Mongo can only answer an $or from indexes when EVERY branch
+      // has one; without this it walks the createdAt index and filters, which
+      // read 616 documents for a 100-row page in stage instead of 100. The
+      // path runs through an array, so this is a multikey index.
+      { key: { [SNAP.tenantIdFlat]: 1, createdAt: -1 }, name: 'tenantFlat_createdAt', why: 'tenant filter, flat envelope' },
       { key: { isInsideGeofence: 1, createdAt: -1 }, name: 'geofence_createdAt', why: 'inside/outside filters and the KPI tiles' },
       { key: { [SNAP.jobSiteId]: 1, createdAt: -1 }, name: 'site_createdAt', why: 'site filter and per-site rollups' },
       { key: { [SNAP.accuracy]: 1 }, name: 'accuracy', why: 'accuracy thresholds and the histogram' },

@@ -308,4 +308,53 @@ function exitWindowStats() {
   };
 }
 
-module.exports = { capturedAtExpr, heartbeatAtExpr, HEARTBEAT_AT, accuracyBandExpr, ageMinutesExpr, computedFields, latestPerUser, exitWindowStats };
+/**
+ * A filter-dropdown facet that also remembers which tenant each value came from.
+ *
+ * When a tenant is picked, every other dropdown should offer only that
+ * tenant's users, sites, devices and so on, with that tenant's counts. Doing
+ * it in the browser needs the split, so this groups twice: once per
+ * (value, tenant), then per value with the tenant counts kept as `byTenant`.
+ * One pass over the data, in the facet that was already running - picking a
+ * tenant then re-scopes the bar instantly, rather than re-running a
+ * six-second /api/meta per tenant.
+ *
+ * `first` adds accumulators to the inner group and `second` to the outer one;
+ * anything the caller needs across tenants (a name, a newest timestamp) has to
+ * be carried through both.
+ */
+function groupWithTenants(keyExpr, tenantExpr, first = {}, second = {}) {
+  return [
+    { $group: { _id: { k: keyExpr, t: tenantExpr }, n: { $sum: 1 }, ...first } },
+    { $group: { _id: '$_id.k', n: { $sum: '$n' }, byTenant: { $push: { t: '$_id.t', n: '$n' } }, ...second } },
+  ];
+}
+
+/**
+ * `[{ t, n }]` -> `{ [tenantId]: n }`.
+ *
+ * Documents with no tenant are kept under `'null'`, the value the Tenant
+ * dropdown sends for "No tenant" - so picking it narrows the other dropdowns
+ * to the tenantless documents, as the filter itself now does.
+ */
+function tenantCounts(list) {
+  const out = {};
+  for (const x of list || []) {
+    const key = x.t === null || x.t === undefined ? 'null' : x.t;
+    out[key] = (out[key] || 0) + x.n;
+  }
+  return out;
+}
+
+module.exports = {
+  capturedAtExpr,
+  heartbeatAtExpr,
+  HEARTBEAT_AT,
+  accuracyBandExpr,
+  ageMinutesExpr,
+  computedFields,
+  latestPerUser,
+  exitWindowStats,
+  groupWithTenants,
+  tenantCounts,
+};

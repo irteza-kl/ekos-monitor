@@ -90,7 +90,22 @@ router.get('/sites', async (req, res, next) => {
     });
 
     const filterId = F.nums(req.query.jobSiteId);
-    const filtered = filterId.length ? rows.filter((r) => filterId.includes(r.siteId)) : rows;
+    let filtered = filterId.length ? rows.filter((r) => filterId.includes(r.siteId)) : rows;
+
+    // The tenant used to narrow only the occupancy above, so under "EMG" this
+    // page still listed every KoderLabs site with its full history - a tenant
+    // chip over a list that ignored it. A site belongs to the tenants whose
+    // people have reported from it (tenantIds, both envelopes); "No tenant"
+    // is the sites nobody with a tenant has.
+    const tenantTokens = F.list(req.query.tenantId);
+    if (tenantTokens.length) {
+      const wanted = new Set(tenantTokens.map(Number).filter(Number.isFinite));
+      const wantsNone = tenantTokens.some((t) => t === 'null' || t === 'none');
+      filtered = filtered.filter((r) => {
+        const ids = (r.tenantIds || []).filter((t) => t !== null && t !== undefined);
+        return ids.some((t) => wanted.has(Number(t))) || (wantsNone && !ids.length);
+      });
+    }
 
     res.json({
       rows: filtered,

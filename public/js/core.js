@@ -639,6 +639,21 @@ window.PM = (function () {
   /** The time window, as the three keys that move together. */
   const WINDOW_KEYS = ['range', 'from', 'to'];
 
+  /**
+   * Filters that survive a change of section, the way the window does.
+   *
+   * The tenant is not a question about the page you are on - it is WHOSE data
+   * you are looking at, and that does not change because you clicked the
+   * sidebar. So a fresh start drops every other filter and keeps these.
+   *
+   * They still ride the store, not the link. Unlike the window, a tenant does
+   * not mean the same thing everywhere: Checks, Explorer and Raw have no tenant
+   * control, and a `tenantId` in their URL would draw a chip for a filter
+   * their endpoints never apply. Through the store, a page adopts one only if
+   * its bar declares the key, and hands it on untouched otherwise.
+   */
+  const SECTION_KEYS = ['tenantId'];
+
   const hasValue = (v) =>
     !(v === null || v === undefined || v === '' || (Array.isArray(v) && !v.length));
 
@@ -756,11 +771,16 @@ window.PM = (function () {
     // the next drill-down would pick the old filters back up.
     const fresh = state.filters[FRESH_PARAM] !== undefined;
     delete state.filters[FRESH_PARAM];
+    // A fresh start keeps the section keys (the tenant) and nothing else. The
+    // store is rewritten below by writeUrlState, so what it held beyond them
+    // is gone for good rather than lying in wait for the next drill-down.
+    const stored = readCarried();
     if (fresh) clearCarried();
     // What the last page was showing, minus anything this URL already says.
     // Held rather than applied: which of these this page can express is not
     // known until its filter bar is built. adoptCarriedFilters finishes it.
-    const carried = fresh ? {} : readCarried();
+    const carried = fresh ? {} : stored;
+    if (fresh) for (const key of SECTION_KEYS) if (hasValue(stored[key])) carried[key] = stored[key];
     state.carried = {};
     state.adopted = false;
     for (const [key, value] of Object.entries(carried)) {
@@ -1173,10 +1193,13 @@ window.PM = (function () {
 
     const paint = () => {
       const needle = search.value.trim().toLowerCase();
-      const shown = options.filter((o) => !needle || String(o.label).toLowerCase().includes(needle));
+      const scoped = scopeToTenant(item, options);
+      const shown = scoped.filter((o) => !needle || String(o.label).toLowerCase().includes(needle));
       list.innerHTML = '';
       if (!options.length) {
         list.append(el('div', { class: 'dd-empty', text: 'No values in this dataset yet.' }));
+      } else if (!scoped.length) {
+        list.append(el('div', { class: 'dd-empty', text: 'None for the selected tenant.' }));
       } else if (!shown.length) {
         list.append(el('div', { class: 'dd-empty', text: 'Nothing matches that search.' }));
       }
@@ -1210,7 +1233,10 @@ window.PM = (function () {
         text: 'Select all',
         onclick: () => {
           const needle = search.value.trim().toLowerCase();
-          const visible = options.filter((o) => !needle || String(o.label).toLowerCase().includes(needle));
+          // What is on screen, which with a tenant picked is only its values.
+          const visible = scopeToTenant(item, options).filter(
+            (o) => !needle || String(o.label).toLowerCase().includes(needle)
+          );
           selected = [...new Set(selected.concat(visible.map((o) => String(o.value))))];
           paint();
           summarise();
@@ -2292,7 +2318,79 @@ window.PM = (function () {
       value: item[valueKey] === null ? 'null' : item[valueKey],
       label: String(item[labelKey] === null || item[labelKey] === undefined ? item[valueKey] : item[labelKey]),
       count: countKey ? item[countKey] : undefined,
+      // Carried through so a picked tenant can narrow this dropdown - see
+      // scopeToTenant. Metadata without the split is simply never narrowed.
+      byTenant: item.byTenant,
     }));
+  }
+
+  /**
+   * `byTenant` for something that belongs to tenants but is not counted per
+   * tenant - a site in the catalogue, which lists who has reported from it.
+   */
+  function tenantPresence(ids) {
+    const out = {};
+    for (const id of ids || []) out[id === null || id === undefined ? 'null' : id] = 1;
+    return out;
+  }
+
+  /**
+   * The options a dropdown shows once a tenant is picked on the bar.
+   *
+   * Only that tenant's values, counted for that tenant alone - a user list
+   * that still offered the other tenant's people would let you build a filter
+   * that could only ever return nothing.
+   *
+   * Three things are left alone. The tenant dropdown itself. Options with no
+   * `byTenant` (accuracy bands, permissions, a fixed list of verdicts): they
+   * are not data about anybody, so there is nothing to narrow them by. And a
+   * value that is already selected: it stays visible, so it can be unticked,
+   * rather than vanishing while still silently filtering the page.
+   *
+   * Read at paint time, not at build time, so picking a tenant narrows the
+   * other dropdowns the next time they open without rebuilding the bar - a
+   * rebuild would close the tenant dropdown mid-selection.
+   */
+  function scopeToTenant(item, options) {
+    if (item.key === 'tenantId') return options;
+    const picked = [].concat(state.filters.tenantId || []).map(String).filter(Boolean);
+    if (!picked.length) return options;
+    const selected = new Set([].concat(state.filters[item.key] || []).map(String));
+    const out = [];
+    for (const opt of options) {
+      if (!opt.byTenant) {
+        out.push(opt);
+        continue;
+      }
+      let count = 0;
+      for (const t of picked) count += Number(opt.byTenant[t] || 0);
+      if (count <= 0 && !selected.has(String(opt.value))) continue;
+      // An option drawn without a count (a site from the catalogue) stays
+      // without one; presence is all its split can say.
+      out.push(opt.count === undefined || opt.count === null ? opt : { ...opt, count });
+    }
+    return out;
+  }
+
+  /**
+   * Tenant filter options for a document kind that stores only the id.
+   *
+   * Shift trails and exit windows carry `tenantId` and nothing else - the
+   * tenant's name exists only on the employee record embedded in a heartbeat.
+   * So the VALUES come from the kind itself (`[{ key, count }]`, the tenants
+   * that actually appear in it, with its own counts) and only the LABEL is
+   * borrowed from the heartbeat meta. Offering the heartbeat tenant list
+   * instead would put tenants in the dropdown that match nothing on the page.
+   */
+  function tenantOptions(list) {
+    const named = new Map(((state.meta || {}).tenants || []).map((t) => [t.id, t.name]));
+    return (list || [])
+      .filter((t) => t.key !== null && t.key !== undefined)
+      .map((t) => ({
+        value: t.key,
+        label: (named.get(t.key) || 'Tenant ' + t.key) + ' · #' + t.key,
+        count: t.count,
+      }));
   }
 
   return {
@@ -2326,6 +2424,9 @@ window.PM = (function () {
     meter,
     jsonHighlight,
     optionsFrom,
+    tenantOptions,
+    tenantPresence,
+    scopeToTenant,
     siteName,
     siteTitle,
     rangeLabel,

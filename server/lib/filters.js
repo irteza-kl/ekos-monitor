@@ -96,6 +96,31 @@ function nums(v) {
   return list(v).map(Number).filter(Number.isFinite);
 }
 
+/**
+ * The tenant filter, for a document kind that stores the tenant under `fields`.
+ *
+ * `null` is a value here, not noise. The Tenant dropdown offers "No tenant"
+ * for heartbeats with no tenant on them, and nums() used to drop that token
+ * as not-a-number - so picking it drew a chip and filtered nothing, returning
+ * every tenant's data under a label that said the opposite. It matters more
+ * now that the tenant follows you between pages.
+ *
+ * A document is in a listed tenant if ANY of its fields holds it (an exit
+ * window's older `companyId` or its `tenantId`), and has no tenant only if
+ * ALL of them are empty.
+ */
+function tenantClause(q, fields) {
+  const tokens = list(q.tenantId);
+  if (!tokens.length) return null;
+  const ids = tokens.map(Number).filter(Number.isFinite);
+  const wantsNone = tokens.some((t) => t === 'null' || t === 'none');
+  const or = [];
+  if (ids.length) for (const field of fields) or.push({ [field]: { $in: ids } });
+  if (wantsNone) or.push(Object.fromEntries(fields.map((field) => [field, null])));
+  if (!or.length) return null;
+  return or.length === 1 ? or[0] : { $or: or };
+}
+
 function dateRange(q, field) {
   const range = {};
   const from = str(q.from);
@@ -129,6 +154,20 @@ function escapeRegex(s) {
 const SNAP = {
   userId: 'currentUser.data.id',
   tenantId: 'currentUser.data.tenantId',
+  // Some heartbeats arrive with the user object flat on currentUser instead of
+  // under currentUser.data - 419 of 26.7k in stage (1.6%), still being
+  // written. A tenant filter reading only the nested path dropped those from
+  // their own tenant and filed them under "No tenant". Tenant queries read
+  // both; see SNAP_TENANT_EXPR and snapshotMatch.
+  //
+  // The tenant ACCOUNT, not `currentUser.tenantId`: measured in stage, every
+  // flat heartbeat carries tenantAccount[0].tenantId, but 36 of the 419 have
+  // no top-level tenantId at all. Where both exist they agree, and no
+  // heartbeat has more than one tenant account.
+  //
+  // (The user id has the same split and is a wider change - attribution,
+  // trails, per-user history and row display all key on the nested path.)
+  tenantIdFlat: 'currentUser.tenantAccount.tenantId',
   fullName: 'currentUser.data.fullName',
   email: 'currentUser.data.email',
   phone: 'currentUser.data.phone',
@@ -153,6 +192,14 @@ const SNAP = {
 };
 
 /**
+ * A heartbeat's tenant under either envelope, for $group and $addToSet.
+ * tenantAccount is an array, so the flat path resolves to an array of ids in
+ * an expression - hence the first element. (A query matches array elements by
+ * itself, so snapshotMatch uses the path directly.)
+ */
+const SNAP_TENANT_EXPR = { $ifNull: ['$' + SNAP.tenantId, { $arrayElemAt: ['$' + SNAP.tenantIdFlat, 0] }] };
+
+/**
  * Filters that can run before any $group (indexed / plain document fields).
  */
 function snapshotMatch(q) {
@@ -172,8 +219,10 @@ function snapshotMatch(q) {
     clauses.push(or.length === 1 ? or[0] : { $or: or });
   }
 
-  const tenants = nums(q.tenantId);
-  if (tenants.length) clauses.push({ [SNAP.tenantId]: { $in: tenants } });
+  // Both envelopes: in a tenant if either path holds it, tenantless only if
+  // neither does.
+  const tenant = tenantClause(q, [SNAP.tenantId, SNAP.tenantIdFlat]);
+  if (tenant) clauses.push(tenant);
 
   const devices = list(q.deviceType);
   if (devices.length) clauses.push({ deviceType: { $in: devices } });
@@ -399,8 +448,10 @@ function exitWindowMatch(q) {
   const users = nums(q.userId);
   if (users.length) clauses.push({ userId: { $in: users } });
 
-  const companies = nums(q.tenantId);
-  if (companies.length) clauses.push({ $or: [{ companyId: { $in: companies } }, { tenantId: { $in: companies } }] });
+  // Older writers called it companyId, so a window belongs to a tenant under
+  // either name - and has none only when it has neither.
+  const tenant = tenantClause(q, ['companyId', 'tenantId']);
+  if (tenant) clauses.push(tenant);
 
   const devices = list(q.deviceType);
   if (devices.length) clauses.push({ deviceType: { $in: devices } });
@@ -497,8 +548,8 @@ function shiftTrailMatch(q) {
   const users = nums(q.userId);
   if (users.length) clauses.push({ userId: { $in: users } });
 
-  const tenants = nums(q.tenantId);
-  if (tenants.length) clauses.push({ tenantId: { $in: tenants } });
+  const tenant = tenantClause(q, ['tenantId']);
+  if (tenant) clauses.push(tenant);
 
   const siteTokens = list(q.siteId).concat(list(q.jobSiteId));
   const sites = siteTokens.map(Number).filter(Number.isFinite);
@@ -641,6 +692,7 @@ function sortSpec(q, allowed, fallback) {
 
 module.exports = {
   SNAP,
+  SNAP_TENANT_EXPR,
   dateRange,
   LOG,
   snapshotMatch,

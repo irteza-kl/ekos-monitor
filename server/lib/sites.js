@@ -2,7 +2,7 @@
 const { collectionFor } = require('../db');
 const config = require('../config');
 const geo = require('./geo');
-const { LOG, SNAP, dateRange } = require('./filters');
+const { LOG, SNAP, SNAP_TENANT_EXPR, dateRange } = require('./filters');
 
 /**
  * The geofence site registry. One rule: geometry is only presented as a fence
@@ -276,7 +276,7 @@ async function siteRecords(byId) {
               firstSeenAt: { $min: '$createdAt' },
               lastSeenAt: { $max: '$createdAt' },
               users: { $addToSet: '$' + SNAP.userId },
-              tenants: { $addToSet: '$' + SNAP.tenantId },
+              tenants: { $addToSet: SNAP_TENANT_EXPR },
             },
           },
         ],
@@ -408,7 +408,7 @@ async function estimatedCentres(byId, { from, to }) {
               _id: { site: '$_siteId', bucket: bucket.expr },
               snapshots: { $sum: 1 },
               users: { $addToSet: '$' + SNAP.userId },
-              tenantIds: { $addToSet: '$' + SNAP.tenantId },
+              tenantIds: { $addToSet: SNAP_TENANT_EXPR },
               lastSeenAt: { $max: '$createdAt' },
               insideCount: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
               outsideCount: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },

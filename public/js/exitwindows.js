@@ -22,6 +22,9 @@
 
     PM.buildFilterBar(() => [
       { kind: 'daterange' },
+      // Exit windows store `tenantId` (the older `companyId` is read too, and
+      // the filter matches either), but never the tenant's name.
+      { kind: 'multi', key: 'tenantId', label: 'Tenant', options: PM.tenantOptions(ew().companies) },
       {
         kind: 'multi',
         key: 'userId',
@@ -33,7 +36,12 @@
         kind: 'multi',
         key: 'resolution',
         label: 'Resolution',
-        options: (ew().resolutions || []).map((r) => ({ value: r.key, label: resolutionLabel(r.key), count: r.count })),
+        options: (ew().resolutions || []).map((r) => ({
+          value: r.key,
+          label: resolutionLabel(r.key),
+          count: r.count,
+          byTenant: r.byTenant,
+        })),
       },
       { kind: 'multi', key: 'openedBy', label: 'Opened by', options: PM.optionsFrom(ew().openedBy || [], 'key', 'key', 'count') },
       { kind: 'multi', key: 'deviceType', label: 'Device', options: PM.optionsFrom(ew().deviceTypes || [], 'key', 'key', 'count') },
@@ -48,6 +56,9 @@
             // The name leads; the id rides along because the filter, the CSV
             // and every cross-page link key on it.
             label: PM.siteName(site, site.siteId) + ' · #' + site.siteId,
+            // The catalogue has no per-tenant counts, only who has reported
+            // from each site - enough to narrow the list to one tenant.
+            byTenant: PM.tenantPresence(site.tenantIds),
           })),
       },
       {
