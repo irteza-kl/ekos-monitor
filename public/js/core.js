@@ -9,6 +9,8 @@ window.PM = (function () {
 
   const PAGES = [
     { file: 'index.html', title: 'Overview', icon: '◧', group: 'Monitoring' },
+    { file: 'attendance.html', title: 'Attendance', icon: '◷', group: 'Monitoring' },
+    { file: 'trends.html', title: 'Trends', icon: '▤', group: 'Monitoring' },
     { file: 'map.html', title: 'Live Map', icon: '◎', group: 'Monitoring' },
     { file: 'users.html', title: 'Users & Devices', icon: '☰', group: 'Monitoring' },
     { file: 'heartbeats.html', title: 'Heartbeats', icon: '∿', group: 'Monitoring', countKey: 'snapshots' },

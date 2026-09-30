@@ -143,6 +143,7 @@ app.use('/api', require('./routes/users'));
 app.use('/api', require('./routes/logs'));
 app.use('/api', require('./routes/exitWindows'));
 app.use('/api', require('./routes/shiftTrails'));
+app.use('/api', require('./routes/clockIns'));
 app.use('/api', require('./routes/sites'));
 app.use('/api', require('./routes/issues'));
 app.use('/api', require('./routes/fence'));

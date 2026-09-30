@@ -181,7 +181,9 @@ should not see contact details, add `email` and `phone` to the `ALWAYS` list.
 
 | Page | What it answers |
 |---|---|
-| **Overview** | **What is wrong, first.** A severity strip opens the page - each tile carrying its change against the previous window of equal length - then the current-state tiles, then **time on site** measured per person, then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. The live map and the trend charts follow as context. |
+| **Overview** | **What needs attention now, and nothing else.** A severity strip opens the page - each tile carrying its change against the previous window of equal length - then the current-state tiles (with links to Attendance and the Live Map), then a ranked feed of detected problems split into people in the field and app/data faults, then the people worst affected. |
+| **Attendance** | **Who is working, when they clocked in, how long they were on site.** The on-the-clock roster (newest heartbeat per person, graded by how recently each device reported), the **clock-in history** (one row per clock-in, latest first, closed by its shift trail, paged 50 at a time), and **time on site** measured per person. |
+| **Trends** | The context charts: geofence state and GPS accuracy over time, the accuracy distribution, devices per platform, site activity, and per-user totals across the range. |
 | **Live Map** | Full situational map: devices coloured by fence verdict, accuracy halos, fence circles, optional trails, and a side list with a walking-directions link for anyone outside their fence. |
 | **Users & Devices** | Newest snapshot per user — device, app build, battery, connectivity, permissions, clock state, fence verdict, distance to the boundary. Clicking a row opens that user's own page in the same tab (ctrl/cmd-click or middle-click for a new one). |
 | **Heartbeats** | Every stored device ping for every user, newest first, with the filters to cut it down: user, tenant, device, app build, site, accuracy band, missing permission, clock state, fence state, connectivity, with/without a fix, battery, search. Silence between a device’s own heartbeats is the point - a **Silence before** column across users, and full gap rows when one user is selected. The **same trail map the user page has** sits above the table - the same Fixes limit, time window, State filter, merging, layer toolbar and replay - drawn from `/api/track` rather than from the table's own page of rows. |
@@ -688,6 +690,13 @@ time. Wide rows scroll sideways inside the table rather than wrapping, and `↓ 
 
 ### On the clock: who is working, and whether their device agrees
 
+This, **Clock-ins** and **Time on site** are the Attendance page. They were on the
+Overview until it grew to fifteen blocks; the split kept the Overview to what needs
+acting on, and put the three workforce questions - who is working, when did they
+start, how long were they on site - on one page with one set of filters. The Overview's
+"On the clock" tile links here. The GPS-accuracy and inside-fence filters are left off
+this page: they describe one heartbeat, and a shift cannot honour them.
+
 The Current-state tiles could count clocked-in devices. They could not say **who**, and
 they could not say whether the claim is still true.
 
@@ -721,13 +730,67 @@ its last geofence flag after clocking out, so the cell would otherwise read "not
 into a site" and "inside" side by side - a verdict about a fence the row has just said it
 does not have.
 
-It costs no extra request: these are the same `/api/users` rows the map is drawn from -
-the newest heartbeat per person - so the roster and the dots can never disagree. That
-also means it is scoped to the page’s time range like everything else, which the subtitle
-states outright: narrow the range and people who did not report inside it leave the
-roster. **Per-user activity**, further down, is the other half - totals across the whole
-window rather than the current state - and now says so in its subtitle, because two
-tables of people on one page that answer different questions have to be told apart.
+These are the same `/api/users` rows the Live Map is drawn from - the newest heartbeat
+per person - so the roster and the dots can never disagree. That also means it is scoped
+to the page’s time range like everything else, which the subtitle states outright: narrow
+the range and people who did not report inside it leave the roster. **Per-user activity**
+on the Trends page is the other half - totals across the whole window rather than the
+current state - and says so in its subtitle.
+
+### Clock-ins: every shift, not just the current one
+
+The roster is the newest heartbeat per person, so it can say who is on the clock now
+and nothing about the shifts before. **Clock-ins**, under it, is the history: one row
+per clock-in, from `/api/clockins` (`server/lib/clockIns.js`), with `↓ CSV` for all of
+them. The answer is computed once per filter set and cached for a minute; the table
+pages through it 50 rows at a time (`limit`, `offset`), so turning a page slices the
+cached answer instead of re-running the aggregation, and the CSV is the same answer.
+
+There is no clock-in collection - `validateClockInLogs` holds one document - so the
+record is assembled from two sources:
+
+| Source | What it gives |
+| --- | --- |
+| `currentUser.data.timeEntry[0]` on the heartbeats | the backend's own record while somebody is on the clock: entry id, clock-in, network status at clock-in, site (`siteAreaId`, the same id as `siteDetails.id`), scheduled shift, facial-verification counts, `geoFenceClockIn`. Grouped by entry id, and the first heartbeat carrying it says where the device was just after clocking in. |
+| the shift trail | the **clock-out**. `shiftKey` is the clock-in in epoch seconds, so trails join to entries on user + clock-in to the second (98 of 106 in stage). Each entry's trail is fetched by `shiftKey` (indexed), not looked up in the window's trail list, which is capped at 500: the cap would otherwise decide which shifts have a clock-out. A trail with no entry still gets a row; those are the only rows the cap can drop, and the card says so when it is hit. |
+
+**The time entry's `clockOut` is null on every heartbeat**, because heartbeats stop
+carrying the entry once somebody clocks out. So the clock-out column always names
+where its time came from:
+
+- **the shift trail** - exact;
+- **a heartbeat** - one that still carried the entry but was off the clock
+  (`clockedIn` false or `clockedOut` true). The clock-out is the first such heartbeat
+  after the *last* on-the-clock one, and the cell says how wide that gap was ("within
+  30s"). After the last, not the first: one entry in stage flips on and off four times,
+  and "first off" put its clock-out mid-shift;
+- **not recorded** - when neither exists, rather than a guess. That covers a person who
+  reported again later without the entry, and an entry never seen on the clock at all
+  (two in stage, whose only heartbeats arrived days later, already off - the first of
+  them dates the phone reconnecting, not the shift ending). The duration is then a floor
+  up to the last on-the-clock heartbeat, or blank when there was none.
+
+A shift whose newest heartbeat still has the person on the clock is **on the clock**,
+graded silent after an hour. Rows are ordered by clock-in, latest first.
+
+Three judgements, and what they rest on:
+
+- **Fence at clock-in** is the first fix after clocking in, judged with the accuracy
+  allowance against the heartbeat's own fence, else the registry's. A first fix more
+  than 15 minutes after the clock-in says where somebody went, not where they clocked
+  in (one arrived 4.7 days later), so it is shown but not counted inside or outside.
+- **Schedule** reads `meta.shiftSchedule` start and end as **UTC times of day**: the
+  dates are an arbitrary February and the timezone is null. "Evening" is then
+  10:00-19:00Z, 15:00-00:00 in Karachi, which is where these clock-ins fall; read as
+  wall-clock time it would put nearly all of them after their shift. A clock-in belongs
+  to the shift whose window (from four hours before its start to its end) contains
+  it, and otherwise to the one that last started, flagged as after it ended.
+  More than 5 minutes after the start is late.
+- **Offline clock-ins** (`clockInNetworkStatus: OFFLINE`) are counted on their own:
+  their time and place are what the phone believed.
+
+Accuracy band and the inside-fence flag describe one heartbeat, not a clock-in, so
+they are not applied here and the subtitle says so when they are set.
 
 ### The Overview leads with problems
 
@@ -827,7 +890,7 @@ The method was checked against the two devices that report densely enough for a
 heartbeat count to be close to the truth anyway: integration gives 47% where
 counting gives 51%. For a device whose reporting rate itself changes with the thing
 being measured the two diverge by nearly twenty points, and integration is the
-correct one. The Overview shows both side by side, and flags any person where they
+correct one. The Attendance page shows both side by side, and flags any person where they
 disagree by ten points or more - seeing them disagree is what makes the difference
 believable.
 
@@ -1161,10 +1224,10 @@ button. It stays until a load succeeds. Nothing is left in a loading state, and
 the live indicator in the topbar reads `stale - refresh failed` rather than a
 timestamp that implies freshness.
 
-The Overview also requests its four endpoints with `Promise.allSettled` rather
-than `Promise.all`. They answer four independent questions, and `all` discarded
-three good answers whenever the fourth failed - so one slow aggregation blanked
-the whole page. Panels whose own request failed say so individually; the rest
+The Overview and Attendance pages also request their endpoints with
+`Promise.allSettled` rather than `Promise.all`. They answer independent questions,
+and `all` discarded every good answer whenever one failed - so one slow aggregation
+blanked the whole page. Panels whose own request failed say so individually; the rest
 render as normal, and the banner says which is which.
 
 ## Cold starts, caches and drifting windows

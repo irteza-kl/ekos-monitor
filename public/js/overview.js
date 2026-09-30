@@ -1,11 +1,16 @@
-/* Overview: the at-a-glance operations picture. */
+/*
+ * Overview: what needs attention now.
+ *
+ * The problems, and the current state they are measured against - nothing
+ * else. It used to carry everything, fifteen blocks deep; the workforce
+ * sections moved to Attendance, the charts to Trends, and the map and the
+ * validation-call card were dropped because the Live Map and Geofence Checks
+ * pages already are those things, with more in them.
+ */
 (function () {
   'use strict';
   const { el, fmt, api, queryString, esc } = PM;
-  const C = PM.colors;
-
-  let liveMap = null;
-  let mapLayers = [];
+  const { tile, panelFailed } = PMPanel;
 
   PM.boot('index.html', async ({ root, meta }) => {
     PM.buildFilterBar(() => [
@@ -39,39 +44,15 @@
       // Problems first: the strip at the top, its detail below the state tiles.
       el('div', { class: 'section-title', text: 'What is wrong' }),
       el('div', { class: 'tiles', id: 'issue-summary' }),
-      el('div', { class: 'section-title', text: 'Current state' }),
+      // Who these people are and where they are standing live on their own
+      // pages now; the links keep them one click from the numbers.
+      el('div', { class: 'section-title has-link' }, [
+        el('span', { text: 'Current state' }),
+        el('div', { class: 'spacer' }),
+        el('a', { class: 'section-link', href: PM.withWindow('/attendance.html'), text: 'Attendance ↗' }),
+        el('a', { class: 'section-link', href: PM.withWindow('/map.html'), text: 'Live map ↗' }),
+      ]),
       el('div', { class: 'tiles', id: 'tiles' }),
-      el('div', { class: 'section-title', text: 'On the clock' }),
-      el('div', { class: 'card' }, [
-        el('div', { class: 'card-head' }, [
-          el('h2', { text: 'Who is working, and whether their device agrees' }),
-          el('span', { class: 'sub', id: 'now-sub' }),
-          el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
-        ]),
-        el('div', { class: 'card-body' }, [el('div', { class: 'tiles tiles-4', id: 'now-tiles' })]),
-        el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'now-table' })]),
-      ]),
-      el('div', { class: 'section-title', text: 'Time on site' }),
-      el('div', { class: 'card' }, [
-        el('div', { class: 'card-head' }, [
-          el('h2', { text: 'How long people were actually inside a fence' }),
-          el('span', { class: 'sub', id: 'fence-sub' }),
-          el('div', { class: 'spacer' }),
-          el('button', {
-            class: 'btn btn-sm',
-            text: '\u2193 CSV',
-            onclick: () => window.open('/api/fence-time.csv?' + queryString(), '_blank'),
-          }),
-        ]),
-        // Two bodies: the tiles need the normal padding, the table is
-        // full-bleed like every other table here. A single 'tight' body put
-        // the tiles flush against the card border.
-        el('div', { class: 'card-body' }, [el('div', { class: 'tiles tiles-4', id: 'fence-tiles' })]),
-        el('div', { class: 'card-body tight card-split' }, [
-          el('div', { class: 'table-scroll', id: 'fence-table' }),
-        ]),
-      ]),
       el('div', { class: 'section-title', text: 'What is wrong, in detail' }),
       el('div', { class: 'grid-2', id: 'issue-columns' }, [
         el('div', { class: 'card' }, [
@@ -103,170 +84,56 @@
           el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
         ]),
         el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'worst-users' })]),
-      ]),
-      el('div', { class: 'card' }, [
-        el('div', { class: 'card-head' }, [
-          el('h2', { text: 'Where everyone is right now' }),
-          el('span', { class: 'sub', id: 'map-sub' }),
-          el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: PM.withWindow('/map.html'), text: 'Full map ↗' }),
-        ]),
-        el('div', { class: 'card-body tight' }, [el('div', { class: 'map', id: 'overview-map' })]),
-        el('div', { html: PMMap.legend() }),
-      ]),
-      el('div', { class: 'grid-2' }, [
-        card('Geofence state over time', 'Snapshot counts per bucket, stacked', 'chart-geo', 'tall', [
-          el('div', {
-            html: PMChart.legend([
-              { color: C.in, label: 'Inside fence' },
-              { color: C.out, label: 'Outside fence' },
-              { color: C.unknown, label: 'No fence flag' },
-            ]),
-          }),
-        ]),
-        card('GPS accuracy over time', 'Average and worst fix per bucket, metres', 'chart-acc', 'tall', [
-          el('div', {
-            html: PMChart.legend([
-              { color: C.series[0], label: 'Average accuracy' },
-              { color: C.series[3], label: 'Worst accuracy' },
-            ]),
-          }),
-        ]),
-      ]),
-      el('div', { class: 'grid-2' }, [
-        card('Accuracy distribution', 'How trustworthy the location data is', 'chart-hist'),
-        card('Devices per platform', 'Snapshots by platform', 'chart-device'),
-      ]),
-      el('div', { class: 'grid-2' }, [
-        card('Site activity', 'Snapshots per site, inside vs outside the fence', 'chart-sites', 'tall', [
-          el('div', {
-            html: PMChart.legend([
-              { color: C.in, label: 'Inside fence' },
-              { color: C.out, label: 'Outside fence' },
-            ]),
-          }),
-        ]),
-        el('div', { class: 'card' }, [
-          el('div', { class: 'card-head' }, [
-            el('h2', { text: 'Per-user activity' }),
-            // Spelled out because there are now two tables of people on this
-            // page and they answer different questions: this one totals the
-            // whole window, the roster above is each person's newest heartbeat.
-            el('span', { class: 'sub', text: 'totals across the selected range, not the current state' }),
-            el('div', { class: 'spacer' }),
-            el('a', { class: 'btn btn-sm', href: PM.withWindow('/users.html'), text: 'All users ↗' }),
-          ]),
-          el('div', { class: 'card-body tight' }, [el('div', { class: 'table-scroll', id: 'user-table' })]),
-        ]),
-      ]),
-      el('div', { class: 'card' }, [
-        el('div', { class: 'card-head' }, [
-          el('h2', { text: 'Geofence validation calls' }),
-          el('span', { class: 'sub', text: 'What the clock-in checks decided, from validateClockInLogs' }),
-          el('div', { class: 'spacer' }),
-          el('a', { class: 'btn btn-sm', href: PM.withWindow('/checks.html'), text: 'Inspect checks ↗' }),
-        ]),
-        el('div', { class: 'card-body' }, [
-          el('div', { class: 'tiles', id: 'check-tiles' }),
-          el('div', { style: 'margin-top:14px' }, [
-            el('div', { class: 'chart-wrap', id: 'chart-checks-wrap' }, [el('canvas', { id: 'chart-checks' })]),
-            el('div', {
-              html: PMChart.legend([
-                { color: C.in, label: 'Passed (within radius)' },
-                { color: C.out, label: 'Failed geometry' },
-                { color: C.series[3], label: 'Auto clock-outs' },
-              ]),
-            }),
-          ]),
-        ]),
       ])
     );
 
-    liveMap = PMMap.create(document.querySelector('#overview-map'));
     await load();
     window.addEventListener('pm:filters', load);
     window.addEventListener('pm:refresh', load);
   });
 
-  function card(title, subtitle, canvasId, size, extra) {
-    return el('div', { class: 'card' }, [
-      el('div', { class: 'card-head' }, [el('h2', { text: title }), subtitle ? el('span', { class: 'sub', text: subtitle }) : null]),
-      el('div', { class: 'card-body' }, [
-        el('div', { class: 'chart-wrap ' + (size || '') }, [el('canvas', { id: canvasId })]),
-        ...(extra || []),
-      ]),
-    ]);
-  }
+  /**
+   * Bumped by every load, so a response that returns after a newer load has
+   * started - a filter changed while it was out - is dropped instead of
+   * overwriting the newer answer.
+   */
+  let loadSeq = 0;
 
   async function load() {
+    const seq = ++loadSeq;
     PM.showSkeleton({
       '#issue-summary': 'tiles:4',
-      '#fence-tiles': 'tiles:4',
-      '#fence-table': 'table:5x5',
       '#issues-people': 'table:5x2',
       '#issues-app': 'table:5x2',
       '#worst-users': 'table:5x3',
       '#tiles': 'tiles:8',
-      '#overview-map': 'map',
-      '#chart-geo': 'chart',
-      '#chart-acc': 'chart',
-      '#chart-hist': 'chart',
-      '#chart-device': 'chart',
-      '#chart-sites': 'chart',
-      '#chart-checks': 'chart',
-      '#now-tiles': 'tiles:4',
-      '#now-table': 'table:6x7',
-      '#user-table': 'table:8x7',
-      '#check-tiles': 'tiles:5',
     });
     const qs = queryString();
-    // allSettled, not all: these four are independent questions, and Promise.all
-    // threw away three good answers whenever the fourth failed - so one slow
+    // allSettled, not all: these are independent questions, and Promise.all
+    // threw away the good answer whenever the other failed - so one slow
     // aggregation timing out blanked the entire page.
     // compare=1 adds the same detection over the previous window of equal
     // length, so every count can say which way it is moving.
-    const [stats, users, problems, fence] = (
-      await Promise.allSettled([
-        api('/api/stats?' + qs),
-        api('/api/users?' + qs + '&limit=200'),
-        api('/api/issues?' + qs + '&compare=1'),
-        api('/api/fence-time?' + qs),
-      ])
+    const [stats, problems] = (
+      await Promise.allSettled([api('/api/stats?' + qs), api('/api/issues?' + qs + '&compare=1')])
     ).map((r) => (r.status === 'fulfilled' ? r.value : null));
+    if (seq !== loadSeq) return;
 
     const failed = [];
     if (!problems) failed.push('problem detection');
     if (!stats) failed.push('statistics');
-    if (!users) failed.push('device positions');
-    if (!fence) failed.push('time on site');
 
     if (problems) {
       renderIssues(problems);
+      renderWorstUsers(problems);
     } else {
       panelFailed('#issue-summary', '#issues-people', '#issues-app', '#worst-users');
     }
-    if (fence) {
-      renderFenceTime(fence, stats);
-    } else {
-      panelFailed('#fence-tiles', '#fence-table');
-    }
     if (stats) {
       renderTiles(stats);
-      renderCharts(stats);
-      renderUserTable(stats.perUser || []);
-      renderChecks(stats);
     } else {
-      panelFailed('#tiles', '#user-table', '#check-tiles');
+      panelFailed('#tiles');
     }
-    if (users) {
-      renderMap(users.rows);
-      // Same rows the map is drawn from - the newest heartbeat per person - so
-      // the roster and the dots on the map can never disagree.
-      renderNow(users.rows);
-    } else {
-      panelFailed('#overview-map', '#now-tiles', '#now-table');
-    }
-    if (problems) renderWorstUsers(problems);
     const c = (problems || {}).counts || {};
     // Improvement is worth stating outright: a list of problems that never
     // acknowledges anything clearing reads as though nothing ever gets fixed.
@@ -291,49 +158,6 @@
     } else {
       PM.markLoaded();
     }
-  }
-
-  /** Marks the panels whose own request failed, leaving the rest of the page. */
-  function panelFailed(...selectors) {
-    for (const selector of selectors) {
-      const host = document.querySelector(selector);
-      if (!host) continue;
-      host.classList.remove('is-loading');
-      host.innerHTML = '';
-      host.append(el('div', { class: 'panel-error', text: 'Could not load this panel.' }));
-    }
-  }
-
-  function tile(label, value, opts) {
-    const options = opts || {};
-    const node = el('div', { class: 'tile ' + (options.tone ? 'is-' + options.tone : '') + (options.href ? ' clickable' : '') }, [
-      el('div', { class: 'tile-label', text: label }),
-      el('div', { class: 'tile-value', html: value === null || value === undefined ? '--' : String(value) }),
-      deltaChip(options.delta),
-      options.note ? el('div', { class: 'tile-note', text: options.note }) : null,
-    ]);
-    if (options.href) node.addEventListener('click', () => (location.href = options.href));
-    return node;
-  }
-
-  /**
-   * Which way a count is moving against the previous window of equal length.
-   *
-   * A bare number cannot say whether things are improving, which is most of
-   * what anyone opens a monitor to find out. Absent when no comparison was
-   * available - an unbounded date range has no previous period - rather than
-   * showing a zero that would read as "no change".
-   */
-  function deltaChip(delta) {
-    if (delta === null || delta === undefined) return null;
-    if (delta === 0) {
-      return el('div', { class: 'delta is-flat', text: 'no change' });
-    }
-    const worse = delta > 0;
-    return el('div', {
-      class: 'delta ' + (worse ? 'is-worse' : 'is-better'),
-      text: (worse ? '▲ +' : '▼ ') + delta + ' vs previous period',
-    });
   }
 
   /**
@@ -384,7 +208,6 @@
         href: PM.withWindow('/users.html'),
       })
     );
-
 
     fillFeed('#issues-people', (problems.issues || []).filter((i) => i.group === 'people'), '#people-sub');
     fillFeed('#issues-app', (problems.issues || []).filter((i) => i.group === 'app'), '#app-sub');
@@ -450,129 +273,6 @@
     );
   }
 
-  /**
-   * Time on site, measured by integrating state rather than counting pings.
-   *
-   * The distinction is the whole point of this card. Reporting rates across
-   * this fleet differ by more than two hundred times, so a share of heartbeats
-   * says who reports most often; a share of TIME says who was on site. Both are
-   * shown per person, because seeing them disagree is what makes the difference
-   * believable.
-   */
-  function renderFenceTime(fence, stats) {
-    const tiles = document.querySelector('#fence-tiles');
-    const host = document.querySelector('#fence-table');
-    tiles.innerHTML = '';
-    host.innerHTML = '';
-    const t = (fence && fence.totals) || {};
-    const rows = (fence && fence.perUser) || [];
-    const span = (msValue) => fmt.span(msValue);
-
-    // Colour carries exactly one meaning across these four: amber marks time
-    // that could not be accounted for. The first two are measurements - time on
-    // site is neither good nor bad, and painting it green implied a verdict the
-    // number does not carry.
-    tiles.append(
-      tile('Time inside a fence', span(t.insideMs), {
-        note: 'measured, not sampled',
-      }),
-      tile('Share of measured time inside', fmt.pct((t.insideShareByTime || 0) * 100, 0), {
-        note:
-          'counting heartbeats instead would say ' +
-          fmt.pct((t.insideShareByBeats || 0) * 100, 0),
-      }),
-      tile('Nobody knew where they were', span(t.silentMs), {
-        tone: t.silentMs > 0 ? 'warning' : undefined,
-        note: 'gaps too long to credit to any state',
-      }),
-      tile('No fence verdict at all', span(t.unknownMs), {
-        tone: t.unknownMs > 0 ? 'warning' : undefined,
-        note: 'reporting, but neither inside nor outside',
-      })
-    );
-
-    const sub = document.querySelector('#fence-sub');
-    if (sub) {
-      const skew = (stats && stats.perPerson) || null;
-      // "person-time" is load-bearing: these totals are summed across people,
-      // so eight people watched for a day gives more than 24h and would
-      // otherwise read as impossible.
-      sub.textContent =
-        t.people + ' people · ' + fmt.int(t.visits) + ' crossings · totals are person-time' +
-        (skew && skew.dominance
-          ? ' · ' + fmt.pct(skew.dominance * 100, 0) + ' of heartbeats come from ' + skew.dominanceOf + ' devices'
-          : '');
-    }
-
-    if (!rows.length) {
-      host.append(el('div', { class: 'all-clear', text: 'No fence activity in this range' }));
-      return;
-    }
-
-    const table = el('table', { class: 'fence-table' });
-    table.innerHTML =
-      '<thead><tr><th>Person</th><th class="num">Inside</th><th class="num">Outside</th>' +
-      '<th class="num">Inside %</th><th class="num">If counting pings</th>' +
-      '<th class="num">Crossings</th><th>Not accounted for</th></tr></thead>';
-    const body = el('tbody');
-    for (const u of rows) {
-      const byTime = u.insideShare === null ? null : u.insideShare * 100;
-      const byBeats = u.insideShareByBeats === null ? null : u.insideShareByBeats * 100;
-      // The gap between the two bases, which is the reason this card exists.
-      const spread = byTime === null || byBeats === null ? null : Math.abs(byTime - byBeats);
-
-      // Chips on one wrapping line rather than a stack of divs: three stacked
-      // lines made some rows three times the height of their neighbours, and a
-      // table of measurements is unreadable when the rows do not line up.
-      const gaps = [];
-      if (u.silentMs > 0) gaps.push(esc(span(u.silentMs)) + ' silent');
-      if (u.unknownMs > 0) gaps.push(esc(span(u.unknownMs)) + ' no verdict');
-      if (u.neverExited) gaps.push('never left');
-
-      // The coverage badge only earns its place when it changes the reading of
-      // the number beside it. 'none' next to a count of zero said nothing twice.
-      const crossings =
-        u.visits === 0
-          ? '<span class="muted">0</span>'
-          : fmt.int(u.visits) +
-            (u.eventCoverage === 'sparse'
-              ? '<span class="chip chip-soft" title="This device sends crossing markers rarely, so the count is a floor rather than a total.">at least</span>'
-              : '');
-
-      body.append(
-        el('tr', {
-          class: 'clickable',
-          onclick: (event) => PM.openRow('/user.html?userId=' + u.userId, event),
-          html:
-            '<td><div class="person"><div class="avatar">' +
-            esc(fmt.initials(u.name)) +
-            '</div><div class="person-main"><div class="person-name">' +
-            esc(u.name) +
-            '</div><div class="person-sub">' +
-            esc(u.timezone ? fmt.zoneLabel(u.timezone) + ' · ' + u.beatsPerHour + '/h' : 'id ' + u.userId) +
-            '</div></div></div></td>' +
-            '<td class="num">' + esc(span(u.insideMs)) + '</td>' +
-            '<td class="num">' + esc(span(u.outsideMs)) + '</td>' +
-            '<td class="num strong">' + (byTime === null ? '--' : esc(fmt.pct(byTime, 0))) + '</td>' +
-            '<td class="num' + (spread !== null && spread >= 10 ? ' is-off' : '') + '">' +
-            (byBeats === null ? '--' : esc(fmt.pct(byBeats, 0))) +
-            (spread !== null && spread >= 10
-              ? '<span class="chip chip-warn" title="Counting heartbeats disagrees with measured time by this much for this person.">' +
-                Math.round(spread) +
-                ' pts off</span>'
-              : '') +
-            '</td>' +
-            '<td class="num">' + crossings + '</td>' +
-            (gaps.length
-              ? '<td><div class="chip-row">' + gaps.map((g) => '<span class="chip">' + g + '</span>').join('') + '</div></td>'
-              : '<td><span class="muted">--</span></td>'),
-        })
-      );
-    }
-    table.append(body);
-    host.append(table);
-  }
-
   /* The same findings keyed by person: "who needs help". */
   function renderWorstUsers(problems) {
     const host = document.querySelector('#worst-users');
@@ -628,7 +328,9 @@
         tone: d.stale ? 'warning' : undefined,
         href: PM.withWindow('/users.html'),
       }),
-      tile('On the clock', fmt.int(d.clockedIn), { note: d.clockedOut + ' clocked out', href: PM.withWindow('/users.html?clockedIn=true') }),
+      // To Attendance, which says who they are and whether each device is
+      // still reporting - the question this number always raises next.
+      tile('On the clock', fmt.int(d.clockedIn), { note: d.clockedOut + ' clocked out', href: PM.withWindow('/attendance.html') }),
       tile('Inside a fence', fmt.int(d.insideGeofence), {
         tone: 'good',
         note: d.geofenceUnknown ? d.geofenceUnknown + ' with no fence flag' : 'device-reported',
@@ -667,387 +369,4 @@
     );
   }
 
-  function renderMap(rows) {
-    PMMap.clear(mapLayers);
-    mapLayers = [];
-    const plotted = (rows || []).filter((r) => r.location);
-    const seenSites = new Map();
-    for (const row of plotted) {
-      if (row.site && row.site.lat != null && !seenSites.has(row.site.siteId)) seenSites.set(row.site.siteId, row.site);
-    }
-    for (const site of seenSites.values()) mapLayers.push(PMMap.siteCircle(liveMap, site));
-    for (const row of plotted) {
-      mapLayers.push(PMMap.deviceMarker(liveMap, row, { pulse: row.ageMinutes !== null && row.ageMinutes < 5, onClick: openUser }));
-      if (row.guide && row.fence) {
-        mapLayers.push(
-          PMMap.guideLine(liveMap, row.location, row.fence, {
-            text: fmt.metres(row.guide.distanceMetres) + ' ' + (row.guide.compass || '') + ' of the fence',
-          })
-        );
-      }
-    }
-    PMMap.fit(
-      liveMap,
-      plotted.map((r) => r.location)
-    );
-    document.querySelector('#map-sub').textContent =
-      plotted.length + ' of ' + (rows || []).length + ' devices have a fix · ' + seenSites.size + ' fence(s) drawn';
-  }
-
-  function openUser(row) {
-    location.href = '/users.html?search=' + encodeURIComponent(row.name || row.userId || '');
-  }
-
-  function renderCharts(stats) {
-    const timeline = PM.padBuckets(stats.timeline || [], stats.granularity, {
-      zero: ['count', 'inside', 'outside', 'unknown', 'clockedIn', 'offline', 'users'],
-      nulls: ['avgAccuracy', 'worstAccuracy'],
-    });
-    const labels = timeline.map((t) => fmt.dayTime(t.at));
-
-    PMChart.stackedTime(document.querySelector('#chart-geo'), {
-      labels,
-      yTitle: 'snapshots',
-      datasets: [
-        { label: 'Inside fence', data: timeline.map((t) => t.inside), color: C.in },
-        { label: 'Outside fence', data: timeline.map((t) => t.outside), color: C.out },
-        { label: 'No fence flag', data: timeline.map((t) => t.unknown), color: C.unknown },
-      ],
-    });
-
-    PMChart.lineTime(document.querySelector('#chart-acc'), {
-      labels,
-      yTitle: 'metres',
-      series: [
-        { label: 'Average accuracy', data: timeline.map((t) => t.avgAccuracy), color: C.series[0] },
-        { label: 'Worst accuracy', data: timeline.map((t) => t.worstAccuracy), color: C.series[3], dashed: true },
-      ],
-    });
-
-    const hist = stats.accuracyHistogram || [];
-    const bounds = [0, 5, 10, 20, 30, 50, 75, 100, 200, 500];
-    PMChart.bars(document.querySelector('#chart-hist'), {
-      labels: hist.map((b) => {
-        if (b.from === 'none') return 'no fix';
-        const index = bounds.indexOf(b.from);
-        const next = bounds[index + 1];
-        return next ? b.from + '-' + next + ' m' : b.from + '+ m';
-      }),
-      values: hist.map((b) => b.count),
-      color: C.in,
-      yTitle: 'snapshots',
-      unit: 'snapshots',
-    });
-
-    const devices = Object.entries(stats.deviceSplit || {});
-    PMChart.bars(document.querySelector('#chart-device'), {
-      labels: devices.map(([k]) => k),
-      values: devices.map(([, v]) => v),
-      color: C.series[1],
-      horizontal: true,
-      unit: 'snapshots',
-    });
-
-    const sites = (stats.topSites || []).filter((s) => s.siteId !== null);
-    PMChart.groupedBars(document.querySelector('#chart-sites'), {
-      // Places, not numbers. A bar chart of "Site 12, Site 28, Site 63" is a
-      // chart nobody can read without a second window open.
-      labels: sites.map((s) => PM.siteName(s, s.siteId)),
-      horizontal: true,
-      datasets: [
-        { label: 'Inside fence', data: sites.map((s) => s.inside), color: C.in },
-        { label: 'Outside fence', data: sites.map((s) => s.outside), color: C.out },
-      ],
-    });
-  }
-
-  /* ------------------------------------------------------ on the clock
-     The tiles above count how many people are clocked in. This says WHO,
-     and - the part that matters - whether the claim is still true.
-
-     "Clocked in" is a flag on a heartbeat, not a live fact. A device that
-     dies mid-shift, or an app that never sends the clock-out, leaves a
-     person flagged on the clock indefinitely. This store has one right now:
-     clocked in yesterday afternoon, last heartbeat 21 hours ago, still
-     counted in the total. Counting it is not wrong, but presenting it
-     without the silence is, so the roster grades every row by how recently
-     the device actually reported.
-
-     Everything here comes from the newest heartbeat per person that
-     /api/users already returns - the same rows the map is drawn from - so
-     the section costs no extra request. It is therefore scoped to the
-     page`s time range like everything else, which the subtitle says out
-     loud: narrow the range and people who have not reported inside it drop
-     out of the roster entirely. */
-
-  /** Minutes since the last heartbeat, and what that means. */
-  const REPORTING = [
-    { key: 'live', upTo: 5, label: 'reporting', tone: 'good' },
-    { key: 'quiet', upTo: 60, label: 'quiet', tone: 'info' },
-    { key: 'silent', upTo: Infinity, label: 'silent', tone: 'serious' },
-  ];
-
-  function reportingState(row) {
-    const age = row.ageMinutes;
-    if (age === null || age === undefined) return { key: 'unknown', label: 'no readable clock', tone: 'warning' };
-    return REPORTING.find((r) => age < r.upTo);
-  }
-
-  function renderNow(users) {
-    const host = document.querySelector('#now-table');
-    const tiles = document.querySelector('#now-tiles');
-    const sub = document.querySelector('#now-sub');
-    if (!host || !tiles) return;
-    host.innerHTML = '';
-    tiles.innerHTML = '';
-
-    const rows = (users || []).slice();
-    if (!rows.length) {
-      host.append(el('div', { class: 'empty', text: 'No device reported in this range.' }));
-      if (sub) sub.textContent = '';
-      return;
-    }
-
-    const onClock = rows.filter((r) => r.clockedIn);
-    const live = rows.filter((r) => reportingState(r).key === 'live');
-    const silentOnClock = onClock.filter((r) => reportingState(r).key === 'silent');
-    const outside = onClock.filter((r) => r.isInsideGeofence === false || r.computedVerdict === 'out');
-    const offClockButLive = live.filter((r) => !r.clockedIn);
-
-    tiles.append(
-      tile('On the clock', fmt.int(onClock.length), {
-        note: onClock.length ? insideNote(onClock) : 'nobody is clocked in',
-      }),
-      tile('Reporting now', fmt.int(live.length), {
-        note: 'a heartbeat in the last 5 minutes',
-        tone: live.length ? undefined : 'warning',
-      }),
-      tile('On the clock but silent', fmt.int(silentOnClock.length), {
-        note: silentOnClock.length ? 'flagged working, no heartbeat for over an hour' : 'every working device is reporting',
-        tone: silentOnClock.length ? 'serious' : undefined,
-      }),
-      tile('Outside their fence', fmt.int(outside.length), {
-        note: offClockButLive.length ? fmt.int(offClockButLive.length) + ' more reporting off the clock' : 'of the people on the clock',
-        tone: outside.length ? 'warning' : undefined,
-      })
-    );
-
-    if (sub) {
-      // "in the last 3 hours" / "in all time" / "in 08 Sep 09:00 to now" -
-      // rangeLabel returns the phrase without a preposition.
-      sub.textContent =
-        'newest heartbeat per person in ' + PM.rangeLabel() + ' · ' + fmt.int(rows.length) + ' device(s)';
-    }
-
-    // On the clock first, then the quietest - a working device that has gone
-    // silent is the row somebody needs to see, so it sorts to the top of its
-    // group rather than being buried by whoever reported most recently.
-    rows.sort((a, b) => {
-      if (!!b.clockedIn !== !!a.clockedIn) return b.clockedIn ? 1 : -1;
-      return (b.ageMinutes || 0) - (a.ageMinutes || 0);
-    });
-
-    const table = el('table');
-    table.innerHTML =
-      '<thead><tr><th>Person</th><th>Clock</th><th>Site</th><th>Fence</th><th>Last heartbeat</th>' +
-      '<th class="num">Battery</th><th class="num">Accuracy</th></tr></thead>';
-    const body = el('tbody');
-    for (const r of rows) {
-      const state = reportingState(r);
-      body.append(
-        el('tr', {
-          class: 'clickable',
-          title: 'Open this user',
-          onclick: (event) =>
-            PM.openRow('/user.html?userId=' + (r.userId === null ? 'anonymous' : r.userId), event),
-          html:
-            personCell(r) +
-            '<td>' + clockCell(r) + '</td>' +
-            '<td>' + siteCell(r) + '</td>' +
-            '<td>' + fenceCell(r) + '</td>' +
-            '<td><span class="badge badge-' + state.tone + '">' + esc(state.label) + '</span>' +
-            '<div class="person-sub">' + esc(fmt.ago(r.capturedAt)) + '</div></td>' +
-            '<td class="num">' + PM.batteryBadge(r.battery) + '</td>' +
-            '<td class="num">' + PM.accuracyBadge(r.accuracyBand, r.accuracy) + '</td>',
-        })
-      );
-    }
-    table.append(body);
-    host.append(table);
-  }
-
-  /** "3 of 5 inside their fence" - the shape of the shift in one line. */
-  function insideNote(onClock) {
-    const inside = onClock.filter((r) => r.isInsideGeofence === true).length;
-    return inside + ' of ' + onClock.length + ' inside their fence';
-  }
-
-  function personCell(r) {
-    return (
-      '<td><div class="person"><div class="avatar">' +
-      esc(fmt.initials(r.name)) +
-      '</div><div class="person-main"><div class="person-name">' +
-      esc(r.name || 'Unidentified device') +
-      '</div><div class="person-sub">' +
-      esc(r.employeeRef || r.tenantName || (r.userId === null ? 'no session' : 'id ' + r.userId)) +
-      (r.offline ? ' · <span class="hint">offline</span>' : '') +
-      '</div></div></div></td>'
-    );
-  }
-
-  /**
-   * On the clock, and for how long.
-   *
-   * The duration is measured from the clock-in on the time entry, not from
-   * the heartbeat, so it keeps counting while a device is silent - which is
-   * precisely the case worth seeing: "on the clock 22 h" beside "silent"
-   * says the shift was never closed.
-   */
-  function clockCell(r) {
-    if (!r.clockedIn) return '<span class="badge badge-neutral">off</span>';
-    const since = r.timeEntry && r.timeEntry.clockIn;
-    const minutes = since ? (Date.now() - new Date(since).getTime()) / 60000 : null;
-    return (
-      '<span class="badge badge-info">on</span>' +
-      (minutes !== null && Number.isFinite(minutes)
-        ? '<div class="person-sub" title="clocked in ' + esc(fmt.date(since)) + '">' +
-          esc(fmt.duration(minutes)) + '</div>'
-        : '')
-    );
-  }
-
-  function siteCell(r) {
-    const site = r.site;
-    const name = site && (site.name || site.label);
-    if (!name && r.jobSiteId == null) return '<span class="hint">not clocked into a site</span>';
-    if (!name) return 'Site ' + r.jobSiteId;
-    return (
-      '<span title="' +
-      esc([name, site.address].filter(Boolean).join(' - ')) +
-      '">' +
-      esc(name) +
-      '</span>'
-    );
-  }
-
-  /**
-   * The verdict, and how far outside when it is outside.
-   *
-   * Nothing at all when there is no site to be inside or outside OF. The device
-   * keeps its last geofence flag after a clock-out, so a row could otherwise
-   * read "not clocked into a site" and "inside" side by side - a verdict about
-   * a fence the row has just said it does not have.
-   */
-  function fenceCell(r) {
-    const hasSite = !!(r.site || r.jobSiteId != null);
-    if (!hasSite && !r.computedVerdict) {
-      return '<span class="hint" title="the device still carries its last geofence flag, but it is not clocked into a site for that flag to be about">no fence to judge</span>';
-    }
-    const badge = PM.geofenceBadge(r.isInsideGeofence, r.computedVerdict, r.verdictReason);
-    if (!r.relation) return badge;
-    const d = r.relation.distanceFromBoundary;
-    if (d === null || d === undefined) return badge;
-    return (
-      badge +
-      '<div class="person-sub">' +
-      esc(fmt.metres(Math.abs(d))) +
-      (r.relation.inside ? ' inside the boundary' : ' outside · ' + esc(r.relation.compass || '')) +
-      '</div>'
-    );
-  }
-
-  function renderUserTable(perUser) {
-    const host = document.querySelector('#user-table');
-    host.innerHTML = '';
-    if (!perUser.length) {
-      host.append(el('div', { class: 'empty', text: 'No snapshots in this range.' }));
-      return;
-    }
-    const maxSnapshots = Math.max(...perUser.map((u) => u.snapshots));
-    const table = el('table');
-    table.innerHTML =
-      '<thead><tr><th>User</th><th class="num">Snapshots</th><th>Inside / outside</th><th class="num">Avg accuracy</th><th class="num">Worst</th><th class="num">Min battery</th><th>Last seen</th></tr></thead>';
-    const body = el('tbody');
-    for (const u of perUser) {
-      const total = u.inside + u.outside || 1;
-      body.append(
-        el('tr', {
-          class: 'clickable',
-          title: 'Open this user',
-          onclick: (event) =>
-            PM.openRow('/user.html?userId=' + (u.userId === null ? 'anonymous' : u.userId), event),
-          html:
-            '<td><div class="person"><div class="avatar">' +
-            esc(fmt.initials(u.name)) +
-            '</div><div class="person-main"><div class="person-name">' +
-            esc(u.name) +
-            '</div><div class="person-sub">' +
-            (u.userId === null ? 'no session' : 'id ' + u.userId) +
-            (u.offline ? ' · ' + u.offline + ' offline pings' : '') +
-            '</div></div></div></td>' +
-            '<td class="num">' +
-            fmt.int(u.snapshots) +
-            ' ' +
-            PM.meter(u.snapshots, maxSnapshots, C.series[6]) +
-            '</td>' +
-            '<td><span style="font-variant-numeric:tabular-nums">' +
-            fmt.int(u.inside) +
-            ' / ' +
-            fmt.int(u.outside) +
-            '</span> ' +
-            PM.meter(u.inside, total, C.in) +
-            '</td>' +
-            '<td class="num">' +
-            fmt.accuracy(u.avgAccuracy) +
-            '</td><td class="num">' +
-            fmt.accuracy(u.worstAccuracy) +
-            '</td><td class="num">' +
-            (u.minBattery === null ? '--' : u.minBattery + '%') +
-            '</td><td>' +
-            fmt.ago(u.lastSeenAt) +
-            '</td>',
-        })
-      );
-    }
-    table.append(body);
-    host.append(table);
-  }
-
-  function renderChecks(stats) {
-    const g = stats.geofenceChecks;
-    const host = document.querySelector('#check-tiles');
-    host.innerHTML = '';
-    if (!g) {
-      host.append(el('div', { class: 'empty', text: stats.geofenceChecksUnavailable || 'No geofence checks available.' }));
-      return;
-    }
-    host.append(
-      tile('Checks made', fmt.int(g.total), { note: g.users + ' user(s) across ' + g.sites + ' site(s)' }),
-      tile('Compliance', fmt.pct(g.complianceRate), {
-        tone: g.complianceRate !== null && g.complianceRate < 95 ? 'warning' : 'good',
-        note: fmt.int(g.actualOutside) + ' failed the raw geometry',
-      }),
-      tile('Saved by accuracy grace', fmt.int(g.grace), {
-        tone: g.grace ? 'warning' : undefined,
-        note: 'avg padding ' + fmt.metres(g.avgRadiusPadding),
-      }),
-      tile('Auto clock-outs', fmt.int(g.clockOuts), { tone: g.clockOuts ? 'serious' : undefined, note: 'triggered by leaving a fence' }),
-      tile('Unmapped clock-ins', fmt.int(g.unmapped), { note: 'no site geofence attached' }),
-      tile('Check accuracy', fmt.accuracy(g.avgAccuracy), { note: 'best ' + fmt.accuracy(g.bestAccuracy) + ' · worst ' + fmt.accuracy(g.worstAccuracy) })
-    );
-
-    const timeline = PM.padBuckets(stats.geofenceTimeline || [], stats.granularity, {
-      zero: ['total', 'within', 'outside', 'clockOuts'],
-      nulls: ['avgAccuracy'],
-    });
-    PMChart.stackedTime(document.querySelector('#chart-checks'), {
-      labels: timeline.map((t) => fmt.dayTime(t.at)),
-      yTitle: 'checks',
-      datasets: [
-        { label: 'Passed', data: timeline.map((t) => t.within), color: C.in },
-        { label: 'Failed geometry', data: timeline.map((t) => t.outside), color: C.out },
-        { label: 'Auto clock-outs', data: timeline.map((t) => t.clockOuts), color: C.series[3] },
-      ],
-    });
-  }
 })();
