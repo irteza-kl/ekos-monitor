@@ -3,7 +3,7 @@ const { collectionFor } = require('../db');
 const config = require('../config');
 const F = require('./filters');
 const memo = require('./cache');
-const { SNAP } = F;
+const { SNAP, SNAP_USER_EXPR, SNAP_NAME_EXPR } = F;
 
 /**
  * Time on site: how long people were actually inside a geofence.
@@ -96,7 +96,7 @@ async function loadFence(query) {
   const dwellPipeline = [
     { $match: match },
     // Four fields, nothing else: this is the sort's budget.
-    { $project: { _id: 0, createdAt: 1, _u: '$' + SNAP.userId, _in: '$isInsideGeofence', _clocked: '$clockedIn' } },
+    { $project: { _id: 0, createdAt: 1, _u: SNAP_USER_EXPR, _in: '$isInsideGeofence', _clocked: '$clockedIn' } },
     { $match: { _u: { $ne: null } } },
     {
       $setWindowFields: {
@@ -130,10 +130,10 @@ async function loadFence(query) {
       $project: {
         _id: 0,
         createdAt: 1,
-        _u: '$' + SNAP.userId,
+        _u: SNAP_USER_EXPR,
         _in: '$isInsideGeofence',
         _clocked: '$clockedIn',
-        _name: '$' + SNAP.fullName,
+        _name: SNAP_NAME_EXPR,
         _tz: '$timezone',
         _gin: '$geofenceIn',
         _gout: '$geofenceOut',

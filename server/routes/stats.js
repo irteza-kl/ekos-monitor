@@ -3,7 +3,7 @@ const express = require('express');
 const config = require('../config');
 const { collectionFor } = require('../db');
 const F = require('../lib/filters');
-const { SNAP, LOG } = F;
+const { SNAP, LOG, SNAP_USER_EXPR, SNAP_NAME_EXPR } = F;
 const P = require('../lib/pipelines');
 const normalize = require('../lib/normalize');
 const geo = require('../lib/geo');
@@ -170,8 +170,8 @@ async function buildStats(q) {
               perUser: [
                 {
                   $group: {
-                    _id: '$' + SNAP.userId,
-                    name: { $last: '$' + SNAP.fullName },
+                    _id: SNAP_USER_EXPR,
+                    name: { $max: SNAP_NAME_EXPR },
                     n: { $sum: 1 },
                     inside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
                     outside: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', false] }, 1, 0] } },
@@ -225,7 +225,7 @@ async function buildStats(q) {
                     },
                     avgAccuracy: { $avg: '$' + SNAP.accuracy },
                     worstAccuracy: { $max: '$' + SNAP.accuracy },
-                    users: { $addToSet: '$' + SNAP.userId },
+                    users: { $addToSet: SNAP_USER_EXPR },
                   },
                 },
                 { $sort: { _id: 1 } },

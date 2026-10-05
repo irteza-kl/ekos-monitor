@@ -24,6 +24,9 @@ const PLAN = [
     indexes: [
       { key: { createdAt: -1 }, name: 'createdAt_desc', why: 'every time-range filter and the newest-per-user sort' },
       { key: { [SNAP.userId]: 1, createdAt: -1 }, name: 'user_createdAt', why: 'per-user history and the users table grouping' },
+      // Same reason as tenantFlat below: every per-user query is an $or over
+      // both envelopes now (see SNAP.userIdFlat), and needs this branch indexed.
+      { key: { [SNAP.userIdFlat]: 1, createdAt: -1 }, name: 'userFlat_createdAt', why: 'per-user history, flat envelope' },
       { key: { [SNAP.tenantId]: 1, createdAt: -1 }, name: 'tenant_createdAt', why: 'tenant filter' },
       // The tenant filter also reads the flat envelope (see SNAP.tenantIdFlat),
       // as an $or. Mongo can only answer an $or from indexes when EVERY branch

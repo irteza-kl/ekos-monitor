@@ -478,7 +478,7 @@ router.get('/users/:userId', async (req, res, next) => {
   try {
     const userId = req.params.userId === 'anonymous' ? null : Number(req.params.userId);
     const { col, base } = await collectionFor('snapshots');
-    const idMatch = userId === null ? { [SNAP.userId]: null } : { [SNAP.userId]: userId };
+    const idMatch = F.snapUserMatch(userId);
     const match = F.and([base, idMatch, F.snapshotMatch({ ...req.query, userId: undefined })]);
     // The trail is the NEWEST `historyLimit` heartbeats, which is not the same
     // thing as the range. Reporting rates here differ by over 200x - one device
@@ -788,8 +788,7 @@ async function buildTrack(query, extraMatch) {
         isInsideGeofence: 1,
         clockedIn: 1,
         batteryPercentage: 1,
-        'currentUser.data.id': 1,
-        'currentUser.data.fullName': 1,
+        ...Object.fromEntries(F.SNAP_USER_PATHS.map((path) => [path, 1])),
         // Which fences to send back. /api/meta lists sites but without
         // coordinates, so a caller drawing a map cannot get them from there.
         [SNAP.jobSiteId]: 1,
@@ -807,7 +806,7 @@ async function buildTrack(query, extraMatch) {
   const siteIds = new Set();
   const all = docs.map((d) => {
     const loc = d.currentUserLocation || {};
-    const user = (d.currentUser && d.currentUser.data) || {};
+    const user = F.snapUser(d);
     const userId = normalize.num(user.id);
     if (userId !== null && !names.has(userId)) names.set(userId, user.fullName || null);
     const jobSiteId =
@@ -902,7 +901,7 @@ router.get('/users/:userId/track', async (req, res, next) => {
     const userId = req.params.userId === 'anonymous' ? null : Number(req.params.userId);
     const data = await buildTrack(
       { ...req.query, userId: undefined },
-      userId === null ? { [SNAP.userId]: null } : { [SNAP.userId]: userId }
+      F.snapUserMatch(userId)
     );
     res.json({ userId, ...data });
   } catch (err) {

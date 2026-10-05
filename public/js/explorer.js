@@ -55,7 +55,7 @@
       name: 'Snapshots per hour (aggregate)',
       collection: 'snapshots',
       pipeline: [
-        { $group: { _id: { $dateTrunc: { date: '$createdAt', unit: 'hour' } }, snapshots: { $sum: 1 }, users: { $addToSet: '$currentUser.data.id' } } },
+        { $group: { _id: { $dateTrunc: { date: '$createdAt', unit: 'hour' } }, snapshots: { $sum: 1 }, users: { $addToSet: { $ifNull: ['$currentUser.data.id', '$currentUser.id'] } } } },
         { $project: { snapshots: 1, users: { $size: '$users' } } },
         { $sort: { _id: -1 } },
       ],
@@ -66,7 +66,7 @@
       pipeline: [
         {
           $group: {
-            _id: '$currentUser.data.fullName',
+            _id: { $ifNull: ['$currentUser.data.fullName', '$currentUser.fullName'] },
             worst: { $max: '$currentUserLocation.accuracy' },
             avg: { $avg: '$currentUserLocation.accuracy' },
             fixes: { $sum: 1 },

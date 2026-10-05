@@ -2,7 +2,7 @@
 const { collectionFor } = require('../db');
 const config = require('../config');
 const F = require('./filters');
-const { SNAP, LOG } = F;
+const { SNAP, LOG, SNAP_USER_EXPR, SNAP_NAME_EXPR } = F;
 const P = require('./pipelines');
 const normalize = require('./normalize');
 const geo = require('./geo');
@@ -197,8 +197,8 @@ async function lookUpNames(ids) {
     const rows = await col
       .aggregate(
         [
-          { $match: { [SNAP.userId]: { $in: ids } } },
-          { $group: { _id: '$' + SNAP.userId, name: { $first: '$' + SNAP.fullName } } },
+          { $match: F.snapUserMatch(ids) },
+          { $group: { _id: SNAP_USER_EXPR, name: { $max: SNAP_NAME_EXPR } } },
         ],
         opts
       )
@@ -521,7 +521,7 @@ async function fromLatestSnapshots(q, nameHints) {
       who: noSession.map((r) => whoOf(r, r.deviceType || 'unknown device')),
       lastAt: newest(noSession, 'capturedAt'),
       href: '/heartbeats.html?userId=anonymous',
-      evidence: 'ekosClientState: currentUser.data.id is null',
+      evidence: 'ekosClientState: neither currentUser.data.id nor currentUser.id is set',
     });
   }
 
@@ -580,7 +580,7 @@ async function fromHeartbeatGaps(q) {
       [
         { $match: match },
         // Two fields only. Anything wider and the partition sort blows the budget.
-        { $project: { createdAt: 1, _user: '$' + SNAP.userId } },
+        { $project: { createdAt: 1, _user: SNAP_USER_EXPR } },
         { $match: { _user: { $ne: null } } },
         {
           $setWindowFields: {
@@ -624,11 +624,10 @@ async function fromHeartbeatGaps(q) {
 
   // The heartbeat that opened each silence, for the cause and the shift state.
   const causes = await col
-    .find({ $or: gaps.map((g) => ({ [SNAP.userId]: g.user, createdAt: g.startedAt })) })
+    .find({ $or: gaps.map((g) => ({ ...F.snapUserMatch(g.user), createdAt: g.startedAt })) })
     .project({
       createdAt: 1,
-      [SNAP.userId]: 1,
-      [SNAP.fullName]: 1,
+      ...Object.fromEntries(F.SNAP_USER_PATHS.map((path) => [path, 1])),
       clockedIn: 1,
       sessionLoggedIn: 1,
       isConnected: 1,
@@ -1302,8 +1301,8 @@ async function fromNetwork(q, nameHints) {
               { $match: { 'clockedInJobDetail.clockInNetworkStatus': 'OFFLINE' } },
               {
                 $group: {
-                  _id: { user: '$' + SNAP.userId, at: '$clockedInJobDetail.clockIn' },
-                  name: { $max: '$' + SNAP.fullName },
+                  _id: { user: SNAP_USER_EXPR, at: '$clockedInJobDetail.clockIn' },
+                  name: { $max: SNAP_NAME_EXPR },
                   lastAt: { $max: '$createdAt' },
                   siteId: { $max: '$clockedInJobDetail.jobSiteId' },
                 },
@@ -1315,8 +1314,8 @@ async function fromNetwork(q, nameHints) {
               { $match: { isConnected: true, isReachable: false } },
               {
                 $group: {
-                  _id: '$' + SNAP.userId,
-                  name: { $max: '$' + SNAP.fullName },
+                  _id: SNAP_USER_EXPR,
+                  name: { $max: SNAP_NAME_EXPR },
                   beats: { $sum: 1 },
                   lastAt: { $max: '$createdAt' },
                 },

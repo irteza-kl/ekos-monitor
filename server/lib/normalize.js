@@ -1,5 +1,6 @@
 'use strict';
 const geo = require('./geo');
+const { snapUser } = require('./filters');
 
 const ALL_PERMISSIONS = [
   'LOCATION_FOREGROUND',
@@ -103,7 +104,8 @@ function minutesSince(v) {
  */
 function snapshot(doc) {
   if (!doc) return null;
-  const user = (doc.currentUser && doc.currentUser.data) || {};
+  // Either envelope - { data: user } or the bare user. See SNAP.userIdFlat.
+  const user = snapUser(doc);
   const tenantAccount = (Array.isArray(user.tenantAccount) ? user.tenantAccount[0] : user.tenantAccount) || {};
   const tenant = tenantAccount.tenant || {};
   const timeEntry = (Array.isArray(user.timeEntry) ? user.timeEntry[0] : user.timeEntry) || {};

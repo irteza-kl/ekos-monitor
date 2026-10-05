@@ -164,15 +164,31 @@ const SNAP = {
   // flat heartbeat carries tenantAccount[0].tenantId, but 36 of the 419 have
   // no top-level tenantId at all. Where both exist they agree, and no
   // heartbeat has more than one tenant account.
-  //
-  // (The user id has the same split and is a wider change - attribution,
-  // trails, per-user history and row display all key on the nested path.)
   tenantIdFlat: 'currentUser.tenantAccount.tenantId',
+  // The user has the same split, and it is why people showed up as "User
+  // null" / unidentified while logged in. Measured in stage 2026-10-05: 508 of
+  // 64.9k heartbeats are flat, every one with an integer id and
+  // isUserLoggedIn true, 88 of them in the last week. The app's
+  // getLoggedInUserData() returns the React Query cache entry ({ data: user },
+  // the raw /me response) when it is warm and the MMKV copy (the bare user)
+  // when it is not - the first heartbeat after login, and background ticks
+  // that run without the hydrated query cache. One Android device sent only
+  // flat heartbeats for three days.
+  //
+  // So every user read takes either envelope: snapUser() in JS,
+  // SNAP_USER_EXPR / SNAP_NAME_EXPR in aggregations, snapUserMatch() in
+  // queries. The nested paths below stay the primary ones.
+  userIdFlat: 'currentUser.id',
   fullName: 'currentUser.data.fullName',
+  fullNameFlat: 'currentUser.fullName',
   email: 'currentUser.data.email',
+  emailFlat: 'currentUser.email',
   phone: 'currentUser.data.phone',
+  phoneFlat: 'currentUser.phone',
   employeeRef: 'currentUser.data.tenantAccount.employeeReferenceId',
+  employeeRefFlat: 'currentUser.tenantAccount.employeeReferenceId',
   tenantName: 'currentUser.data.tenantAccount.tenant.name',
+  tenantNameFlat: 'currentUser.tenantAccount.tenant.name',
   accuracy: 'currentUserLocation.accuracy',
   // The device's own fix time. Epoch today, expected to become an ISODate -
   // see normalize.flexibleIso and pipelines.capturedAtExpr, which both read it.
@@ -199,6 +215,39 @@ const SNAP = {
  */
 const SNAP_TENANT_EXPR = { $ifNull: ['$' + SNAP.tenantId, { $arrayElemAt: ['$' + SNAP.tenantIdFlat, 0] }] };
 
+/** A heartbeat's user id / name under either envelope, for $group and $project. */
+const SNAP_USER_EXPR = { $ifNull: ['$' + SNAP.userId, '$' + SNAP.userIdFlat] };
+const SNAP_NAME_EXPR = { $ifNull: ['$' + SNAP.fullName, '$' + SNAP.fullNameFlat] };
+
+/** Every path a snapshot's user is read from - for projections. */
+const SNAP_USER_PATHS = [SNAP.userId, SNAP.userIdFlat, SNAP.fullName, SNAP.fullNameFlat];
+
+/**
+ * Heartbeats belonging to these user ids, under either envelope. `null` means
+ * the session-less ones: neither path set. (A bare {currentUser.data.id: null}
+ * matches every flat heartbeat too - the field is missing on them - which is
+ * how logged-in people were filed as anonymous.)
+ */
+function snapUserMatch(ids) {
+  const list = (Array.isArray(ids) ? ids : [ids]).filter((id) => id !== null && id !== undefined);
+  const anonymous = (Array.isArray(ids) ? ids : [ids]).some((id) => id === null || id === undefined);
+  const or = [];
+  if (list.length) {
+    const value = list.length === 1 ? list[0] : { $in: list };
+    or.push({ [SNAP.userId]: value }, { [SNAP.userIdFlat]: value });
+  }
+  if (anonymous) or.push({ [SNAP.userId]: null, [SNAP.userIdFlat]: null });
+  return or.length === 1 ? or[0] : { $or: or };
+}
+
+/** The user object on a heartbeat document, under either envelope, or {}. */
+function snapUser(doc) {
+  const cu = doc && doc.currentUser;
+  if (!cu || typeof cu !== 'object') return {};
+  if (cu.data && typeof cu.data === 'object') return cu.data;
+  return cu.id !== undefined ? cu : {};
+}
+
 /**
  * Filters that can run before any $group (indexed / plain document fields).
  */
@@ -212,12 +261,7 @@ function snapshotMatch(q) {
   const userTokens = list(q.userId);
   const users = nums(q.userId);
   const wantsAnonymous = userTokens.some((t) => t === 'null' || t === 'anonymous');
-  if (users.length || wantsAnonymous) {
-    const or = [];
-    if (users.length) or.push({ [SNAP.userId]: { $in: users } });
-    if (wantsAnonymous) or.push({ [SNAP.userId]: null });
-    clauses.push(or.length === 1 ? or[0] : { $or: or });
-  }
+  if (users.length || wantsAnonymous) clauses.push(snapUserMatch(wantsAnonymous ? users.concat(null) : users));
 
   // Both envelopes: in a tenant if either path holds it, tenantless only if
   // neither does.
@@ -318,14 +362,19 @@ function snapshotMatch(q) {
     const rx = { $regex: escapeRegex(search), $options: 'i' };
     const or = [
       { [SNAP.fullName]: rx },
+      { [SNAP.fullNameFlat]: rx },
       { [SNAP.email]: rx },
+      { [SNAP.emailFlat]: rx },
       { [SNAP.phone]: rx },
+      { [SNAP.phoneFlat]: rx },
       { [SNAP.employeeRef]: rx },
+      { [SNAP.employeeRefFlat]: rx },
       { [SNAP.tenantName]: rx },
+      { [SNAP.tenantNameFlat]: rx },
       { timezone: rx },
     ];
     const asNumber = Number(search);
-    if (Number.isFinite(asNumber)) or.push({ [SNAP.userId]: asNumber });
+    if (Number.isFinite(asNumber)) or.push({ [SNAP.userId]: asNumber }, { [SNAP.userIdFlat]: asNumber });
     clauses.push({ $or: or });
   }
 
@@ -693,6 +742,11 @@ function sortSpec(q, allowed, fallback) {
 module.exports = {
   SNAP,
   SNAP_TENANT_EXPR,
+  SNAP_USER_EXPR,
+  SNAP_NAME_EXPR,
+  SNAP_USER_PATHS,
+  snapUserMatch,
+  snapUser,
   dateRange,
   LOG,
   snapshotMatch,

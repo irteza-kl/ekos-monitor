@@ -26,7 +26,7 @@
 const { collectionFor } = require('../db');
 const config = require('../config');
 const geo = require('./geo');
-const { SNAP } = require('./filters');
+const { SNAP, SNAP_USER_EXPR, SNAP_NAME_EXPR, SNAP_USER_PATHS, snapUserMatch, snapUser } = require('./filters');
 
 /**
  * A heartbeat this close in space and time to a window sample is the same
@@ -66,16 +66,16 @@ async function positionStream(fromMs, toMs, tenantIds) {
     createdAt: { $gte: new Date(fromMs), $lte: new Date(toMs) },
     [SNAP.lat]: { $ne: null },
   };
-  if (tenantIds.length) match[SNAP.tenantId] = { $in: tenantIds };
+  if (tenantIds.length) match.$or = [{ [SNAP.tenantId]: { $in: tenantIds } }, { [SNAP.tenantIdFlat]: { $in: tenantIds } }];
 
   const docs = await col
     .find(match, {
       projection: {
         createdAt: 1,
         deviceType: 1,
-        [SNAP.userId]: 1,
-        [SNAP.fullName]: 1,
+        ...Object.fromEntries(SNAP_USER_PATHS.map((path) => [path, 1])),
         [SNAP.tenantId]: 1,
+        'currentUser.tenantId': 1,
         [SNAP.lat]: 1,
         [SNAP.lng]: 1,
       },
@@ -90,7 +90,7 @@ async function positionStream(fromMs, toMs, tenantIds) {
   const users = new Map();
 
   for (const doc of docs.slice(0, MAX_POINTS)) {
-    const user = (doc.currentUser && doc.currentUser.data) || {};
+    const user = snapUser(doc);
     const userId = user.id === undefined ? null : user.id;
     if (userId === null) continue; // a session-less heartbeat identifies nobody
     const loc = doc.currentUserLocation || {};
@@ -395,7 +395,7 @@ async function nameDirectMatches(rows) {
     const found = await col
       .aggregate(
         [
-          { $match: { ...base, [SNAP.userId]: { $in: ids } } },
+          { $match: { ...base, ...snapUserMatch(ids) } },
           // No sort. This was `$sort: { createdAt: -1 }` over every heartbeat
           // those users have ever sent, with whole documents in the sort - a
           // blocking sort with no ceiling, and this deployment does not honour
@@ -407,8 +407,8 @@ async function nameDirectMatches(rows) {
           // with memory proportional to the number of people asked about.
           {
             $group: {
-              _id: '$' + SNAP.userId,
-              newest: { $max: { at: '$createdAt', name: { $ifNull: ['$' + SNAP.fullName, null] } } },
+              _id: SNAP_USER_EXPR,
+              newest: { $max: { at: '$createdAt', name: { $ifNull: [SNAP_NAME_EXPR, null] } } },
             },
           },
           { $project: { name: '$newest.name' } },

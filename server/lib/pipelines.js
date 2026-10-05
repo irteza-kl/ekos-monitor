@@ -1,5 +1,5 @@
 'use strict';
-const { SNAP } = require('./filters');
+const { SNAP, SNAP_USER_EXPR } = require('./filters');
 const { ACCURACY_BANDS } = require('./geo');
 
 /** $switch that mirrors geo.accuracyBand, so bands can be filtered in Mongo. */
@@ -191,7 +191,7 @@ function latestPerUser({ match, postMatch, sort, skip, limit, collection }) {
       $project: {
         _id: 1,
         [HEARTBEAT_AT]: 1,
-        _u: { $ifNull: ['$' + SNAP.userId, 'anonymous'] },
+        _u: { $ifNull: [SNAP_USER_EXPR, 'anonymous'] },
         _acc: '$' + SNAP.accuracy,
         _in: '$isInsideGeofence',
         _conn: '$isConnected',

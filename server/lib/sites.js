@@ -2,7 +2,7 @@
 const { collectionFor } = require('../db');
 const config = require('../config');
 const geo = require('./geo');
-const { LOG, SNAP, SNAP_TENANT_EXPR, dateRange } = require('./filters');
+const { LOG, SNAP, SNAP_TENANT_EXPR, SNAP_USER_EXPR, snapUserMatch, dateRange } = require('./filters');
 
 /**
  * The geofence site registry. One rule: geometry is only presented as a fence
@@ -275,7 +275,7 @@ async function siteRecords(byId) {
               heartbeats: { $sum: 1 },
               firstSeenAt: { $min: '$createdAt' },
               lastSeenAt: { $max: '$createdAt' },
-              users: { $addToSet: '$' + SNAP.userId },
+              users: { $addToSet: SNAP_USER_EXPR },
               tenants: { $addToSet: SNAP_TENANT_EXPR },
             },
           },
@@ -407,7 +407,7 @@ async function estimatedCentres(byId, { from, to }) {
             $group: {
               _id: { site: '$_siteId', bucket: bucket.expr },
               snapshots: { $sum: 1 },
-              users: { $addToSet: '$' + SNAP.userId },
+              users: { $addToSet: SNAP_USER_EXPR },
               tenantIds: { $addToSet: SNAP_TENANT_EXPR },
               lastSeenAt: { $max: '$createdAt' },
               insideCount: { $sum: { $cond: [{ $eq: ['$isInsideGeofence', true] }, 1, 0] } },
@@ -1081,11 +1081,11 @@ async function nameWindowSitesFromHeartbeats(rows) {
     beats = await col
       .find({
         ...base,
-        [SNAP.userId]: { $in: userIds },
+        ...snapUserMatch(userIds),
         [SNAP.siteRecordId]: { $ne: null },
         createdAt: { $gte: new Date(from - 5 * 60000), $lte: new Date(to + 5 * 60000) },
       })
-      .project({ _id: 0, u: '$' + SNAP.userId, at: '$createdAt', id: '$' + SNAP.siteRecordId, name: '$' + SNAP.siteName })
+      .project({ _id: 0, u: SNAP_USER_EXPR, at: '$createdAt', id: '$' + SNAP.siteRecordId, name: '$' + SNAP.siteName })
       .limit(20000)
       .maxTimeMS(config.queryTimeoutMs)
       .toArray();

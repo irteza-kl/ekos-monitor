@@ -2,7 +2,7 @@
 const express = require('express');
 const config = require('../config');
 const { resolveCollections, collectionFor, ping } = require('../db');
-const { SNAP, LOG, SNAP_TENANT_EXPR } = require('../lib/filters');
+const { SNAP, LOG, SNAP_TENANT_EXPR, SNAP_USER_EXPR, SNAP_NAME_EXPR } = require('../lib/filters');
 const { ACCURACY_BANDS } = require('../lib/geo');
 const { ALL_PERMISSIONS } = require('../lib/normalize');
 const { getSites } = require('../lib/sites');
@@ -76,9 +76,9 @@ router.get('/meta', async (req, res, next) => {
                 // it ranks any string above null.
                 users: [
                   ...groupWithTenants(
-                    '$' + SNAP.userId,
+                    SNAP_USER_EXPR,
                     TENANT,
-                    { name: { $last: '$' + SNAP.fullName }, lastSeenAt: { $max: '$createdAt' } },
+                    { name: { $max: SNAP_NAME_EXPR }, lastSeenAt: { $max: '$createdAt' } },
                     { name: { $max: '$name' }, tenantId: { $max: '$_id.t' }, lastSeenAt: { $max: '$lastSeenAt' } }
                   ),
                   { $sort: { lastSeenAt: -1 } },
