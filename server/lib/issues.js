@@ -631,8 +631,12 @@ async function fromHeartbeatGaps(q) {
       clockedIn: 1,
       sessionLoggedIn: 1,
       isConnected: 1,
+      isReachable: 1,
       batteryPercentage: 1,
       permissionsEnabled: 1,
+      // explainGap reads locationAlways off this; without the field every
+      // heartbeat normalizes to false and the cause reads "not always-on".
+      allowEveryTimeOnLocationCheck: 1,
     })
     .toArray();
 
